@@ -100,18 +100,6 @@ void log_shutdown(void) {
     if (g_log_file) { fflush(g_log_file); fclose(g_log_file); g_log_file = NULL; }
 }
 
-void log_set_level(log_level_t level) { g_log_level = level; }
-
-log_level_t log_level_from_string(const char *str) {
-    if (!str) return LOG_INFO;
-    if (_stricmp(str, "error") == 0) return LOG_ERROR;
-    if (_stricmp(str, "warn") == 0)  return LOG_WARN;
-    if (_stricmp(str, "info") == 0)  return LOG_INFO;
-    if (_stricmp(str, "debug") == 0) return LOG_DEBUG;
-    if (_stricmp(str, "trace") == 0) return LOG_TRACE;
-    return LOG_INFO;
-}
-
 static void log_output_entry_unlocked(const log_entry_t *entry) {
     if (g_log_queue.use_color) fprintf(stderr, "%s", level_colors[entry->level]);
     fprintf(stderr, "[%s][TID:%lu][%-5s] ", entry->time_str, entry->tid, level_names[entry->level]);

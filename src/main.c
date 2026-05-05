@@ -66,6 +66,12 @@ int main(int argc, char *argv[]) {
     const char *dns_str = NULL;
     const char *log_path = NULL;
     int verbosity = -1;
+    int conntrack_ok = 0;
+    int proc_lookup_ok = 0;
+    int dns_ok = 0;
+    int tcp_ok = 0;
+    int udp_ok = 0;
+    int divert_ok = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
@@ -77,8 +83,8 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--log") == 0 && i + 1 < argc) {
             log_path = argv[++i];
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
-            if (verbosity < 0) verbosity = LOG_INFO;
-            verbosity++;
+            if (verbosity < LOG_INFO) verbosity = LOG_INFO;
+            else if (verbosity < LOG_TRACE) verbosity++;
         } else if (strcmp(argv[i], "-vv") == 0) {
             verbosity = LOG_DEBUG;
         } else if (strcmp(argv[i], "-vvv") == 0) {
@@ -115,7 +121,12 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    config_apply_cli(&config, proxy_str, dns_str, verbosity);
+    if (config_apply_cli(&config, proxy_str, dns_str, verbosity) != ERR_OK) {
+        fprintf(stderr, "Invalid command-line proxy or DNS endpoint\n");
+        config_free(&config);
+        WSACleanup();
+        return 1;
+    }
     /* Initialize logging */
     const char *effective_log_path = log_path ? log_path : (config.log_file[0] ? config.log_file : NULL);
     log_init(config.log_level, effective_log_path);
@@ -128,18 +139,18 @@ int main(int argc, char *argv[]) {
 
     /* Initialize subsystems in dependency order.
      * Each shutdown reverses its corresponding init. */
-    int ct_ok = 0, tcp_ok = 0, udp_ok = 0, divert_ok = 0;
-
     if (conntrack_init(&g_conntrack) != ERR_OK) {
         LOG_ERROR("Failed to initialize connection tracking");
         goto cleanup;
     }
-    ct_ok = 1;
+    conntrack_ok = 1;
 
     proc_lookup_init(&g_proc_lookup);
+    proc_lookup_ok = 1;
 
     dns_hijack_init(&g_dns_hijack, config.dns.enabled,
                     config.dns.redirect_ip_addr, config.dns.redirect_port);
+    dns_ok = 1;
 
     if (tcp_relay_start(&g_tcp_relay, &g_conntrack, &config.proxy) != ERR_OK) {
         LOG_ERROR("Failed to start TCP relay");
@@ -171,9 +182,9 @@ cleanup:
     if (divert_ok)  divert_stop(&g_divert);
     if (udp_ok)     udp_relay_stop(&g_udp_relay);
     if (tcp_ok)     tcp_relay_stop(&g_tcp_relay);
-    dns_hijack_shutdown(&g_dns_hijack);
-    proc_lookup_shutdown(&g_proc_lookup);
-    if (ct_ok)      conntrack_shutdown(&g_conntrack);
+    if (dns_ok)     dns_hijack_shutdown(&g_dns_hijack);
+    if (proc_lookup_ok) proc_lookup_shutdown(&g_proc_lookup);
+    if (conntrack_ok)   conntrack_shutdown(&g_conntrack);
     config_free(&config);
     WSACleanup();
 

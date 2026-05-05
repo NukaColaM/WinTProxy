@@ -1,5 +1,6 @@
 #include "process.h"
 #include "log.h"
+#include "util.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -9,13 +10,15 @@
 
 void proc_lookup_init(proc_lookup_t *pl) {
     memset(pl, 0, sizeof(*pl));
-    InitializeSRWLock(&pl->lock);
+    for (int i = 0; i < PROC_CACHE_BUCKETS; i++) {
+        InitializeSRWLock(&pl->locks[i]);
+    }
     pl->self_pid = GetCurrentProcessId();
 }
 
 void proc_lookup_shutdown(proc_lookup_t *pl) {
-    AcquireSRWLockExclusive(&pl->lock);
     for (int i = 0; i < PROC_CACHE_BUCKETS; i++) {
+        AcquireSRWLockExclusive(&pl->locks[i]);
         proc_cache_entry_t *e = pl->buckets[i];
         while (e) {
             proc_cache_entry_t *next = e->next;
@@ -23,8 +26,8 @@ void proc_lookup_shutdown(proc_lookup_t *pl) {
             e = next;
         }
         pl->buckets[i] = NULL;
+        ReleaseSRWLockExclusive(&pl->locks[i]);
     }
-    ReleaseSRWLockExclusive(&pl->lock);
 }
 
 static uint32_t make_cache_key(uint32_t ip, uint16_t port, int is_udp) {
@@ -33,34 +36,36 @@ static uint32_t make_cache_key(uint32_t ip, uint16_t port, int is_udp) {
 
 static int cache_get(proc_lookup_t *pl, uint32_t key, uint32_t *pid, char *name, int name_len) {
     unsigned int idx = key % PROC_CACHE_BUCKETS;
+    uint64_t now = GetTickCount64();
 
-    AcquireSRWLockShared(&pl->lock);
+    AcquireSRWLockShared(&pl->locks[idx]);
     proc_cache_entry_t *e = pl->buckets[idx];
     while (e) {
-        if (e->key == key && (GetTickCount64() - e->timestamp) < PROC_CACHE_TTL_MS) {
+        uint64_t ttl = (e->pid == 0) ? PROC_CACHE_NEG_TTL_MS : PROC_CACHE_TTL_MS;
+        if (e->key == key && (now - e->timestamp) < ttl) {
             *pid = e->pid;
-            if (name && name_len > 0) strncpy(name, e->name, name_len - 1);
-            ReleaseSRWLockShared(&pl->lock);
+            if (name && name_len > 0) safe_str_copy(name, (size_t)name_len, e->name[0] ? e->name : "unknown");
+            ReleaseSRWLockShared(&pl->locks[idx]);
             return 1;
         }
         e = e->next;
     }
-    ReleaseSRWLockShared(&pl->lock);
+    ReleaseSRWLockShared(&pl->locks[idx]);
     return 0;
 }
 
 static void cache_put(proc_lookup_t *pl, uint32_t key, uint32_t pid, const char *name) {
     unsigned int idx = key % PROC_CACHE_BUCKETS;
 
-    AcquireSRWLockExclusive(&pl->lock);
+    AcquireSRWLockExclusive(&pl->locks[idx]);
 
     proc_cache_entry_t *e = pl->buckets[idx];
     while (e) {
         if (e->key == key) {
             e->pid = pid;
-            strncpy(e->name, name, sizeof(e->name) - 1);
+            safe_str_copy(e->name, sizeof(e->name), name ? name : "unknown");
             e->timestamp = GetTickCount64();
-            ReleaseSRWLockExclusive(&pl->lock);
+            ReleaseSRWLockExclusive(&pl->locks[idx]);
             return;
         }
         e = e->next;
@@ -70,13 +75,13 @@ static void cache_put(proc_lookup_t *pl, uint32_t key, uint32_t pid, const char 
     if (e) {
         e->key = key;
         e->pid = pid;
-        strncpy(e->name, name, sizeof(e->name) - 1);
+        safe_str_copy(e->name, sizeof(e->name), name ? name : "unknown");
         e->timestamp = GetTickCount64();
         e->next = pl->buckets[idx];
         pl->buckets[idx] = e;
     }
 
-    ReleaseSRWLockExclusive(&pl->lock);
+    ReleaseSRWLockExclusive(&pl->locks[idx]);
 }
 
 static int get_process_name(uint32_t pid, char *name, int name_len) {
@@ -108,13 +113,23 @@ uint32_t proc_lookup_tcp(proc_lookup_t *pl, uint32_t src_ip, uint16_t src_port, 
     PMIB_TCPTABLE_OWNER_PID table = NULL;
     DWORD size = 0;
     DWORD ret = GetExtendedTcpTable(NULL, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
-    if (ret != ERROR_INSUFFICIENT_BUFFER) return 0;
+    if (ret != ERROR_INSUFFICIENT_BUFFER) {
+        cache_put(pl, key, 0, "unknown");
+        return 0;
+    }
 
     table = (PMIB_TCPTABLE_OWNER_PID)malloc(size);
-    if (!table) return 0;
+    if (!table) {
+        cache_put(pl, key, 0, "unknown");
+        return 0;
+    }
 
     ret = GetExtendedTcpTable(table, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
-    if (ret != NO_ERROR) { free(table); return 0; }
+    if (ret != NO_ERROR) {
+        free(table);
+        cache_put(pl, key, 0, "unknown");
+        return 0;
+    }
 
     for (DWORD i = 0; i < table->dwNumEntries; i++) {
         MIB_TCPROW_OWNER_PID *row = &table->table[i];
@@ -128,12 +143,15 @@ uint32_t proc_lookup_tcp(proc_lookup_t *pl, uint32_t src_ip, uint16_t src_port, 
     if (pid > 0) {
         char proc_name[256] = {0};
         if (get_process_name(pid, proc_name, sizeof(proc_name))) {
-            if (name_out) strncpy(name_out, proc_name, name_len - 1);
+            if (name_out && name_len > 0) safe_str_copy(name_out, (size_t)name_len, proc_name);
             cache_put(pl, key, pid, proc_name);
         } else {
             cache_put(pl, key, pid, "unknown");
-            if (name_out) strncpy(name_out, "unknown", name_len - 1);
+            if (name_out && name_len > 0) safe_str_copy(name_out, (size_t)name_len, "unknown");
         }
+    } else {
+        cache_put(pl, key, 0, "unknown");
+        if (name_out && name_len > 0) safe_str_copy(name_out, (size_t)name_len, "unknown");
     }
 
     return pid;
@@ -150,13 +168,23 @@ uint32_t proc_lookup_udp(proc_lookup_t *pl, uint32_t src_ip, uint16_t src_port, 
     PMIB_UDPTABLE_OWNER_PID table = NULL;
     DWORD size = 0;
     DWORD ret = GetExtendedUdpTable(NULL, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
-    if (ret != ERROR_INSUFFICIENT_BUFFER) return 0;
+    if (ret != ERROR_INSUFFICIENT_BUFFER) {
+        cache_put(pl, key, 0, "unknown");
+        return 0;
+    }
 
     table = (PMIB_UDPTABLE_OWNER_PID)malloc(size);
-    if (!table) return 0;
+    if (!table) {
+        cache_put(pl, key, 0, "unknown");
+        return 0;
+    }
 
     ret = GetExtendedUdpTable(table, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
-    if (ret != NO_ERROR) { free(table); return 0; }
+    if (ret != NO_ERROR) {
+        free(table);
+        cache_put(pl, key, 0, "unknown");
+        return 0;
+    }
 
     uint32_t fallback_pid = 0;
 
@@ -180,12 +208,15 @@ uint32_t proc_lookup_udp(proc_lookup_t *pl, uint32_t src_ip, uint16_t src_port, 
     if (pid > 0) {
         char proc_name[256] = {0};
         if (get_process_name(pid, proc_name, sizeof(proc_name))) {
-            if (name_out) strncpy(name_out, proc_name, name_len - 1);
+            if (name_out && name_len > 0) safe_str_copy(name_out, (size_t)name_len, proc_name);
             cache_put(pl, key, pid, proc_name);
         } else {
             cache_put(pl, key, pid, "unknown");
-            if (name_out) strncpy(name_out, "unknown", name_len - 1);
+            if (name_out && name_len > 0) safe_str_copy(name_out, (size_t)name_len, "unknown");
         }
+    } else {
+        cache_put(pl, key, 0, "unknown");
+        if (name_out && name_len > 0) safe_str_copy(name_out, (size_t)name_len, "unknown");
     }
 
     return pid;

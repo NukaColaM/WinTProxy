@@ -195,9 +195,11 @@ error_t socks5_udp_associate(SOCKET ctrl_sock, struct sockaddr_in *relay_addr) {
 
 int socks5_udp_wrap(uint8_t *buf, int buf_size, uint32_t dst_ip, uint16_t dst_port,
                     const uint8_t *payload, int payload_len) {
-    int header_size = sizeof(socks5_udp_header_t);
-    int total = header_size + payload_len;
-    if (total > buf_size) return -1;
+    size_t header_size = sizeof(socks5_udp_header_t);
+    size_t total;
+    if (payload_len < 0 || buf_size < 0) return -1;
+    total = header_size + (size_t)payload_len;
+    if (total > (size_t)buf_size) return -1;
 
     socks5_udp_header_t hdr;
     hdr.rsv = 0;
@@ -207,8 +209,8 @@ int socks5_udp_wrap(uint8_t *buf, int buf_size, uint32_t dst_ip, uint16_t dst_po
     hdr.dst_port = htons(dst_port);
 
     memcpy(buf, &hdr, header_size);
-    memcpy(buf + header_size, payload, payload_len);
-    return total;
+    memcpy(buf + header_size, payload, (size_t)payload_len);
+    return (int)total;
 }
 
 error_t socks5_udp_unwrap(const uint8_t *buf, int buf_len, uint32_t *src_ip,

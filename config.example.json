@@ -10,10 +10,6 @@
     },
     "rules": [
         {
-            "process": "chrome.exe,firefox.exe,msedge.exe",
-            "action": "proxy"
-        },
-        {
             "process": "sockd.exe",
             "action": "direct"
         },
@@ -24,6 +20,16 @@
         {
             "ip": "127.0.0.0/8",
             "action": "direct"
+        },
+        {
+            "process": "chrome.exe,firefox.exe,msedge.exe",
+            "action": "proxy"
+        },
+        {
+            "process": "game.exe",
+            "protocol": "udp",
+            "action": "block",
+            "enabled": false
         },
         {
             "process": "*",

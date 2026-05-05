@@ -3,15 +3,16 @@
 
 #include <stdint.h>
 #include "common.h"
+#include "constants.h"
 
 #ifdef _WIN32
 #include <windows.h>
 #include <winsock2.h>
 #endif
 
-#define CONNTRACK_BUCKETS 1024
-#define CONNTRACK_TTL_SEC 60
-#define CONNTRACK_CLEANUP_INTERVAL_SEC 30
+#define CONNTRACK_BUCKETS              WTP_CONNTRACK_BUCKETS
+#define CONNTRACK_TTL_SEC              WTP_CONNTRACK_TTL_SEC
+#define CONNTRACK_CLEANUP_INTERVAL_SEC WTP_CONNTRACK_CLEANUP_SEC
 
 typedef struct conntrack_entry_s {
     uint16_t src_port;

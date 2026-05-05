@@ -2,13 +2,15 @@
 #define WINTPROXY_PROCESS_H
 
 #include <stdint.h>
+#include "constants.h"
 
 #ifdef _WIN32
 #include <windows.h>
 #endif
 
-#define PROC_CACHE_BUCKETS 1024
-#define PROC_CACHE_TTL_MS  1000
+#define PROC_CACHE_BUCKETS    WTP_PROC_CACHE_BUCKETS
+#define PROC_CACHE_TTL_MS     WTP_PROC_CACHE_TTL_MS
+#define PROC_CACHE_NEG_TTL_MS WTP_PROC_CACHE_NEG_TTL_MS
 
 typedef struct proc_cache_entry_s {
     uint32_t key;
@@ -20,7 +22,7 @@ typedef struct proc_cache_entry_s {
 
 typedef struct {
     proc_cache_entry_t *buckets[PROC_CACHE_BUCKETS];
-    SRWLOCK             lock;
+    SRWLOCK             locks[PROC_CACHE_BUCKETS];
     uint32_t            self_pid;
 } proc_lookup_t;
 

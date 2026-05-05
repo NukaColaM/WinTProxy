@@ -25,6 +25,22 @@ typedef struct {
     uint8_t            protocol;
 } pkt_ctx_t;
 
+static int packet_dns_txid(pkt_ctx_t *ctx, uint16_t *txid) {
+    PVOID dns_data = NULL;
+    UINT dns_data_len = 0;
+
+    WinDivertHelperParsePacket(ctx->packet, ctx->packet_len,
+        NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+        &dns_data, &dns_data_len, NULL, NULL);
+    if (!dns_data || dns_data_len < 2) return 0;
+
+    {
+        const uint8_t *p = (const uint8_t *)dns_data;
+        *txid = (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+    }
+    return 1;
+}
+
 /* === Packet classification ===
  * Order matches the original monolithic worker exactly — do not reorder.
  */
@@ -92,8 +108,18 @@ static void handle_dns_response_loopback(divert_engine_t *engine, pkt_ctx_t *ctx
     uint32_t orig_dns_ip, cli_ip;
     uint16_t orig_dns_port;
     uint32_t orig_if_idx, orig_sub_if_idx;
+    uint16_t dns_txid;
+
+    if (!packet_dns_txid(ctx, &dns_txid)) {
+        LOG_TRACE("DNS response (loopback): malformed payload, passing through");
+        if (!WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr))
+            LOG_WARN("WinDivertSend failed (DNS response loopback malformed): err=%lu", GetLastError());
+        return;
+    }
+
     if (dns_hijack_rewrite_response(engine->dns_hijack, &orig_dns_ip, &orig_dns_port,
-                                     ctx->dst_port, &cli_ip, &orig_if_idx, &orig_sub_if_idx)) {
+                                     ctx->dst_port, dns_txid,
+                                     &cli_ip, &orig_if_idx, &orig_sub_if_idx)) {
         char orig_str[16], cli_str[16], src_str[16];
         ip_to_str(orig_dns_ip, orig_str, sizeof(orig_str));
         ip_to_str(cli_ip, cli_str, sizeof(cli_str));
@@ -119,8 +145,10 @@ static void handle_inbound(divert_engine_t *engine, pkt_ctx_t *ctx,
     if (type == PKT_DNS_RESP) {
         uint32_t orig_dns_ip;
         uint16_t orig_dns_port;
-        if (dns_hijack_rewrite_response(engine->dns_hijack, &orig_dns_ip, &orig_dns_port,
-                                         ctx->dst_port, NULL, NULL, NULL)) {
+        uint16_t dns_txid;
+        if (packet_dns_txid(ctx, &dns_txid) &&
+            dns_hijack_rewrite_response(engine->dns_hijack, &orig_dns_ip, &orig_dns_port,
+                                         ctx->dst_port, dns_txid, NULL, NULL, NULL)) {
             ctx->ip_hdr->SrcAddr = orig_dns_ip;
             ctx->udp_hdr->SrcPort = htons(orig_dns_port);
             WinDivertHelperCalcChecksums(ctx->packet, ctx->packet_len, addr, 0);
@@ -175,17 +203,33 @@ static void handle_return_path(divert_engine_t *engine, pkt_ctx_t *ctx,
 /* === Handler: DNS hijacking (non-loopback rewrite or loopback socket forward) === */
 static void handle_dns_hijack(divert_engine_t *engine, pkt_ctx_t *ctx,
                                WINDIVERT_ADDRESS *addr) {
+    PVOID dns_data = NULL;
+    UINT dns_data_len = 0;
+    uint16_t dns_txid = 0;
+
+    WinDivertHelperParsePacket(ctx->packet, ctx->packet_len,
+        NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+        &dns_data, &dns_data_len, NULL, NULL);
+    if (!dns_data || dns_data_len < 2) {
+        LOG_TRACE("DNS hijack: malformed DNS payload, passing through");
+        if (!WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr))
+            LOG_WARN("WinDivertSend failed (DNS malformed pass): err=%lu", GetLastError());
+        return;
+    }
+    {
+        const uint8_t *p = (const uint8_t *)dns_data;
+        dns_txid = (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+    }
+
     if (engine->dns_hijack->use_socket_fwd) {
-        PVOID dns_data = NULL;
-        UINT dns_data_len = 0;
-        WinDivertHelperParsePacket(ctx->packet, ctx->packet_len,
-            NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-            &dns_data, &dns_data_len, NULL, NULL);
-        if (dns_data && dns_data_len > 0) {
-            dns_hijack_forward_query(engine->dns_hijack,
-                (const uint8_t *)dns_data, dns_data_len,
-                ctx->src_port, ctx->dst_ip, ctx->dst_port,
-                ctx->src_ip, addr->Network.IfIdx, addr->Network.SubIfIdx);
+        error_t err = dns_hijack_forward_query(engine->dns_hijack,
+            (const uint8_t *)dns_data, (int)dns_data_len,
+            ctx->src_port, ctx->dst_ip, ctx->dst_port,
+            ctx->src_ip, addr->Network.IfIdx, addr->Network.SubIfIdx);
+        if (err != ERR_OK) {
+            LOG_WARN("DNS hijack: loopback forward failed (%d), passing original query", err);
+            if (!WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr))
+                LOG_WARN("WinDivertSend failed (DNS forward fallback): err=%lu", GetLastError());
         }
         return;
     }
@@ -193,13 +237,18 @@ static void handle_dns_hijack(divert_engine_t *engine, pkt_ctx_t *ctx,
     uint32_t new_dst_ip = ctx->dst_ip;
     uint16_t new_dst_port = ctx->dst_port;
     if (dns_hijack_rewrite_request(engine->dns_hijack, &new_dst_ip, &new_dst_port,
-                                    ctx->src_port, ctx->dst_ip, ctx->dst_port,
+                                    ctx->src_port, dns_txid,
+                                    ctx->dst_ip, ctx->dst_port,
                                     ctx->src_ip, addr->Network.IfIdx, addr->Network.SubIfIdx) == 1) {
         ctx->ip_hdr->DstAddr = new_dst_ip;
         ctx->udp_hdr->DstPort = htons(new_dst_port);
         WinDivertHelperCalcChecksums(ctx->packet, ctx->packet_len, addr, 0);
         if (!WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr))
             LOG_WARN("WinDivertSend failed (DNS hijack): err=%lu", GetLastError());
+    } else {
+        LOG_WARN("DNS hijack: failed to store NAT entry, passing original query");
+        if (!WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr))
+            LOG_WARN("WinDivertSend failed (DNS hijack fallback): err=%lu", GetLastError());
     }
 }
 
@@ -215,7 +264,13 @@ static void proxy_redirect_udp_forward(divert_engine_t *engine, pkt_ctx_t *ctx) 
         return;
     }
 
-    uint8_t framed[2 + 65536];
+    if (udp_data_len > WTP_UDP_BUFFER_SIZE) {
+        LOG_WARN("UDP PROXY: payload too large: %u", udp_data_len);
+        return;
+    }
+
+    uint8_t framed[2 + WTP_UDP_BUFFER_SIZE];
+    int framed_len = (int)(2U + udp_data_len);
     framed[0] = (uint8_t)(ctx->src_port >> 8);
     framed[1] = (uint8_t)(ctx->src_port & 0xFF);
     memcpy(framed + 2, udp_data, udp_data_len);
@@ -226,12 +281,12 @@ static void proxy_redirect_udp_forward(divert_engine_t *engine, pkt_ctx_t *ctx) 
     relay_dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     relay_dest.sin_port = htons(UDP_RELAY_PORT);
 
-    int fwd = sendto(engine->udp_fwd_sock, (const char *)framed, 2 + udp_data_len, 0,
+    int fwd = sendto(engine->udp_fwd_sock, (const char *)framed, framed_len, 0,
                      (struct sockaddr *)&relay_dest, sizeof(relay_dest));
     if (fwd == SOCKET_ERROR)
         LOG_WARN("UDP fwd sendto failed: %d", WSAGetLastError());
     else
-        LOG_DEBUG("UDP fwd: sent %u bytes (port %u) to relay", udp_data_len, ctx->src_port);
+        LOG_TRACE("UDP fwd: sent %u bytes (port %u) to relay", udp_data_len, ctx->src_port);
 }
 
 /* === Helper: non-SYN TCP that is tracked — redirect to relay === */
@@ -405,10 +460,49 @@ static DWORD WINAPI divert_worker_proc(LPVOID param) {
     return 0;
 }
 
+static void divert_close_handle(divert_engine_t *engine) {
+    if (engine->handle && engine->handle != INVALID_HANDLE_VALUE) {
+        WinDivertClose(engine->handle);
+    }
+    engine->handle = INVALID_HANDLE_VALUE;
+}
+
+static void divert_close_udp_socket(divert_engine_t *engine) {
+    if (engine->udp_fwd_sock != INVALID_SOCKET) {
+        closesocket(engine->udp_fwd_sock);
+    }
+    engine->udp_fwd_sock = INVALID_SOCKET;
+}
+
+static void divert_join_workers(divert_engine_t *engine) {
+    for (int i = 0; i < DIVERT_WORKER_COUNT; i++) {
+        if (engine->workers[i]) {
+            WaitForSingleObject(engine->workers[i], 5000);
+            CloseHandle(engine->workers[i]);
+            engine->workers[i] = NULL;
+        }
+    }
+}
+
+static error_t divert_start_fail(divert_engine_t *engine, dns_hijack_t *dns_hijack,
+                                 int dns_forwarder_started, error_t err) {
+    engine->running = 0;
+    if (dns_forwarder_started) {
+        dns_hijack_shutdown(dns_hijack);
+    }
+    divert_close_handle(engine);
+    divert_close_udp_socket(engine);
+    divert_join_workers(engine);
+    return err;
+}
+
 error_t divert_start(divert_engine_t *engine, app_config_t *config,
                     conntrack_t *conntrack, proc_lookup_t *proc_lookup,
                     dns_hijack_t *dns_hijack) {
+    int dns_forwarder_started = 0;
+
     memset(engine, 0, sizeof(*engine));
+    engine->handle = INVALID_HANDLE_VALUE;
     engine->config = config;
     engine->conntrack = conntrack;
     engine->proc_lookup = proc_lookup;
@@ -465,6 +559,7 @@ error_t divert_start(divert_engine_t *engine, app_config_t *config,
         LOG_ERROR("WinDivertOpen failed: %lu", err);
         if (err == 5) LOG_ERROR("Access denied — run as Administrator");
         if (err == 577) LOG_ERROR("Driver not signed — install WinDivert driver");
+        engine->running = 0;
         return ERR_PERMISSION;
     }
 
@@ -475,8 +570,7 @@ error_t divert_start(divert_engine_t *engine, app_config_t *config,
     engine->udp_fwd_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (engine->udp_fwd_sock == INVALID_SOCKET) {
         LOG_ERROR("UDP fwd socket: socket() failed: %d", WSAGetLastError());
-        WinDivertClose(engine->handle);
-        return ERR_NETWORK;
+        return divert_start_fail(engine, dns_hijack, dns_forwarder_started, ERR_NETWORK);
     }
     {
         struct sockaddr_in bind_addr;
@@ -486,32 +580,30 @@ error_t divert_start(divert_engine_t *engine, app_config_t *config,
         bind_addr.sin_port = 0;
         if (bind(engine->udp_fwd_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) == SOCKET_ERROR) {
             LOG_ERROR("UDP fwd socket: bind() failed: %d", WSAGetLastError());
-            closesocket(engine->udp_fwd_sock);
-            engine->udp_fwd_sock = INVALID_SOCKET;
-            WinDivertClose(engine->handle);
-            return ERR_NETWORK;
+            return divert_start_fail(engine, dns_hijack, dns_forwarder_started, ERR_NETWORK);
         }
         struct sockaddr_in local;
         int local_len = sizeof(local);
-        getsockname(engine->udp_fwd_sock, (struct sockaddr *)&local, &local_len);
+        if (getsockname(engine->udp_fwd_sock, (struct sockaddr *)&local, &local_len) == SOCKET_ERROR) {
+            LOG_ERROR("UDP fwd socket: getsockname() failed: %d", WSAGetLastError());
+            return divert_start_fail(engine, dns_hijack, dns_forwarder_started, ERR_NETWORK);
+        }
         LOG_INFO("UDP forwarding socket bound to 127.0.0.1:%u", ntohs(local.sin_port));
     }
 
     if (dns_hijack->use_socket_fwd) {
         if (dns_hijack_start_forwarder(dns_hijack, engine->handle) != ERR_OK) {
             LOG_ERROR("Failed to start DNS forwarder");
-            WinDivertClose(engine->handle);
-            return ERR_GENERIC;
+            return divert_start_fail(engine, dns_hijack, dns_forwarder_started, ERR_GENERIC);
         }
+        dns_forwarder_started = 1;
     }
 
     for (int i = 0; i < DIVERT_WORKER_COUNT; i++) {
         engine->workers[i] = CreateThread(NULL, 0, divert_worker_proc, engine, 0, NULL);
         if (!engine->workers[i]) {
             LOG_ERROR("Failed to create WinDivert worker thread %d", i);
-            engine->running = 0;
-            WinDivertClose(engine->handle);
-            return ERR_GENERIC;
+            return divert_start_fail(engine, dns_hijack, dns_forwarder_started, ERR_GENERIC);
         }
     }
 
@@ -521,24 +613,12 @@ error_t divert_start(divert_engine_t *engine, app_config_t *config,
 
 void divert_stop(divert_engine_t *engine) {
     engine->running = 0;
-
-    if (engine->handle && engine->handle != INVALID_HANDLE_VALUE) {
-        WinDivertClose(engine->handle);
-        engine->handle = NULL;
+    if (engine->dns_hijack && engine->dns_hijack->use_socket_fwd) {
+        dns_hijack_shutdown(engine->dns_hijack);
     }
-
-    if (engine->udp_fwd_sock != INVALID_SOCKET) {
-        closesocket(engine->udp_fwd_sock);
-        engine->udp_fwd_sock = INVALID_SOCKET;
-    }
-
-    for (int i = 0; i < DIVERT_WORKER_COUNT; i++) {
-        if (engine->workers[i]) {
-            WaitForSingleObject(engine->workers[i], 5000);
-            CloseHandle(engine->workers[i]);
-            engine->workers[i] = NULL;
-        }
-    }
+    divert_close_handle(engine);
+    divert_close_udp_socket(engine);
+    divert_join_workers(engine);
 
     LOG_INFO("WinDivert engine stopped");
 }

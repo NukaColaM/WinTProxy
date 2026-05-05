@@ -15,7 +15,7 @@ WinDivert captures outbound packets before they leave the network stack. WinTPro
 
 **UDP:** Payloads are forwarded to a local relay with a source-port header. The relay performs a SOCKS5 UDP ASSOCIATE handshake, wraps/unwraps payloads in SOCKS5 UDP datagrams, and responses are sent back through loopback for injection.
 
-**DNS hijacking:** outbound DNS queries (port 53) are intercepted before rule evaluation and redirected to a local resolver.
+**DNS hijacking:** outbound DNS queries (port 53) are intercepted before rule evaluation and redirected to the configured resolver. Loopback resolvers use a UDP forwarding socket because WinDivert cannot reliably inject packets into the loopback stack.
 
 A connection-tracking table keyed on `(source_port, protocol)` stores original destination IP/port and adapter interface index for return-path restoration.
 
@@ -45,6 +45,7 @@ Options:
   --dns <addr:port>   Enable DNS hijacking (redirect to addr:port)
   --log <path>        Write logs to file (in addition to stderr)
   -v, --verbose       Increase verbosity (-v info, -vv debug, -vvv trace)
+  --version           Show version
   -h, --help          Show help
 ```
 
@@ -71,6 +72,14 @@ See [`config.example.json`](config.example.json) for a complete example. Command
 }
 ```
 
+Configuration is intentionally strict:
+
+- `address` and `redirect_address` must be IPv4 literals.
+- `port`, `redirect_port`, and rule ports must be in `1..65535`.
+- `default_action` and rule `action` must be `proxy`, `direct`, or `block`.
+- Rule `protocol` must be `tcp`, `udp`, or `both`.
+- Malformed JSON, wrong value types, invalid IP patterns, truncated strings, and short file reads fail startup.
+
 ### Rules
 
 Rules are evaluated in order; first match wins. When no rule matches, `default_action` applies.
@@ -85,7 +94,11 @@ Rules are evaluated in order; first match wins. When no rule matches, `default_a
 }
 ```
 
-All match fields are optional. A rule with no match fields matches everything.
+All match fields are optional. A rule with no match fields matches everything. Because first match wins, put broad wildcard rules after more specific direct/block rules.
+
+IP patterns support exact IPv4 addresses, CIDR (`10.0.0.0/8`), inclusive ranges (`10.0.0.1-10.0.0.20`), wildcard octets (`192.168.*.*`), and semicolon-separated lists. Port patterns support exact ports, inclusive ranges, comma lists, and semicolon lists.
+
+`bypass_private_ips` bypasses RFC 1918, link-local, and CGNAT destinations before rule evaluation.
 
 ## Requirements
 
@@ -101,6 +114,7 @@ All match fields are optional. A rule with no match fields matches everything.
 - **Loopback interface index** default (`IfIdx=1`) may not be correct on all machines
 - **Single proxy** — all proxied traffic routed through one SOCKS5 server
 - **No domain-based SOCKS5** — only IPv4 addresses (ATYP 0x01) sent to the proxy
+- **Strict IPv4 config** - hostnames are not resolved from `proxy.address`, `dns.redirect_address`, or IP rules
 
 ## License
 

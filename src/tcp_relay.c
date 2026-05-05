@@ -3,8 +3,9 @@
 #include "log.h"
 #include "util.h"
 #include <string.h>
+#include <stdlib.h>
 
-#define TCP_RELAY_BUF_SIZE  65536
+#define TCP_RELAY_BUF_SIZE  WTP_TCP_RELAY_BUFFER_SIZE
 
 typedef struct {
     SOCKET          client_sock;
@@ -12,6 +13,13 @@ typedef struct {
     proxy_config_t *proxy;
     volatile int   *running;
 } tcp_conn_ctx_t;
+
+static void close_socket_if_valid(SOCKET *sock) {
+    if (*sock != INVALID_SOCKET) {
+        closesocket(*sock);
+        *sock = INVALID_SOCKET;
+    }
+}
 
 static DWORD WINAPI tcp_connection_handler(LPVOID param) {
     tcp_conn_ctx_t *ctx = (tcp_conn_ctx_t *)param;
@@ -84,7 +92,7 @@ static DWORD WINAPI tcp_connection_handler(LPVOID param) {
         if (FD_ISSET(client, &fds)) {
             int n = recv(client, buf, sizeof(buf), 0);
             if (n <= 0) break;
-            bytes_up += n;
+            bytes_up += (uint64_t)n;
             int sent = 0;
             while (sent < n) {
                 int s = send(proxy_sock, buf + sent, n - sent, 0);
@@ -96,7 +104,7 @@ static DWORD WINAPI tcp_connection_handler(LPVOID param) {
         if (FD_ISSET(proxy_sock, &fds)) {
             int n = recv(proxy_sock, buf, sizeof(buf), 0);
             if (n <= 0) break;
-            bytes_down += n;
+            bytes_down += (uint64_t)n;
             int sent = 0;
             while (sent < n) {
                 int s = send(client, buf + sent, n - sent, 0);
@@ -158,6 +166,7 @@ static DWORD WINAPI tcp_accept_thread(LPVOID param) {
 
 error_t tcp_relay_start(tcp_relay_t *relay, conntrack_t *conntrack, proxy_config_t *proxy) {
     memset(relay, 0, sizeof(*relay));
+    relay->listen_sock = INVALID_SOCKET;
     relay->conntrack = conntrack;
     relay->proxy = proxy;
     relay->running = 1;
@@ -165,6 +174,7 @@ error_t tcp_relay_start(tcp_relay_t *relay, conntrack_t *conntrack, proxy_config
     relay->listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (relay->listen_sock == INVALID_SOCKET) {
         LOG_ERROR("TCP relay: socket() failed: %d", WSAGetLastError());
+        relay->running = 0;
         return ERR_NETWORK;
     }
 
@@ -179,20 +189,23 @@ error_t tcp_relay_start(tcp_relay_t *relay, conntrack_t *conntrack, proxy_config
 
     if (bind(relay->listen_sock, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
         LOG_ERROR("TCP relay: bind failed on port %u: %d", TCP_RELAY_PORT, WSAGetLastError());
-        closesocket(relay->listen_sock);
+        close_socket_if_valid(&relay->listen_sock);
+        relay->running = 0;
         return ERR_NETWORK;
     }
 
     if (listen(relay->listen_sock, SOMAXCONN) == SOCKET_ERROR) {
         LOG_ERROR("TCP relay: listen failed: %d", WSAGetLastError());
-        closesocket(relay->listen_sock);
+        close_socket_if_valid(&relay->listen_sock);
+        relay->running = 0;
         return ERR_NETWORK;
     }
 
     relay->thread = CreateThread(NULL, 0, tcp_accept_thread, relay, 0, NULL);
     if (!relay->thread) {
         LOG_ERROR("TCP relay: failed to create accept thread");
-        closesocket(relay->listen_sock);
+        close_socket_if_valid(&relay->listen_sock);
+        relay->running = 0;
         return ERR_GENERIC;
     }
 
@@ -202,10 +215,7 @@ error_t tcp_relay_start(tcp_relay_t *relay, conntrack_t *conntrack, proxy_config
 
 void tcp_relay_stop(tcp_relay_t *relay) {
     relay->running = 0;
-    if (relay->listen_sock != INVALID_SOCKET) {
-        closesocket(relay->listen_sock);
-        relay->listen_sock = INVALID_SOCKET;
-    }
+    close_socket_if_valid(&relay->listen_sock);
     if (relay->thread) {
         WaitForSingleObject(relay->thread, 5000);
         CloseHandle(relay->thread);

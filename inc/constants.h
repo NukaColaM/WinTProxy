@@ -1,0 +1,33 @@
+#ifndef WINTPROXY_CONSTANTS_H
+#define WINTPROXY_CONSTANTS_H
+
+#define WTP_TCP_RELAY_PORT             34010
+#define WTP_UDP_RELAY_PORT             34011
+
+#define WTP_DIVERT_WORKER_COUNT        4
+#define WTP_DIVERT_MAX_PACKET_SIZE     65535
+#define WTP_DIVERT_QUEUE_LENGTH        8192
+#define WTP_DIVERT_QUEUE_TIME_MS       2000
+
+#define WTP_DNS_NAT_BUCKETS            256
+#define WTP_DNS_NAT_TTL_MS             30000
+#define WTP_DNS_FORWARD_BUFFER_SIZE    2048
+
+#define WTP_CONNTRACK_BUCKETS          1024
+#define WTP_CONNTRACK_TTL_SEC          60
+#define WTP_CONNTRACK_CLEANUP_SEC      30
+
+#define WTP_PROC_CACHE_BUCKETS         1024
+#define WTP_PROC_CACHE_TTL_MS          5000
+#define WTP_PROC_CACHE_NEG_TTL_MS      1500
+
+#define WTP_UDP_SESSION_MAX            256
+#define WTP_UDP_SESSION_TTL_SEC        300
+#define WTP_UDP_RETRY_DELAY_MS         5000
+#define WTP_UDP_BUFFER_SIZE            65536
+
+#define WTP_TCP_RELAY_BUFFER_SIZE      65536
+
+#define WTP_IPV4_LOOPBACK              0x0100007FU
+
+#endif

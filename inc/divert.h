@@ -5,16 +5,17 @@
 #include "connection.h"
 #include "process.h"
 #include "dns.h"
+#include "constants.h"
 
 #ifdef _WIN32
 #include <windows.h>
 #include <winsock2.h>
 #endif
 
-#define DIVERT_WORKER_COUNT     4
-#define DIVERT_MAX_PACKET_SIZE  65535
-#define DIVERT_QUEUE_LENGTH     8192
-#define DIVERT_QUEUE_TIME       2000
+#define DIVERT_WORKER_COUNT     WTP_DIVERT_WORKER_COUNT
+#define DIVERT_MAX_PACKET_SIZE  WTP_DIVERT_MAX_PACKET_SIZE
+#define DIVERT_QUEUE_LENGTH     WTP_DIVERT_QUEUE_LENGTH
+#define DIVERT_QUEUE_TIME       WTP_DIVERT_QUEUE_TIME_MS
 
 typedef struct {
     HANDLE           handle;

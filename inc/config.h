@@ -60,8 +60,7 @@ typedef struct {
 error_t config_load(app_config_t *cfg, const char *path);
 void    config_set_defaults(app_config_t *cfg);
 void    config_free(app_config_t *cfg);
-void    config_apply_cli(app_config_t *cfg, const char *proxy_str, const char *dns_str, int verbosity);
-void    config_resolve_addresses(app_config_t *cfg);
+error_t config_apply_cli(app_config_t *cfg, const char *proxy_str, const char *dns_str, int verbosity);
 void    config_dump(const app_config_t *cfg);
 
 #endif

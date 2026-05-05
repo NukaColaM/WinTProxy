@@ -1,5 +1,6 @@
 #include "connection.h"
 #include "log.h"
+#include "util.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -53,6 +54,7 @@ error_t conntrack_init(conntrack_t *ct) {
     ct->cleanup_thread = CreateThread(NULL, 0, cleanup_thread_proc, ct, 0, NULL);
     if (!ct->cleanup_thread) {
         LOG_ERROR("Failed to create conntrack cleanup thread");
+        ct->running = 0;
         return ERR_GENERIC;
     }
     return ERR_OK;
@@ -92,7 +94,7 @@ error_t conntrack_add(conntrack_t *ct, uint16_t src_port, uint32_t src_ip,
             e->orig_dst_ip = orig_dst_ip;
             e->orig_dst_port = orig_dst_port;
             e->pid = pid;
-            if (process_name) strncpy(e->process_name, process_name, sizeof(e->process_name) - 1);
+            if (process_name) safe_str_copy(e->process_name, sizeof(e->process_name), process_name);
             e->timestamp = get_tick_ms();
             e->if_idx = if_idx;
             e->sub_if_idx = sub_if_idx;
@@ -114,7 +116,7 @@ error_t conntrack_add(conntrack_t *ct, uint16_t src_port, uint32_t src_ip,
     e->orig_dst_port = orig_dst_port;
     e->protocol = protocol;
     e->pid = pid;
-    if (process_name) strncpy(e->process_name, process_name, sizeof(e->process_name) - 1);
+    if (process_name) safe_str_copy(e->process_name, sizeof(e->process_name), process_name);
     e->timestamp = get_tick_ms();
     e->if_idx = if_idx;
     e->sub_if_idx = sub_if_idx;

@@ -4,13 +4,14 @@
 #include "connection.h"
 #include "config.h"
 #include "common.h"
+#include "constants.h"
 
 #ifdef _WIN32
 #include <windows.h>
 #include <winsock2.h>
 #endif
 
-#define TCP_RELAY_PORT  34010
+#define TCP_RELAY_PORT  WTP_TCP_RELAY_PORT
 
 typedef struct {
     SOCKET           listen_sock;

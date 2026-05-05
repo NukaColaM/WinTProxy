@@ -4,16 +4,17 @@
 #include "connection.h"
 #include "config.h"
 #include "common.h"
+#include "constants.h"
 
 #ifdef _WIN32
 #include <windows.h>
 #include <winsock2.h>
 #endif
 
-#define UDP_RELAY_PORT      34011
-#define UDP_SESSION_MAX     256
-#define UDP_SESSION_TTL_SEC 300
-#define UDP_RETRY_DELAY_MS  5000
+#define UDP_RELAY_PORT      WTP_UDP_RELAY_PORT
+#define UDP_SESSION_MAX     WTP_UDP_SESSION_MAX
+#define UDP_SESSION_TTL_SEC WTP_UDP_SESSION_TTL_SEC
+#define UDP_RETRY_DELAY_MS  WTP_UDP_RETRY_DELAY_MS
 
 typedef struct {
     int              active;
