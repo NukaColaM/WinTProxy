@@ -1,0 +1,11 @@
+LIBRARY WinDivert
+EXPORTS
+    WinDivertOpen
+    WinDivertClose
+    WinDivertRecv
+    WinDivertSend
+    WinDivertSetParam
+    WinDivertGetParam
+    WinDivertHelperParsePacket
+    WinDivertHelperCalcChecksums
+    WinDivertHelperHashPacket
