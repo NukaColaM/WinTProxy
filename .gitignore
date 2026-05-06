@@ -1,4 +1,5 @@
 build/
+build-*/
 
 # CMake/Ninja/Make generated files when configured in-tree
 CMakeFiles/

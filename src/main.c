@@ -25,6 +25,60 @@ static dns_hijack_t     g_dns_hijack;
 static divert_engine_t  g_divert;
 static tcp_relay_t      g_tcp_relay;
 static udp_relay_t      g_udp_relay;
+static HANDLE           g_metrics_thread;
+
+static DWORD WINAPI metrics_thread_proc(LPVOID param) {
+    (void)param;
+    while (g_running) {
+        Sleep(30000);
+        if (!g_running) break;
+        divert_counters_t divert_counters;
+        conntrack_counters_t conntrack_counters;
+        proc_lookup_counters_t proc_counters;
+        tcp_relay_counters_t tcp_counters;
+        udp_relay_counters_t udp_counters;
+
+        divert_snapshot_counters(&g_divert, &divert_counters);
+        conntrack_snapshot_counters(&g_conntrack, &conntrack_counters);
+        proc_lookup_snapshot_counters(&g_proc_lookup, &proc_counters);
+        tcp_relay_snapshot_counters(&g_tcp_relay, &tcp_counters);
+        udp_relay_snapshot_counters(&g_udp_relay, &udp_counters);
+
+        LOG_INFO("perf: pkt recv=%llu sent=%llu drop=%llu send_fail=%llu udp_fwd=%llu; "
+                 "ct add=%llu upd=%llu rem=%llu miss=%llu exhausted=%llu stale=%llu; "
+                 "proc hit=%llu wildcard=%llu miss=%llu refresh=%llu flow_events=%llu; "
+                 "tcp active=%llu accepted=%llu rejected=%llu up=%llu down=%llu; "
+                 "udp active=%llu created=%llu evicted=%llu drop=%llu up=%llu down=%llu",
+                 (unsigned long long)divert_counters.packets_recv,
+                 (unsigned long long)divert_counters.packets_sent,
+                 (unsigned long long)divert_counters.packets_dropped,
+                 (unsigned long long)divert_counters.send_failures,
+                 (unsigned long long)divert_counters.udp_forwarded,
+                 (unsigned long long)conntrack_counters.adds,
+                 (unsigned long long)conntrack_counters.updates,
+                 (unsigned long long)conntrack_counters.removes,
+                 (unsigned long long)conntrack_counters.misses,
+                 (unsigned long long)conntrack_counters.pool_exhausted,
+                 (unsigned long long)conntrack_counters.stale_cleanups,
+                 (unsigned long long)proc_counters.flow_hits,
+                 (unsigned long long)proc_counters.wildcard_hits,
+                 (unsigned long long)proc_counters.misses,
+                 (unsigned long long)proc_counters.refreshes,
+                 (unsigned long long)proc_counters.flow_events,
+                 (unsigned long long)tcp_counters.active_connections,
+                 (unsigned long long)tcp_counters.accepted_connections,
+                 (unsigned long long)tcp_counters.rejected_connections,
+                 (unsigned long long)tcp_counters.bytes_up,
+                 (unsigned long long)tcp_counters.bytes_down,
+                 (unsigned long long)udp_counters.active_sessions,
+                 (unsigned long long)udp_counters.created_sessions,
+                 (unsigned long long)udp_counters.evicted_sessions,
+                 (unsigned long long)udp_counters.dropped_datagrams,
+                 (unsigned long long)udp_counters.bytes_up,
+                 (unsigned long long)udp_counters.bytes_down);
+    }
+    return 0;
+}
 
 static BOOL WINAPI console_handler(DWORD ctrl) {
     if (ctrl == CTRL_C_EVENT || ctrl == CTRL_BREAK_EVENT || ctrl == CTRL_CLOSE_EVENT) {
@@ -46,7 +100,7 @@ static void print_usage(const char *prog) {
         "  --proxy <addr:port> SOCKS5 proxy address (default: 127.0.0.1:7890)\n"
         "  --dns <addr:port>   Enable DNS hijacking (redirect to addr:port)\n"
         "  --log <path>        Write logs to file (in addition to stderr)\n"
-        "  -v, --verbose       Increase verbosity (repeat for more: -vv, -vvv)\n"
+        "  -v, --verbose       Increase verbosity (repeat for more: -vv, -vvv, -vvvv)\n"
         "  --version           Show version\n"
         "  -h, --help          Show this help\n"
         "\n"
@@ -72,6 +126,7 @@ int main(int argc, char *argv[]) {
     int tcp_ok = 0;
     int udp_ok = 0;
     int divert_ok = 0;
+    int exit_code = 1;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
@@ -84,11 +139,13 @@ int main(int argc, char *argv[]) {
             log_path = argv[++i];
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             if (verbosity < LOG_INFO) verbosity = LOG_INFO;
-            else if (verbosity < LOG_TRACE) verbosity++;
+            else if (verbosity < LOG_PACKET) verbosity++;
         } else if (strcmp(argv[i], "-vv") == 0) {
             verbosity = LOG_DEBUG;
         } else if (strcmp(argv[i], "-vvv") == 0) {
             verbosity = LOG_TRACE;
+        } else if (strcmp(argv[i], "-vvvv") == 0) {
+            verbosity = LOG_PACKET;
         } else if (strcmp(argv[i], "--version") == 0) {
             fprintf(stderr, "WinTProxy " WINTPROXY_VERSION "\n");
             return 0;
@@ -145,11 +202,17 @@ int main(int argc, char *argv[]) {
     }
     conntrack_ok = 1;
 
-    proc_lookup_init(&g_proc_lookup);
+    if (proc_lookup_init(&g_proc_lookup) != ERR_OK) {
+        LOG_ERROR("Failed to initialize process lookup");
+        goto cleanup;
+    }
     proc_lookup_ok = 1;
 
-    dns_hijack_init(&g_dns_hijack, config.dns.enabled,
-                    config.dns.redirect_ip_addr, config.dns.redirect_port);
+    if (dns_hijack_init(&g_dns_hijack, config.dns.enabled,
+                        config.dns.redirect_ip_addr, config.dns.redirect_port) != ERR_OK) {
+        LOG_ERROR("Failed to initialize DNS hijack state");
+        goto cleanup;
+    }
     dns_ok = 1;
 
     if (tcp_relay_start(&g_tcp_relay, &g_conntrack, &config.proxy) != ERR_OK) {
@@ -164,20 +227,34 @@ int main(int argc, char *argv[]) {
     }
     udp_ok = 1;
 
-    if (divert_start(&g_divert, &config, &g_conntrack, &g_proc_lookup, &g_dns_hijack) != ERR_OK) {
+    if (divert_start(&g_divert, &config, &g_conntrack, &g_proc_lookup, &g_dns_hijack,
+                     g_tcp_relay.port, g_udp_relay.port) != ERR_OK) {
         LOG_ERROR("Failed to start WinDivert engine");
         goto cleanup;
     }
     divert_ok = 1;
+
+    g_metrics_thread = CreateThread(NULL, 0, metrics_thread_proc, NULL, 0, NULL);
+    if (!g_metrics_thread) {
+        LOG_WARN("Failed to start periodic metrics thread");
+    }
 
     LOG_INFO("WinTProxy is running. Press Ctrl+C to stop.");
 
     while (g_running) {
         Sleep(500);
     }
+    exit_code = 0;
 
 cleanup:
     LOG_INFO("Shutting down...");
+
+    if (g_metrics_thread) {
+        g_running = 0;
+        WaitForSingleObject(g_metrics_thread, 1000);
+        CloseHandle(g_metrics_thread);
+        g_metrics_thread = NULL;
+    }
 
     if (divert_ok)  divert_stop(&g_divert);
     if (udp_ok)     udp_relay_stop(&g_udp_relay);
@@ -190,5 +267,5 @@ cleanup:
 
     LOG_INFO("WinTProxy stopped.");
     log_shutdown();
-    return 0;
+    return exit_code;
 }

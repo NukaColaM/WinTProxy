@@ -11,6 +11,7 @@
 #endif
 
 #define DNS_NAT_BUCKETS WTP_DNS_NAT_BUCKETS
+#define DNS_NAT_POOL_SIZE WTP_DNS_NAT_POOL_SIZE
 #define DNS_NAT_TTL_MS  WTP_DNS_NAT_TTL_MS
 
 typedef struct dns_nat_entry_s {
@@ -40,11 +41,15 @@ struct dns_hijack_s {
     HANDLE           fwd_thread;
     volatile int     fwd_running;
     void            *divert_handle;
-    dns_nat_entry_t *buckets[DNS_NAT_BUCKETS];
+    dns_nat_entry_t **buckets;
+    dns_nat_entry_t  *pool;
+    dns_nat_entry_t *free_list;
+    size_t            bucket_count;
+    size_t            pool_size;
     SRWLOCK          lock;
 };
 
-void dns_hijack_init(dns_hijack_t *dh, int enabled, uint32_t redirect_ip, uint16_t redirect_port);
+error_t dns_hijack_init(dns_hijack_t *dh, int enabled, uint32_t redirect_ip, uint16_t redirect_port);
 void dns_hijack_shutdown(dns_hijack_t *dh);
 
 int dns_hijack_is_dns_request(uint16_t dst_port);

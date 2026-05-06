@@ -37,7 +37,4 @@ typedef enum {
     PKT_BYPASS
 } pkt_type_t;
 
-/* === Debug helpers === */
-#define STATIC_ASSERT(cond)  typedef char _static_assert_##__LINE__[(cond) ? 1 : -1]
-
 #endif

@@ -26,12 +26,6 @@
             "action": "proxy"
         },
         {
-            "process": "game.exe",
-            "protocol": "udp",
-            "action": "block",
-            "enabled": false
-        },
-        {
             "process": "*",
             "port": "80,443,8080,8443",
             "protocol": "tcp",

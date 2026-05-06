@@ -4,7 +4,7 @@ project(WinTProxy C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-add_compile_options(-Wall -Wextra -Wno-unknown-pragmas -DWIN32_LEAN_AND_MEAN)
+add_compile_options(-Wall -Wextra -Wno-unknown-pragmas -DWIN32_LEAN_AND_MEAN -D_WIN32_WINNT=0x0600)
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     add_compile_options(-O2 -DNDEBUG)
@@ -26,6 +26,8 @@ set(SOURCES
 )
 
 add_executable(WinTProxy ${SOURCES})
+
+target_compile_definitions(WinTProxy PRIVATE CJSON_HIDE_SYMBOLS)
 
 target_include_directories(WinTProxy PRIVATE
     ${CMAKE_SOURCE_DIR}/inc
@@ -51,3 +53,5 @@ else()
 endif()
 
 install(TARGETS WinTProxy RUNTIME DESTINATION bin)
+install(FILES README.md LICENSE DESTINATION share/WinTProxy)
+install(DIRECTORY docs examples DESTINATION share/WinTProxy)

@@ -2,12 +2,17 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <stdlib.h>
 #include <windows.h>
 
 #define LOG_SHARD_COUNT        16
 #define LOG_SHARD_CAPACITY     4096
 #define LOG_MESSAGE_MAX        1024
 #define LOG_FLUSH_INTERVAL_MS  250
+
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
 
 typedef struct {
     log_level_t level;
@@ -17,7 +22,7 @@ typedef struct {
 } log_entry_t;
 
 typedef struct {
-    log_entry_t  entries[LOG_SHARD_CAPACITY];
+    log_entry_t *entries;
     unsigned int head;
     unsigned int tail;
     unsigned int count;
@@ -39,14 +44,19 @@ static log_queue_t  g_log_queue;
 static CRITICAL_SECTION g_output_lock;
 static int g_output_lock_init = 0;
 
-static const char *level_names[] = { "ERROR", "WARN", "INFO", "DEBUG", "TRACE" };
-static const char *level_colors[] = { "\033[31m", "\033[33m", "\033[32m", "\033[36m", "\033[90m" };
+static const char *level_names[] = { "ERROR", "WARN", "INFO", "DEBUG", "TRACE", "PKT" };
+static const char *level_colors[] = { "\033[31m", "\033[33m", "\033[32m", "\033[36m", "\033[90m", "\033[35m" };
 
 static void log_output_entry(const log_entry_t *entry);
 static void log_output_dropped(unsigned long dropped);
 static DWORD WINAPI log_worker_proc(LPVOID param);
 
+int log_is_enabled(log_level_t level) {
+    return level <= g_log_level;
+}
+
 void log_init(log_level_t level, const char *log_file_path) {
+    int async_ready = 1;
     g_log_level = level;
 
     if (log_file_path && log_file_path[0]) {
@@ -62,17 +72,28 @@ void log_init(log_level_t level, const char *log_file_path) {
 
     for (int i = 0; i < LOG_SHARD_COUNT; i++) {
         InitializeCriticalSection(&g_log_queue.shards[i].lock);
+        g_log_queue.shards[i].entries = (log_entry_t *)calloc(LOG_SHARD_CAPACITY, sizeof(log_entry_t));
+        if (!g_log_queue.shards[i].entries) {
+            async_ready = 0;
+        }
     }
     g_log_queue.initialized = 1;
 
     {
         HANDLE hConsole = GetStdHandle(STD_ERROR_HANDLE);
         DWORD mode;
-        g_log_queue.use_color = GetConsoleMode(hConsole, &mode) != 0;
+        if (GetConsoleMode(hConsole, &mode) != 0 &&
+            SetConsoleMode(hConsole, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0) {
+            g_log_queue.use_color = 1;
+        } else {
+            g_log_queue.use_color = 0;
+        }
     }
 
-    g_log_queue.thread = CreateThread(NULL, 0, log_worker_proc, &g_log_queue, 0, NULL);
-    if (!g_log_queue.thread) {
+    if (async_ready) {
+        g_log_queue.thread = CreateThread(NULL, 0, log_worker_proc, &g_log_queue, 0, NULL);
+    }
+    if (!async_ready || !g_log_queue.thread) {
         g_log_queue.running = 0;
         fprintf(stderr, "WARNING: Cannot start logger thread; falling back to synchronous logging\n");
     }
@@ -87,6 +108,8 @@ void log_shutdown(void) {
     }
     if (g_log_queue.initialized) {
         for (int i = 0; i < LOG_SHARD_COUNT; i++) {
+            free(g_log_queue.shards[i].entries);
+            g_log_queue.shards[i].entries = NULL;
             DeleteCriticalSection(&g_log_queue.shards[i].lock);
         }
         g_log_queue.initialized = 0;
@@ -241,6 +264,10 @@ void log_write(log_level_t level, const char *fmt, ...) {
     /* Sharded async path: pick shard by thread ID, O(1) insert, O(1) on full */
     unsigned int s = entry.tid % LOG_SHARD_COUNT;
     log_shard_t *shard = &g_log_queue.shards[s];
+    if (!shard->entries) {
+        log_output_entry(&entry);
+        return;
+    }
 
     EnterCriticalSection(&shard->lock);
     if (shard->count < LOG_SHARD_CAPACITY) {

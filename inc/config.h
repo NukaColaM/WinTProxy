@@ -2,7 +2,12 @@
 #define WINTPROXY_CONFIG_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include "common.h"
+
+#define RULE_PROCESS_TOKEN_MAX  16
+#define RULE_IP_RANGE_MAX       32
+#define RULE_PORT_RANGE_MAX     32
 
 typedef enum {
     RULE_ACTION_PROXY  = 0,
@@ -16,13 +21,31 @@ typedef enum {
     RULE_PROTO_UDP  = 2
 } rule_protocol_t;
 
-typedef struct ip_range_s {
-    uint32_t            start;
-    uint32_t            end;
-    struct ip_range_s  *next;
+typedef enum {
+    RULE_PROCESS_ANY = 0,
+    RULE_PROCESS_EXACT,
+    RULE_PROCESS_PREFIX,
+    RULE_PROCESS_SUFFIX,
+    RULE_PROCESS_CONTAINS
+} rule_process_match_t;
+
+typedef struct {
+    rule_process_match_t type;
+    char                 text[256];
+    size_t               len;
+} process_pattern_t;
+
+typedef struct {
+    uint32_t start;
+    uint32_t end;
 } ip_range_t;
 
-typedef struct rule_s {
+typedef struct {
+    uint16_t start;
+    uint16_t end;
+} port_range_t;
+
+typedef struct {
     int             id;
     char            process[256];
     char            ip[256];
@@ -30,8 +53,15 @@ typedef struct rule_s {
     rule_protocol_t protocol;
     rule_action_t   action;
     int             enabled;
-    ip_range_t     *ip_ranges;
-    struct rule_s  *next;
+    int             process_any;
+    process_pattern_t process_patterns[RULE_PROCESS_TOKEN_MAX];
+    size_t          process_pattern_count;
+    int             ip_any;
+    ip_range_t      ip_ranges[RULE_IP_RANGE_MAX];
+    size_t          ip_range_count;
+    int             port_any;
+    port_range_t    port_ranges[RULE_PORT_RANGE_MAX];
+    size_t          port_range_count;
 } rule_t;
 
 typedef struct {
@@ -51,6 +81,7 @@ typedef struct {
     proxy_config_t proxy;
     dns_config_t   dns;
     rule_t        *rules;
+    size_t         rule_count;
     rule_action_t  default_action;
     int            log_level;
     char           log_file[260];

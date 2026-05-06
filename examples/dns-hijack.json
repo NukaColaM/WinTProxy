@@ -1,0 +1,29 @@
+{
+    "proxy": {
+        "address": "127.0.0.1",
+        "port": 7890
+    },
+    "dns": {
+        "enabled": true,
+        "redirect_address": "127.0.0.1",
+        "redirect_port": 1053
+    },
+    "rules": [
+        {
+            "process": "sockd.exe",
+            "action": "direct"
+        },
+        {
+            "ip": "127.0.0.0/8",
+            "action": "direct"
+        },
+        {
+            "process": "*",
+            "action": "proxy"
+        }
+    ],
+    "default_action": "proxy",
+    "bypass_private_ips": true,
+    "log_level": "info",
+    "log_file": ""
+}

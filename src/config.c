@@ -14,6 +14,8 @@
 
 #include "cJSON/cJSON.h"
 
+#define CONFIG_FILE_MAX_BYTES (1024L * 1024L)
+
 void config_set_defaults(app_config_t *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     safe_str_copy(cfg->proxy.address, sizeof(cfg->proxy.address), "127.0.0.1");
@@ -24,28 +26,16 @@ void config_set_defaults(app_config_t *cfg) {
     cfg->dns.redirect_port = 1053;
     cfg->dns.redirect_ip_addr = LOOPBACK_ADDR;
     cfg->rules = NULL;
+    cfg->rule_count = 0;
     cfg->default_action = RULE_ACTION_PROXY;
     cfg->log_level = LOG_INFO;
     cfg->bypass_private_ips = 0;
 }
 
-static void ip_ranges_free(ip_range_t *ranges) {
-    while (ranges) {
-        ip_range_t *next = ranges->next;
-        free(ranges);
-        ranges = next;
-    }
-}
-
 void config_free(app_config_t *cfg) {
-    rule_t *r = cfg->rules;
-    while (r) {
-        rule_t *next = r->next;
-        ip_ranges_free(r->ip_ranges);
-        free(r);
-        r = next;
-    }
+    free(cfg->rules);
     cfg->rules = NULL;
+    cfg->rule_count = 0;
 }
 
 static char *trim(char *s) {
@@ -123,6 +113,7 @@ static int parse_log_level(const char *s, int *out) {
     if (_stricmp(s, "info") == 0)  { *out = LOG_INFO;  return 1; }
     if (_stricmp(s, "debug") == 0) { *out = LOG_DEBUG; return 1; }
     if (_stricmp(s, "trace") == 0) { *out = LOG_TRACE; return 1; }
+    if (_stricmp(s, "packet") == 0) { *out = LOG_PACKET; return 1; }
     return 0;
 }
 
@@ -141,22 +132,71 @@ static int resolve_ip_required(const char *name, const char *addr_str, uint32_t 
     return 1;
 }
 
-static int append_ip_range(ip_range_t **head, ip_range_t **tail, uint32_t start, uint32_t end) {
-    ip_range_t *node;
-    if (start > end) return 0;
+static int ip_range_cmp(const void *a, const void *b) {
+    const ip_range_t *ra = (const ip_range_t *)a;
+    const ip_range_t *rb = (const ip_range_t *)b;
+    if (ra->start < rb->start) return -1;
+    if (ra->start > rb->start) return 1;
+    if (ra->end < rb->end) return -1;
+    if (ra->end > rb->end) return 1;
+    return 0;
+}
 
-    node = (ip_range_t *)calloc(1, sizeof(*node));
-    if (!node) return 0;
+static int port_range_cmp(const void *a, const void *b) {
+    const port_range_t *ra = (const port_range_t *)a;
+    const port_range_t *rb = (const port_range_t *)b;
+    if (ra->start < rb->start) return -1;
+    if (ra->start > rb->start) return 1;
+    if (ra->end < rb->end) return -1;
+    if (ra->end > rb->end) return 1;
+    return 0;
+}
 
-    node->start = start;
-    node->end = end;
-    if (!*head) {
-        *head = node;
-        *tail = node;
-    } else {
-        (*tail)->next = node;
-        *tail = node;
+static void merge_ip_ranges(rule_t *r) {
+    size_t out = 0;
+    if (r->ip_range_count <= 1) return;
+    qsort(r->ip_ranges, r->ip_range_count, sizeof(r->ip_ranges[0]), ip_range_cmp);
+
+    for (size_t i = 0; i < r->ip_range_count; i++) {
+        ip_range_t cur = r->ip_ranges[i];
+        if (out > 0 && cur.start <= r->ip_ranges[out - 1].end + 1U) {
+            if (cur.end > r->ip_ranges[out - 1].end) r->ip_ranges[out - 1].end = cur.end;
+        } else {
+            r->ip_ranges[out++] = cur;
+        }
     }
+    r->ip_range_count = out;
+}
+
+static void merge_port_ranges(rule_t *r) {
+    size_t out = 0;
+    if (r->port_range_count <= 1) return;
+    qsort(r->port_ranges, r->port_range_count, sizeof(r->port_ranges[0]), port_range_cmp);
+
+    for (size_t i = 0; i < r->port_range_count; i++) {
+        port_range_t cur = r->port_ranges[i];
+        if (out > 0 && (unsigned int)cur.start <= (unsigned int)r->port_ranges[out - 1].end + 1U) {
+            if (cur.end > r->port_ranges[out - 1].end) r->port_ranges[out - 1].end = cur.end;
+        } else {
+            r->port_ranges[out++] = cur;
+        }
+    }
+    r->port_range_count = out;
+}
+
+static int append_ip_range(rule_t *r, uint32_t start, uint32_t end) {
+    if (start > end || r->ip_range_count >= RULE_IP_RANGE_MAX) return 0;
+    r->ip_ranges[r->ip_range_count].start = start;
+    r->ip_ranges[r->ip_range_count].end = end;
+    r->ip_range_count++;
+    return 1;
+}
+
+static int append_port_range(rule_t *r, uint16_t start, uint16_t end) {
+    if (start > end || r->port_range_count >= RULE_PORT_RANGE_MAX) return 0;
+    r->port_ranges[r->port_range_count].start = start;
+    r->port_ranges[r->port_range_count].end = end;
+    r->port_range_count++;
     return 1;
 }
 
@@ -197,21 +237,23 @@ static int parse_wildcard_ipv4(const char *token, uint32_t *start, uint32_t *end
     return 1;
 }
 
-static int ip_ranges_compile(const char *pattern, ip_range_t **out) {
+static int compile_ip_ranges(rule_t *r) {
     char pat_copy[256];
-    ip_range_t *head = NULL;
-    ip_range_t *tail = NULL;
     char *ctx = NULL;
     char *token;
 
-    *out = NULL;
-    if (!pattern || strcmp(pattern, "*") == 0) return 1;
-    if (!safe_str_copy(pat_copy, sizeof(pat_copy), pattern)) {
+    r->ip_any = 0;
+    r->ip_range_count = 0;
+    if (strcmp(r->ip, "*") == 0) {
+        r->ip_any = 1;
+        return 1;
+    }
+    if (!safe_str_copy(pat_copy, sizeof(pat_copy), r->ip)) {
         LOG_ERROR("Invalid config: IP pattern is too long");
         return 0;
     }
 
-    token = strtok_s(pat_copy, ";", &ctx);
+    token = strtok_s(pat_copy, ";,", &ctx);
     while (token) {
         uint32_t start = 0;
         uint32_t end = 0;
@@ -260,31 +302,35 @@ static int ip_ranges_compile(const char *pattern, ip_range_t **out) {
             start = end = ipv4_net_to_host(exact_net);
         }
 
-        if (!append_ip_range(&head, &tail, start, end)) {
-            LOG_ERROR("Invalid config: IP range start must be <= end: %s", pattern);
-            goto fail;
+        if (!append_ip_range(r, start, end)) {
+            LOG_ERROR("Invalid config: too many IP ranges or invalid range: %s", r->ip);
+            return 0;
         }
 
-        token = strtok_s(NULL, ";", &ctx);
+        token = strtok_s(NULL, ";,", &ctx);
     }
 
-    if (!head) goto fail;
-    *out = head;
+    if (r->ip_range_count == 0) goto fail;
+    merge_ip_ranges(r);
     return 1;
 
 fail:
-    LOG_ERROR("Invalid config: IP pattern is malformed: %s", pattern);
-    ip_ranges_free(head);
+    LOG_ERROR("Invalid config: IP pattern is malformed: %s", r->ip);
     return 0;
 }
 
-static int validate_port_pattern(const char *pattern) {
+static int compile_port_ranges(rule_t *r) {
     char copy[128];
     char *ctx = NULL;
     char *token;
 
-    if (!pattern || strcmp(pattern, "*") == 0) return 1;
-    if (!safe_str_copy(copy, sizeof(copy), pattern)) {
+    r->port_any = 0;
+    r->port_range_count = 0;
+    if (strcmp(r->port, "*") == 0) {
+        r->port_any = 1;
+        return 1;
+    }
+    if (!safe_str_copy(copy, sizeof(copy), r->port)) {
         LOG_ERROR("Invalid config: port pattern is too long");
         return 0;
     }
@@ -297,7 +343,7 @@ static int validate_port_pattern(const char *pattern) {
 
         token = trim(token);
         if (!*token) {
-            LOG_ERROR("Invalid config: empty port token in pattern: %s", pattern);
+            LOG_ERROR("Invalid config: empty port token in pattern: %s", r->port);
             return 0;
         }
 
@@ -307,15 +353,98 @@ static int validate_port_pattern(const char *pattern) {
             if (!parse_port_text(trim(token), 0, &lo) ||
                 !parse_port_text(trim(dash + 1), 0, &hi) ||
                 lo > hi) {
-                LOG_ERROR("Invalid config: malformed port range: %s", pattern);
+                LOG_ERROR("Invalid config: malformed port range: %s", r->port);
                 return 0;
             }
-        } else if (!parse_port_text(token, 0, &lo)) {
-            LOG_ERROR("Invalid config: malformed port token: %s", pattern);
+        } else if (parse_port_text(token, 0, &lo)) {
+            hi = lo;
+        } else {
+            LOG_ERROR("Invalid config: malformed port token: %s", r->port);
+            return 0;
+        }
+
+        if (!append_port_range(r, lo, hi)) {
+            LOG_ERROR("Invalid config: too many port ranges: %s", r->port);
             return 0;
         }
 
         token = strtok_s(NULL, ",;", &ctx);
+    }
+
+    if (r->port_range_count == 0) return 0;
+    merge_port_ranges(r);
+    return 1;
+}
+
+static int append_process_pattern(rule_t *r, rule_process_match_t type, const char *text) {
+    process_pattern_t *p;
+    if (r->process_pattern_count >= RULE_PROCESS_TOKEN_MAX) return 0;
+    p = &r->process_patterns[r->process_pattern_count++];
+    memset(p, 0, sizeof(*p));
+    p->type = type;
+    if (!safe_str_copy(p->text, sizeof(p->text), text)) return 0;
+    _strlwr(p->text);
+    p->len = strlen(p->text);
+    return p->len > 0 || type == RULE_PROCESS_ANY;
+}
+
+static int compile_process_patterns(rule_t *r) {
+    char copy[256];
+    char *ctx = NULL;
+    char *token;
+
+    r->process_any = 0;
+    r->process_pattern_count = 0;
+    if (strcmp(r->process, "*") == 0 || _stricmp(r->process, "any") == 0) {
+        r->process_any = 1;
+        return 1;
+    }
+
+    if (!safe_str_copy(copy, sizeof(copy), r->process)) {
+        LOG_ERROR("Invalid config: process pattern is too long");
+        return 0;
+    }
+
+    token = strtok_s(copy, ",;", &ctx);
+    while (token) {
+        rule_process_match_t type = RULE_PROCESS_EXACT;
+        size_t len;
+
+        token = trim(token);
+        len = strlen(token);
+        if (len == 0) {
+            token = strtok_s(NULL, ",;", &ctx);
+            continue;
+        }
+
+        if (strcmp(token, "*") == 0 || _stricmp(token, "any") == 0) {
+            r->process_any = 1;
+            return 1;
+        }
+
+        if (token[0] == '*' && token[len - 1] == '*' && len > 2) {
+            token[len - 1] = '\0';
+            token++;
+            type = RULE_PROCESS_CONTAINS;
+        } else if (token[0] == '*' && len > 1) {
+            token++;
+            type = RULE_PROCESS_SUFFIX;
+        } else if (token[len - 1] == '*' && len > 1) {
+            token[len - 1] = '\0';
+            type = RULE_PROCESS_PREFIX;
+        }
+
+        if (!append_process_pattern(r, type, token)) {
+            LOG_ERROR("Invalid config: too many process patterns or token too long: %s", r->process);
+            return 0;
+        }
+
+        token = strtok_s(NULL, ",;", &ctx);
+    }
+
+    if (r->process_pattern_count == 0) {
+        LOG_ERROR("Invalid config: process pattern is empty: %s", r->process);
+        return 0;
     }
 
     return 1;
@@ -410,18 +539,6 @@ static int parse_dns_object(app_config_t *cfg, cJSON *dns) {
     return parse_json_port(port, "dns.redirect_port", &cfg->dns.redirect_port);
 }
 
-static int append_rule(app_config_t *cfg, rule_t **tail, rule_t *rule) {
-    rule->next = NULL;
-    if (!cfg->rules) {
-        cfg->rules = rule;
-        *tail = rule;
-    } else {
-        (*tail)->next = rule;
-        *tail = rule;
-    }
-    return 1;
-}
-
 static int parse_rule_object(rule_t *r, cJSON *item, int id) {
     cJSON *proc = cJSON_GetObjectItemCaseSensitive(item, "process");
     cJSON *ip = cJSON_GetObjectItemCaseSensitive(item, "ip");
@@ -430,6 +547,7 @@ static int parse_rule_object(rule_t *r, cJSON *item, int id) {
     cJSON *action = cJSON_GetObjectItemCaseSensitive(item, "action");
     cJSON *enabled = cJSON_GetObjectItemCaseSensitive(item, "enabled");
 
+    memset(r, 0, sizeof(*r));
     r->id = id;
     r->enabled = 1;
     safe_str_copy(r->process, sizeof(r->process), "*");
@@ -459,8 +577,6 @@ static int parse_rule_object(rule_t *r, cJSON *item, int id) {
             return 0;
         }
     }
-    if (!ip_ranges_compile(r->ip, &r->ip_ranges)) return 0;
-
     if (port) {
         if (!cJSON_IsString(port) ||
             !safe_str_copy(r->port, sizeof(r->port), port->valuestring)) {
@@ -468,8 +584,6 @@ static int parse_rule_object(rule_t *r, cJSON *item, int id) {
             return 0;
         }
     }
-    if (!validate_port_pattern(r->port)) return 0;
-
     if (proto) {
         if (!cJSON_IsString(proto) || !parse_protocol(proto->valuestring, &r->protocol)) {
             LOG_ERROR("Invalid config: rules[%d].protocol must be tcp, udp, or both", id - 1);
@@ -483,13 +597,15 @@ static int parse_rule_object(rule_t *r, cJSON *item, int id) {
         }
     }
 
-    return 1;
+    return compile_process_patterns(r) && compile_ip_ranges(r) && compile_port_ranges(r);
 }
 
 static int parse_rules_array(app_config_t *cfg, cJSON *rules) {
-    rule_t *tail = NULL;
     int count;
+    rule_t *compiled;
 
+    cfg->rules = NULL;
+    cfg->rule_count = 0;
     if (!rules) return 1;
     if (!cJSON_IsArray(rules)) {
         LOG_ERROR("Invalid config: rules must be an array");
@@ -497,27 +613,27 @@ static int parse_rules_array(app_config_t *cfg, cJSON *rules) {
     }
 
     count = cJSON_GetArraySize(rules);
+    if (count <= 0) return 1;
+
+    compiled = (rule_t *)calloc((size_t)count, sizeof(*compiled));
+    if (!compiled) return 0;
+
     for (int i = 0; i < count; i++) {
         cJSON *item = cJSON_GetArrayItem(rules, i);
-        rule_t *r;
-
         if (!cJSON_IsObject(item)) {
             LOG_ERROR("Invalid config: rules[%d] must be an object", i);
+            free(compiled);
             return 0;
         }
 
-        r = (rule_t *)calloc(1, sizeof(*r));
-        if (!r) return 0;
-
-        if (!parse_rule_object(r, item, i + 1)) {
-            ip_ranges_free(r->ip_ranges);
-            free(r);
+        if (!parse_rule_object(&compiled[i], item, i + 1)) {
+            free(compiled);
             return 0;
         }
-
-        append_rule(cfg, &tail, r);
     }
 
+    cfg->rules = compiled;
+    cfg->rule_count = (size_t)count;
     return 1;
 }
 
@@ -539,6 +655,11 @@ error_t config_load(app_config_t *cfg, const char *path) {
     }
     if (fseek(f, 0, SEEK_END) != 0 || (len = ftell(f)) < 0 || fseek(f, 0, SEEK_SET) != 0) {
         LOG_ERROR("Cannot determine config file size: %s", path);
+        goto done;
+    }
+    if (len > CONFIG_FILE_MAX_BYTES) {
+        LOG_ERROR("Config file is too large: %s (%ld bytes, max %ld)", path, len, CONFIG_FILE_MAX_BYTES);
+        result = ERR_PARAM;
         goto done;
     }
 
@@ -584,7 +705,7 @@ error_t config_load(app_config_t *cfg, const char *path) {
         cJSON *log_lvl = cJSON_GetObjectItemCaseSensitive(root, "log_level");
         if (log_lvl) {
             if (!cJSON_IsString(log_lvl) || !parse_log_level(log_lvl->valuestring, &next.log_level)) {
-                LOG_ERROR("Invalid config: log_level must be error, warn, info, debug, or trace");
+                LOG_ERROR("Invalid config: log_level must be error, warn, info, debug, trace, or packet");
                 goto done;
             }
         }
@@ -663,7 +784,7 @@ error_t config_apply_cli(app_config_t *cfg, const char *proxy_str, const char *d
     }
 
     if (verbosity >= 0) {
-        if (verbosity > LOG_TRACE) verbosity = LOG_TRACE;
+        if (verbosity > LOG_PACKET) verbosity = LOG_PACKET;
         cfg->log_level = verbosity;
     }
 
@@ -682,8 +803,8 @@ void config_dump(const app_config_t *cfg) {
         cfg->default_action == RULE_ACTION_DIRECT ? "direct" : "block");
     LOG_INFO("Bypass private IPs: %s", cfg->bypass_private_ips ? "enabled" : "disabled");
 
-    int count = 0;
-    for (rule_t *r = cfg->rules; r; r = r->next) {
+    for (size_t i = 0; i < cfg->rule_count; i++) {
+        const rule_t *r = &cfg->rules[i];
         LOG_INFO("  Rule #%d: process=%s ip=%s port=%s proto=%s action=%s%s",
             r->id, r->process, r->ip, r->port,
             r->protocol == RULE_PROTO_TCP ? "tcp" :
@@ -691,7 +812,6 @@ void config_dump(const app_config_t *cfg) {
             r->action == RULE_ACTION_PROXY ? "proxy" :
             r->action == RULE_ACTION_DIRECT ? "direct" : "block",
             r->enabled ? "" : " disabled");
-        count++;
     }
-    LOG_INFO("Total rules: %d", count);
+    LOG_INFO("Total rules: %u", (unsigned int)cfg->rule_count);
 }

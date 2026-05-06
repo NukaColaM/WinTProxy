@@ -2,126 +2,104 @@
 #include "config.h"
 #include "log.h"
 #include "util.h"
+#include <ctype.h>
 #include <string.h>
-#include <stdlib.h>
-#include <stdio.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
-#include <ws2tcpip.h>
 #endif
 
-static int rules_match_process(const char *pattern, const char *process_name) {
-    if (!pattern || !process_name) return 0;
-    if (strcmp(pattern, "*") == 0 || _stricmp(pattern, "any") == 0) return 1;
+static void lowercase_ascii(char *s) {
+    while (*s) {
+        *s = (char)tolower((unsigned char)*s);
+        s++;
+    }
+}
 
-    char pat_lower[256], name_lower[256];
-    if (!safe_str_copy(pat_lower, sizeof(pat_lower), pattern) ||
-        !safe_str_copy(name_lower, sizeof(name_lower), process_name)) {
+static int rules_match_process(const rule_t *r, const char *process_name) {
+    char name_lower[256];
+
+    if (r->process_any) return 1;
+    if (!process_name || !safe_str_copy(name_lower, sizeof(name_lower), process_name)) {
         return 0;
     }
-    _strlwr(pat_lower);
-    _strlwr(name_lower);
 
-    /* Handle comma/semicolon separated lists */
-    char *ctx = NULL;
-    char *token = strtok_s(pat_lower, ",;", &ctx);
-    while (token) {
-        while (*token == ' ') token++;
-        char *end = token + strlen(token) - 1;
-        while (end > token && *end == ' ') { *end = '\0'; end--; }
+    lowercase_ascii(name_lower);
+    size_t nlen = strlen(name_lower);
 
-        int match = 0;
-        size_t tlen = strlen(token);
-        size_t nlen = strlen(name_lower);
-
-        if (tlen == 0) {
-            token = strtok_s(NULL, ",;", &ctx);
-            continue;
+    for (size_t i = 0; i < r->process_pattern_count; i++) {
+        const process_pattern_t *p = &r->process_patterns[i];
+        switch (p->type) {
+        case RULE_PROCESS_ANY:
+            return 1;
+        case RULE_PROCESS_EXACT:
+            if (strcmp(name_lower, p->text) == 0) return 1;
+            break;
+        case RULE_PROCESS_PREFIX:
+            if (nlen >= p->len && strncmp(name_lower, p->text, p->len) == 0) return 1;
+            break;
+        case RULE_PROCESS_SUFFIX:
+            if (nlen >= p->len && strcmp(name_lower + nlen - p->len, p->text) == 0) return 1;
+            break;
+        case RULE_PROCESS_CONTAINS:
+            if (strstr(name_lower, p->text) != NULL) return 1;
+            break;
         }
+    }
 
-        if (strcmp(token, "*") == 0) {
-            match = 1;
-        } else if (token[0] == '*' && token[tlen - 1] == '*' && tlen > 2) {
-            /* *substring* */
-            char sub[256];
-            if (tlen - 2 >= sizeof(sub)) return 0;
-            memcpy(sub, token + 1, tlen - 2);
-            sub[tlen - 2] = '\0';
-            match = strstr(name_lower, sub) != NULL;
-        } else if (token[0] == '*') {
-            /* *suffix */
-            const char *suffix = token + 1;
-            size_t slen = strlen(suffix);
-            if (nlen >= slen) match = strcmp(name_lower + nlen - slen, suffix) == 0;
-        } else if (token[tlen - 1] == '*') {
-            /* prefix* */
-            match = strncmp(name_lower, token, tlen - 1) == 0;
-        } else {
-            match = strcmp(name_lower, token) == 0;
-        }
+    return 0;
+}
 
-        if (match) return 1;
-        token = strtok_s(NULL, ",;", &ctx);
+static int rules_match_ip(const rule_t *r, uint32_t ip) {
+    uint32_t ip_host;
+
+    if (r->ip_any) return 1;
+
+    ip_host = ipv4_net_to_host(ip);
+    for (size_t i = 0; i < r->ip_range_count; i++) {
+        const ip_range_t *range = &r->ip_ranges[i];
+        if (ip_host < range->start) return 0;
+        if (ip_host <= range->end) return 1;
     }
     return 0;
 }
 
-static int rules_match_ip(const ip_range_t *ranges, uint32_t ip) {
-    uint32_t ip_host = ipv4_net_to_host(ip);
-    if (!ranges) return 1;
-    for (const ip_range_t *r = ranges; r; r = r->next) {
-        if (ip_host >= r->start && ip_host <= r->end) return 1;
+static int rules_match_port(const rule_t *r, uint16_t port) {
+    if (r->port_any) return 1;
+
+    for (size_t i = 0; i < r->port_range_count; i++) {
+        const port_range_t *range = &r->port_ranges[i];
+        if (port < range->start) return 0;
+        if (port <= range->end) return 1;
     }
     return 0;
 }
 
-static int rules_match_port(const char *pattern, uint16_t port) {
-    if (!pattern) return 0;
-    if (strcmp(pattern, "*") == 0) return 1;
-
-    char pat_copy[128];
-    if (!safe_str_copy(pat_copy, sizeof(pat_copy), pattern)) return 0;
-
-    char *ctx = NULL;
-    char *token = strtok_s(pat_copy, ",;", &ctx);
-    while (token) {
-        while (*token == ' ') token++;
-
-        char *dash = strchr(token, '-');
-        if (dash) {
-            *dash = '\0';
-            uint16_t lo = (uint16_t)atoi(token);
-            uint16_t hi = (uint16_t)atoi(dash + 1);
-            if (port >= lo && port <= hi) return 1;
-        } else {
-            if (port == (uint16_t)atoi(token)) return 1;
-        }
-
-        token = strtok_s(NULL, ",;", &ctx);
-    }
+static uint8_t rule_protocol_number(const rule_t *r) {
+    if (r->protocol == RULE_PROTO_TCP) return 6;
+    if (r->protocol == RULE_PROTO_UDP) return 17;
     return 0;
 }
 
-rule_action_t rules_match(const rule_t *rules, rule_action_t default_action,
-                          const char *process_name, uint32_t dst_ip,
-                          uint16_t dst_port, uint8_t protocol) {
-    uint8_t rule_proto;
+rule_action_t rules_match_ex(const rule_t *rules, size_t rule_count, rule_action_t default_action,
+                             const char *process_name, uint32_t dst_ip,
+                             uint16_t dst_port, uint8_t protocol, int *matched_rule_id) {
+    if (matched_rule_id) *matched_rule_id = 0;
 
-    for (const rule_t *r = rules; r; r = r->next) {
+    for (size_t i = 0; i < rule_count; i++) {
+        const rule_t *r = &rules[i];
+        uint8_t rule_proto;
+
         if (!r->enabled) continue;
 
-        /* Check protocol compatibility */
-        if (r->protocol == RULE_PROTO_TCP) rule_proto = 6;
-        else if (r->protocol == RULE_PROTO_UDP) rule_proto = 17;
-        else rule_proto = 0;
+        rule_proto = rule_protocol_number(r);
 
         if (rule_proto != 0 && rule_proto != protocol) continue;
 
-        if (rules_match_process(r->process, process_name) &&
-            rules_match_ip(r->ip_ranges, dst_ip) &&
-            rules_match_port(r->port, dst_port)) {
-            LOG_TRACE("Rule #%d matched process=%s", r->id, r->process);
+        if (rules_match_process(r, process_name) &&
+            rules_match_ip(r, dst_ip) &&
+            rules_match_port(r, dst_port)) {
+            if (matched_rule_id) *matched_rule_id = r->id;
             return r->action;
         }
     }

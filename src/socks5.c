@@ -54,7 +54,7 @@ error_t socks5_connect_to_proxy(SOCKET *out_sock, uint32_t proxy_ip, uint16_t pr
 
 static error_t socks5_negotiate_auth(SOCKET sock) {
     uint8_t req[3] = { SOCKS5_VERSION, 1, SOCKS5_AUTH_NONE };
-    LOG_TRACE("socks5: sending auth [%02x %02x %02x]", req[0], req[1], req[2]);
+    LOG_PACKET("socks5: sending auth [%02x %02x %02x]", req[0], req[1], req[2]);
     if (send_all(sock, req, sizeof(req)) < 0) {
         LOG_ERROR("socks5: failed to send auth negotiation");
         return ERR_NETWORK;
@@ -66,7 +66,7 @@ static error_t socks5_negotiate_auth(SOCKET sock) {
         return ERR_NETWORK;
     }
 
-    LOG_TRACE("socks5: auth response [%02x %02x]", resp[0], resp[1]);
+    LOG_PACKET("socks5: auth response [%02x %02x]", resp[0], resp[1]);
 
     if (resp[0] != SOCKS5_VERSION || resp[1] != SOCKS5_AUTH_NONE) {
         LOG_ERROR("socks5: auth rejected (ver=%02x, method=%02x)", resp[0], resp[1]);
@@ -81,7 +81,7 @@ static error_t socks5_recv_response(SOCKET sock, uint8_t *atyp_out,
     uint8_t hdr[4];
     if (recv_all(sock, hdr, 4) < 0) return ERR_NETWORK;
 
-    LOG_TRACE("socks5: response hdr [%02x %02x %02x %02x]", hdr[0], hdr[1], hdr[2], hdr[3]);
+    LOG_PACKET("socks5: response hdr [%02x %02x %02x %02x]", hdr[0], hdr[1], hdr[2], hdr[3]);
 
     if (hdr[0] != SOCKS5_VERSION) return ERR_PROTO;
     if (hdr[1] != 0x00) {
@@ -119,7 +119,7 @@ static error_t socks5_recv_response(SOCKET sock, uint8_t *atyp_out,
 
 error_t socks5_tcp_handshake(SOCKET sock, uint32_t dst_ip, uint16_t dst_port) {
     unsigned char *ib = (unsigned char *)&dst_ip;
-    LOG_DEBUG("socks5: CONNECT to %u.%u.%u.%u:%u", ib[0], ib[1], ib[2], ib[3], dst_port);
+    LOG_PACKET("socks5: CONNECT to %u.%u.%u.%u:%u", ib[0], ib[1], ib[2], ib[3], dst_port);
 
     if (socks5_negotiate_auth(sock) != ERR_OK) return ERR_PROTO;
 
@@ -145,7 +145,7 @@ error_t socks5_tcp_handshake(SOCKET sock, uint32_t dst_ip, uint16_t dst_port) {
         return ERR_PROTO;
     }
 
-    LOG_TRACE("socks5: CONNECT succeeded");
+    LOG_PACKET("socks5: CONNECT succeeded");
     return ERR_OK;
 }
 
@@ -188,7 +188,7 @@ error_t socks5_udp_associate(SOCKET ctrl_sock, struct sockaddr_in *relay_addr) {
 
     char relay_str[16];
     ip_to_str(relay_addr->sin_addr.s_addr, relay_str, sizeof(relay_str));
-    LOG_DEBUG("socks5: UDP ASSOCIATE relay at %s:%u",
+    LOG_PACKET("socks5: UDP ASSOCIATE relay at %s:%u",
         relay_str, ntohs(relay_addr->sin_port));
     return ERR_OK;
 }

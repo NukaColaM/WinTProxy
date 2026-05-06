@@ -10,6 +10,7 @@
 #include "windivert/windivert.h"
 
 #include <winsock2.h>
+#include <iphlpapi.h>
 
 /* Packet context passed to handler functions */
 typedef struct {
@@ -23,21 +24,81 @@ typedef struct {
     uint16_t           src_port;
     uint16_t           dst_port;
     uint8_t            protocol;
+    const uint8_t     *dns_data;
+    UINT               dns_data_len;
+    int                dns_data_valid;
+    uint16_t           dns_txid;
+    int                dns_txid_valid;
 } pkt_ctx_t;
 
-static int packet_dns_txid(pkt_ctx_t *ctx, uint16_t *txid) {
-    PVOID dns_data = NULL;
-    UINT dns_data_len = 0;
+static void counter_inc(volatile LONG64 *counter) {
+    InterlockedIncrement64(counter);
+}
 
-    WinDivertHelperParsePacket(ctx->packet, ctx->packet_len,
-        NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-        &dns_data, &dns_data_len, NULL, NULL);
-    if (!dns_data || dns_data_len < 2) return 0;
-
-    {
-        const uint8_t *p = (const uint8_t *)dns_data;
-        *txid = (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+static int divert_send_packet(divert_engine_t *engine, const void *packet, UINT packet_len,
+                              WINDIVERT_ADDRESS *addr, const char *context) {
+    if (WinDivertSend(engine->handle, packet, packet_len, NULL, addr)) {
+        counter_inc(&engine->counters.packets_sent);
+        return 1;
     }
+    counter_inc(&engine->counters.send_failures);
+    LOG_WARN("WinDivertSend failed (%s): err=%lu", context ? context : "packet", GetLastError());
+    return 0;
+}
+
+static void set_loopback_route(divert_engine_t *engine, WINDIVERT_ADDRESS *addr) {
+    addr->Outbound = 1;
+    addr->Loopback = 1;
+    addr->Network.IfIdx = engine->loopback_if_idx;
+    addr->Network.SubIfIdx = 0;
+}
+
+static uint32_t detect_loopback_if_idx(void) {
+    DWORD if_idx = 0;
+    DWORD ret = GetBestInterface(htonl(INADDR_LOOPBACK), &if_idx);
+    if (ret == NO_ERROR && if_idx != 0) return if_idx;
+    LOG_WARN("Could not detect loopback interface index (err=%lu); using IfIdx=1", ret);
+    return 1;
+}
+
+static void tune_windivert_queue(divert_engine_t *engine) {
+    WinDivertSetParam(engine->handle, WINDIVERT_PARAM_QUEUE_LENGTH, DIVERT_QUEUE_LENGTH);
+    WinDivertSetParam(engine->handle, WINDIVERT_PARAM_QUEUE_TIME, DIVERT_QUEUE_TIME);
+    WinDivertSetParam(engine->handle, WINDIVERT_PARAM_QUEUE_SIZE, DIVERT_QUEUE_SIZE);
+    WinDivertGetParam(engine->handle, WINDIVERT_PARAM_QUEUE_LENGTH, &engine->queue_length);
+    WinDivertGetParam(engine->handle, WINDIVERT_PARAM_QUEUE_TIME, &engine->queue_time);
+    WinDivertGetParam(engine->handle, WINDIVERT_PARAM_QUEUE_SIZE, &engine->queue_size);
+}
+
+static int packet_dns_payload(pkt_ctx_t *ctx, const uint8_t **dns_data, UINT *dns_data_len) {
+    if (!ctx->dns_data_valid) {
+        PVOID data = NULL;
+        UINT len = 0;
+        WinDivertHelperParsePacket(ctx->packet, ctx->packet_len,
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+            &data, &len, NULL, NULL);
+        ctx->dns_data = (const uint8_t *)data;
+        ctx->dns_data_len = len;
+        ctx->dns_data_valid = 1;
+        ctx->dns_txid_valid = 0;
+    }
+    if (dns_data) *dns_data = ctx->dns_data;
+    if (dns_data_len) *dns_data_len = ctx->dns_data_len;
+    return ctx->dns_data && ctx->dns_data_len >= 2;
+}
+
+static int packet_dns_data(pkt_ctx_t *ctx, const uint8_t **dns_data, UINT *dns_data_len) {
+    return packet_dns_payload(ctx, dns_data, dns_data_len);
+}
+
+static int packet_dns_txid(pkt_ctx_t *ctx, uint16_t *txid) {
+    if (!packet_dns_payload(ctx, NULL, NULL)) return 0;
+    if (!ctx->dns_txid_valid) {
+        const uint8_t *p = ctx->dns_data;
+        ctx->dns_txid = (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+        ctx->dns_txid_valid = 1;
+    }
+    if (txid) *txid = ctx->dns_txid;
     return 1;
 }
 
@@ -70,14 +131,14 @@ static pkt_type_t classify_packet(divert_engine_t *engine, pkt_ctx_t *ctx, WINDI
         return PKT_INBOUND;
     }
 
-    if (ctx->tcp_hdr && ctx->src_port == TCP_RELAY_PORT)  return PKT_TCP_RETURN;
-    if (ctx->udp_hdr && ctx->src_port == UDP_RELAY_PORT)  return PKT_UDP_RETURN;
+    if (ctx->tcp_hdr && ctx->src_port == engine->tcp_relay_port)  return PKT_TCP_RETURN;
+    if (ctx->udp_hdr && ctx->src_port == engine->udp_relay_port)  return PKT_UDP_RETURN;
 
     if (ctx->dst_ip == engine->config->proxy.ip_addr &&
         ctx->dst_port == engine->config->proxy.port)
         return PKT_SELF_PROXY;
 
-    if (ctx->dst_port == TCP_RELAY_PORT || ctx->dst_port == UDP_RELAY_PORT)
+    if (ctx->dst_port == engine->tcp_relay_port || ctx->dst_port == engine->udp_relay_port)
         return PKT_SELF_RELAY;
 
     if (engine->dns_hijack->enabled &&
@@ -111,9 +172,8 @@ static void handle_dns_response_loopback(divert_engine_t *engine, pkt_ctx_t *ctx
     uint16_t dns_txid;
 
     if (!packet_dns_txid(ctx, &dns_txid)) {
-        LOG_TRACE("DNS response (loopback): malformed payload, passing through");
-        if (!WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr))
-            LOG_WARN("WinDivertSend failed (DNS response loopback malformed): err=%lu", GetLastError());
+        LOG_PACKET("DNS response (loopback): malformed payload, passing through");
+        divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "DNS response loopback malformed");
         return;
     }
 
@@ -124,7 +184,7 @@ static void handle_dns_response_loopback(divert_engine_t *engine, pkt_ctx_t *ctx
         ip_to_str(orig_dns_ip, orig_str, sizeof(orig_str));
         ip_to_str(cli_ip, cli_str, sizeof(cli_str));
         ip_to_str(ctx->src_ip, src_str, sizeof(src_str));
-        LOG_DEBUG("DNS response (loopback): src %s:%u -> %s:%u, dst -> %s, IfIdx=%lu",
+        LOG_PACKET("DNS response (loopback): src %s:%u -> %s:%u, dst -> %s, IfIdx=%lu",
             src_str, ctx->src_port, orig_str, orig_dns_port, cli_str, (unsigned long)orig_if_idx);
         ctx->ip_hdr->SrcAddr = orig_dns_ip;
         ctx->udp_hdr->SrcPort = htons(orig_dns_port);
@@ -135,8 +195,7 @@ static void handle_dns_response_loopback(divert_engine_t *engine, pkt_ctx_t *ctx
         addr->Network.SubIfIdx = orig_sub_if_idx;
         WinDivertHelperCalcChecksums(ctx->packet, ctx->packet_len, addr, 0);
     }
-    if (!WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr))
-        LOG_WARN("WinDivertSend failed (DNS response loopback): err=%lu", GetLastError());
+    divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "DNS response loopback");
 }
 
 /* === Handler: inbound packets (with optional DNS response rewrite) === */
@@ -154,8 +213,7 @@ static void handle_inbound(divert_engine_t *engine, pkt_ctx_t *ctx,
             WinDivertHelperCalcChecksums(ctx->packet, ctx->packet_len, addr, 0);
         }
     }
-    if (!WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr))
-        LOG_WARN("WinDivertSend failed (inbound): err=%lu", GetLastError());
+    divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "inbound");
 }
 
 /* === Handler: TCP/UDP return path (shared logic) === */
@@ -163,12 +221,10 @@ static void handle_return_path(divert_engine_t *engine, pkt_ctx_t *ctx,
                                 WINDIVERT_ADDRESS *addr, pkt_type_t type) {
     uint8_t proto_num = (type == PKT_TCP_RETURN) ? 6 : 17;
     conntrack_entry_t entry;
-    if (conntrack_get_full(engine->conntrack, ctx->dst_port, proto_num, &entry) != ERR_OK) {
-        LOG_TRACE("%s return: no conntrack for dst_port %u",
+    if (conntrack_get_full(engine->conntrack, ctx->dst_ip, ctx->dst_port, proto_num, &entry) != ERR_OK) {
+        LOG_PACKET("%s return: no conntrack for dst_port %u",
             (type == PKT_TCP_RETURN) ? "TCP" : "UDP", ctx->dst_port);
-        if (!WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr))
-            LOG_WARN("WinDivertSend failed (%s return no-track): err=%lu",
-                (type == PKT_TCP_RETURN) ? "TCP" : "UDP", GetLastError());
+        counter_inc(&engine->counters.packets_dropped);
         return;
     }
 
@@ -180,7 +236,10 @@ static void handle_return_path(divert_engine_t *engine, pkt_ctx_t *ctx,
     else
         ctx->udp_hdr->SrcPort = htons(entry.orig_dst_port);
 
-    conntrack_touch(engine->conntrack, ctx->dst_port, proto_num);
+    conntrack_touch(engine->conntrack, entry.key_src_ip, ctx->dst_port, proto_num);
+    if (entry.src_ip != entry.key_src_ip) {
+        conntrack_touch(engine->conntrack, entry.src_ip, ctx->dst_port, proto_num);
+    }
     addr->Outbound = 0;
     addr->Loopback = 0;
     addr->Network.IfIdx = entry.if_idx;
@@ -190,46 +249,37 @@ static void handle_return_path(divert_engine_t *engine, pkt_ctx_t *ctx,
     char orig_dst_str[16], orig_src_str[16];
     ip_to_str(entry.orig_dst_ip, orig_dst_str, sizeof(orig_dst_str));
     ip_to_str(entry.src_ip, orig_src_str, sizeof(orig_src_str));
-    LOG_TRACE("%s return: rewrite 127.0.0.1:%u -> %s:%u, dst -> %s, IfIdx=%lu",
+    LOG_PACKET("%s return: rewrite 127.0.0.1:%u -> %s:%u, dst -> %s, IfIdx=%lu",
         (type == PKT_TCP_RETURN) ? "TCP" : "UDP",
-        (type == PKT_TCP_RETURN) ? TCP_RELAY_PORT : UDP_RELAY_PORT,
+        (type == PKT_TCP_RETURN) ? engine->tcp_relay_port : engine->udp_relay_port,
         orig_dst_str, entry.orig_dst_port, orig_src_str, (unsigned long)entry.if_idx);
 
-    if (!WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr))
-        LOG_WARN("WinDivertSend failed (%s return): err=%lu",
-            (type == PKT_TCP_RETURN) ? "TCP" : "UDP", GetLastError());
+    divert_send_packet(engine, ctx->packet, ctx->packet_len, addr,
+                       (type == PKT_TCP_RETURN) ? "TCP return" : "UDP return");
 }
 
 /* === Handler: DNS hijacking (non-loopback rewrite or loopback socket forward) === */
 static void handle_dns_hijack(divert_engine_t *engine, pkt_ctx_t *ctx,
                                WINDIVERT_ADDRESS *addr) {
-    PVOID dns_data = NULL;
+    const uint8_t *dns_data = NULL;
     UINT dns_data_len = 0;
     uint16_t dns_txid = 0;
 
-    WinDivertHelperParsePacket(ctx->packet, ctx->packet_len,
-        NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-        &dns_data, &dns_data_len, NULL, NULL);
-    if (!dns_data || dns_data_len < 2) {
-        LOG_TRACE("DNS hijack: malformed DNS payload, passing through");
-        if (!WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr))
-            LOG_WARN("WinDivertSend failed (DNS malformed pass): err=%lu", GetLastError());
+    packet_dns_data(ctx, &dns_data, &dns_data_len);
+    if (!dns_data || dns_data_len < 2 || !packet_dns_txid(ctx, &dns_txid)) {
+        LOG_PACKET("DNS hijack: malformed DNS payload, passing through");
+        divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "DNS malformed pass");
         return;
-    }
-    {
-        const uint8_t *p = (const uint8_t *)dns_data;
-        dns_txid = (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
     }
 
     if (engine->dns_hijack->use_socket_fwd) {
         error_t err = dns_hijack_forward_query(engine->dns_hijack,
-            (const uint8_t *)dns_data, (int)dns_data_len,
+            dns_data, (int)dns_data_len,
             ctx->src_port, ctx->dst_ip, ctx->dst_port,
             ctx->src_ip, addr->Network.IfIdx, addr->Network.SubIfIdx);
         if (err != ERR_OK) {
             LOG_WARN("DNS hijack: loopback forward failed (%d), passing original query", err);
-            if (!WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr))
-                LOG_WARN("WinDivertSend failed (DNS forward fallback): err=%lu", GetLastError());
+            divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "DNS forward fallback");
         }
         return;
     }
@@ -243,12 +293,10 @@ static void handle_dns_hijack(divert_engine_t *engine, pkt_ctx_t *ctx,
         ctx->ip_hdr->DstAddr = new_dst_ip;
         ctx->udp_hdr->DstPort = htons(new_dst_port);
         WinDivertHelperCalcChecksums(ctx->packet, ctx->packet_len, addr, 0);
-        if (!WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr))
-            LOG_WARN("WinDivertSend failed (DNS hijack): err=%lu", GetLastError());
+        divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "DNS hijack");
     } else {
         LOG_WARN("DNS hijack: failed to store NAT entry, passing original query");
-        if (!WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr))
-            LOG_WARN("WinDivertSend failed (DNS hijack fallback): err=%lu", GetLastError());
+        divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "DNS hijack fallback");
     }
 }
 
@@ -269,42 +317,66 @@ static void proxy_redirect_udp_forward(divert_engine_t *engine, pkt_ctx_t *ctx) 
         return;
     }
 
-    uint8_t framed[2 + WTP_UDP_BUFFER_SIZE];
+    uint8_t framed[6 + WTP_UDP_BUFFER_SIZE];
     int framed_len = (int)(2U + udp_data_len);
-    framed[0] = (uint8_t)(ctx->src_port >> 8);
-    framed[1] = (uint8_t)(ctx->src_port & 0xFF);
-    memcpy(framed + 2, udp_data, udp_data_len);
+    framed_len = (int)(6U + udp_data_len);
+    memcpy(framed, &ctx->src_ip, 4);
+    framed[4] = (uint8_t)(ctx->src_port >> 8);
+    framed[5] = (uint8_t)(ctx->src_port & 0xFF);
+    memcpy(framed + 6, udp_data, udp_data_len);
 
     struct sockaddr_in relay_dest;
     memset(&relay_dest, 0, sizeof(relay_dest));
     relay_dest.sin_family = AF_INET;
     relay_dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    relay_dest.sin_port = htons(UDP_RELAY_PORT);
+    relay_dest.sin_port = htons(engine->udp_relay_port);
 
     int fwd = sendto(engine->udp_fwd_sock, (const char *)framed, framed_len, 0,
                      (struct sockaddr *)&relay_dest, sizeof(relay_dest));
     if (fwd == SOCKET_ERROR)
         LOG_WARN("UDP fwd sendto failed: %d", WSAGetLastError());
-    else
-        LOG_TRACE("UDP fwd: sent %u bytes (port %u) to relay", udp_data_len, ctx->src_port);
+    else {
+        counter_inc(&engine->counters.udp_forwarded);
+        LOG_PACKET("UDP fwd: sent %u bytes (port %u) to relay", udp_data_len, ctx->src_port);
+    }
+}
+
+static error_t add_proxy_conntrack(divert_engine_t *engine, pkt_ctx_t *ctx,
+                                   WINDIVERT_ADDRESS *addr, uint32_t pid,
+                                   const char *proc_name) {
+    error_t err = conntrack_add(engine->conntrack, ctx->src_port, ctx->src_ip,
+                                ctx->dst_ip, ctx->dst_port, ctx->protocol,
+                                pid, proc_name,
+                                addr->Network.IfIdx, addr->Network.SubIfIdx);
+
+    if (err != ERR_OK) return err;
+
+    if (ctx->tcp_hdr || ctx->udp_hdr) {
+        err = conntrack_add_key(engine->conntrack, LOOPBACK_ADDR, ctx->src_port,
+                                ctx->src_ip, ctx->dst_ip, ctx->dst_port,
+                                ctx->protocol, pid, proc_name,
+                                addr->Network.IfIdx, addr->Network.SubIfIdx);
+        if (err != ERR_OK) {
+            conntrack_remove(engine->conntrack, ctx->src_ip, ctx->src_port, ctx->protocol);
+            return err;
+        }
+    }
+
+    return err;
 }
 
 /* === Helper: non-SYN TCP that is tracked — redirect to relay === */
 static int proxy_redirect_tcp_non_syn_tracked(divert_engine_t *engine, pkt_ctx_t *ctx,
                                                WINDIVERT_ADDRESS *addr) {
-    if (conntrack_get(engine->conntrack, ctx->src_port, 6, NULL, NULL) != ERR_OK)
+    if (conntrack_get(engine->conntrack, ctx->src_ip, ctx->src_port, 6, NULL, NULL) != ERR_OK)
         return 0;
 
-    ctx->ip_hdr->DstAddr = LOOPBACK_ADDR;
-    ctx->tcp_hdr->DstPort = htons(TCP_RELAY_PORT);
     ctx->ip_hdr->SrcAddr = LOOPBACK_ADDR;
-    addr->Outbound = 1;
-    addr->Loopback = 1;
-    addr->Network.IfIdx = 1;
-    addr->Network.SubIfIdx = 0;
+    ctx->ip_hdr->DstAddr = LOOPBACK_ADDR;
+    ctx->tcp_hdr->DstPort = htons(engine->tcp_relay_port);
+    set_loopback_route(engine, addr);
     WinDivertHelperCalcChecksums(ctx->packet, ctx->packet_len, addr, 0);
-    if (!WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr))
-        LOG_WARN("WinDivertSend failed (TCP tracked non-SYN): err=%lu", GetLastError());
+    divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "TCP tracked non-SYN");
     return 1;
 }
 
@@ -312,7 +384,10 @@ static int proxy_redirect_tcp_non_syn_tracked(divert_engine_t *engine, pkt_ctx_t
 static void handle_proxy_redirect(divert_engine_t *engine, pkt_ctx_t *ctx,
                                    WINDIVERT_ADDRESS *addr) {
     char proc_name[256] = {0};
+    char dst_str[16];
+    char rule_str[16];
     uint32_t pid = 0;
+    int matched_rule_id = 0;
 
     /* Process lookup */
     if (ctx->tcp_hdr) {
@@ -322,7 +397,7 @@ static void handle_proxy_redirect(divert_engine_t *engine, pkt_ctx_t *ctx,
         } else {
             if (proxy_redirect_tcp_non_syn_tracked(engine, ctx, addr))
                 return;
-            WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr);
+            divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "TCP non-SYN pass");
             return;
         }
     } else {
@@ -332,51 +407,72 @@ static void handle_proxy_redirect(divert_engine_t *engine, pkt_ctx_t *ctx,
 
     /* Self-exclusion */
     if (pid > 0 && proc_is_self(engine->proc_lookup, pid)) {
-        LOG_TRACE("SELF: pid=%u %s, passing through", pid, proc_name);
-        WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr);
+        LOG_DEBUG("SELF: pid=%u %s, passing through", pid, proc_name);
+        divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "self pass");
         return;
     }
 
+    ip_to_str(ctx->dst_ip, dst_str, sizeof(dst_str));
+
+    if (pid == 0) {
+        if (ctx->tcp_hdr) {
+            pid = proc_lookup_tcp_retry(engine->proc_lookup, ctx->src_ip, ctx->src_port,
+                                        proc_name, sizeof(proc_name));
+        } else {
+            pid = proc_lookup_udp_retry(engine->proc_lookup, ctx->src_ip, ctx->src_port,
+                                        proc_name, sizeof(proc_name));
+        }
+        if (pid > 0 && proc_is_self(engine->proc_lookup, pid)) {
+            LOG_DEBUG("SELF: pid=%u %s, passing through", pid, proc_name);
+            divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "self pass");
+            return;
+        }
+    }
+
     /* Rule matching */
-    rule_action_t action = rules_match(engine->config->rules, engine->config->default_action,
-                                       proc_name, ctx->dst_ip, ctx->dst_port, ctx->protocol);
+    rule_action_t action = rules_match_ex(engine->config->rules, engine->config->rule_count,
+                                          engine->config->default_action,
+                                          proc_name, ctx->dst_ip, ctx->dst_port, ctx->protocol,
+                                          &matched_rule_id);
+    if (matched_rule_id > 0) snprintf(rule_str, sizeof(rule_str), "#%d", matched_rule_id);
+    else safe_str_copy(rule_str, sizeof(rule_str), "default");
 
     if (action == RULE_ACTION_BLOCK) {
-        LOG_DEBUG("BLOCK: %s [%u] (%s)",
-            proc_name[0] ? proc_name : "?", pid,
+        LOG_DEBUG("BLOCK: rule=%s %s [%u] -> %s:%u (%s)",
+            rule_str, proc_name[0] ? proc_name : "?", pid, dst_str, ctx->dst_port,
             ctx->protocol == 6 ? "TCP" : "UDP");
         return;
     }
 
     if (action == RULE_ACTION_DIRECT) {
-        LOG_TRACE("DIRECT: %s [%u] (%s)",
-            proc_name[0] ? proc_name : "?", pid,
+        LOG_DEBUG("DIRECT: rule=%s %s [%u] -> %s:%u (%s)",
+            rule_str, proc_name[0] ? proc_name : "?", pid, dst_str, ctx->dst_port,
             ctx->protocol == 6 ? "TCP" : "UDP");
-        WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr);
+        divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "direct");
         return;
     }
 
     /* PROXY action */
-    uint16_t relay_port = (ctx->protocol == 6) ? TCP_RELAY_PORT : UDP_RELAY_PORT;
-    LOG_DEBUG("PROXY: %s [%u] via relay :%u (%s) IfIdx=%lu",
-        proc_name[0] ? proc_name : "?", pid, relay_port,
+    uint16_t relay_port = (ctx->protocol == 6) ? engine->tcp_relay_port : engine->udp_relay_port;
+    LOG_DEBUG("PROXY: rule=%s %s [%u] -> %s:%u via relay :%u (%s) IfIdx=%lu",
+        rule_str, proc_name[0] ? proc_name : "?", pid, dst_str, ctx->dst_port, relay_port,
         ctx->protocol == 6 ? "TCP" : "UDP", (unsigned long)addr->Network.IfIdx);
 
-    conntrack_add(engine->conntrack, ctx->src_port, ctx->src_ip,
-                  ctx->dst_ip, ctx->dst_port, ctx->protocol,
-                  pid, proc_name, addr->Network.IfIdx, addr->Network.SubIfIdx);
+    if (add_proxy_conntrack(engine, ctx, addr, pid, proc_name) != ERR_OK) {
+        LOG_WARN("PROXY: conntrack unavailable for %s [%u] -> %s:%u (%s), dropping",
+            proc_name[0] ? proc_name : "?", pid, dst_str, ctx->dst_port,
+            ctx->protocol == 6 ? "TCP" : "UDP");
+        counter_inc(&engine->counters.packets_dropped);
+        return;
+    }
 
     if (ctx->tcp_hdr) {
-        ctx->ip_hdr->DstAddr = LOOPBACK_ADDR;
         ctx->ip_hdr->SrcAddr = LOOPBACK_ADDR;
+        ctx->ip_hdr->DstAddr = LOOPBACK_ADDR;
         ctx->tcp_hdr->DstPort = htons(relay_port);
-        addr->Outbound = 1;
-        addr->Loopback = 1;
-        addr->Network.IfIdx = 1;
-        addr->Network.SubIfIdx = 0;
+        set_loopback_route(engine, addr);
         WinDivertHelperCalcChecksums(ctx->packet, ctx->packet_len, addr, 0);
-        if (!WinDivertSend(engine->handle, ctx->packet, ctx->packet_len, NULL, addr))
-            LOG_WARN("WinDivertSend failed (TCP PROXY redirect): err=%lu", GetLastError());
+        divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "TCP PROXY redirect");
     } else {
         proxy_redirect_udp_forward(engine, ctx);
     }
@@ -397,6 +493,7 @@ static DWORD WINAPI divert_worker_proc(LPVOID param) {
             LOG_ERROR("WinDivertRecv failed: %lu", err);
             continue;
         }
+        counter_inc(&engine->counters.packets_recv);
 
         PWINDIVERT_IPHDR ip_hdr = NULL;
         PWINDIVERT_TCPHDR tcp_hdr = NULL;
@@ -406,7 +503,7 @@ static DWORD WINAPI divert_worker_proc(LPVOID param) {
             NULL, NULL, NULL, NULL);
 
         if (!ip_hdr) {
-            WinDivertSend(engine->handle, packet, packet_len, NULL, &addr);
+            divert_send_packet(engine, packet, packet_len, &addr, "non-IP pass");
             continue;
         }
 
@@ -418,15 +515,22 @@ static DWORD WINAPI divert_worker_proc(LPVOID param) {
             src_port = ntohs(udp_hdr->SrcPort);
             dst_port = ntohs(udp_hdr->DstPort);
         } else {
-            WinDivertSend(engine->handle, packet, packet_len, NULL, &addr);
+            divert_send_packet(engine, packet, packet_len, &addr, "non-TCP/UDP pass");
             continue;
         }
 
-        pkt_ctx_t ctx = {
-            packet, packet_len, ip_hdr, tcp_hdr, udp_hdr,
-            ip_hdr->SrcAddr, ip_hdr->DstAddr,
-            src_port, dst_port, ip_hdr->Protocol
-        };
+        pkt_ctx_t ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.packet = packet;
+        ctx.packet_len = packet_len;
+        ctx.ip_hdr = ip_hdr;
+        ctx.tcp_hdr = tcp_hdr;
+        ctx.udp_hdr = udp_hdr;
+        ctx.src_ip = ip_hdr->SrcAddr;
+        ctx.dst_ip = ip_hdr->DstAddr;
+        ctx.src_port = src_port;
+        ctx.dst_port = dst_port;
+        ctx.protocol = ip_hdr->Protocol;
 
         pkt_type_t type = classify_packet(engine, &ctx, &addr);
 
@@ -446,7 +550,7 @@ static DWORD WINAPI divert_worker_proc(LPVOID param) {
         case PKT_SELF_RELAY:
         case PKT_SELF_DNS:
         case PKT_BYPASS:
-            WinDivertSend(engine->handle, packet, packet_len, NULL, &addr);
+            divert_send_packet(engine, packet, packet_len, &addr, "bypass");
             break;
         case PKT_DNS_HIJACK:
             handle_dns_hijack(engine, &ctx, &addr);
@@ -498,7 +602,8 @@ static error_t divert_start_fail(divert_engine_t *engine, dns_hijack_t *dns_hija
 
 error_t divert_start(divert_engine_t *engine, app_config_t *config,
                     conntrack_t *conntrack, proc_lookup_t *proc_lookup,
-                    dns_hijack_t *dns_hijack) {
+                    dns_hijack_t *dns_hijack,
+                    uint16_t tcp_relay_port, uint16_t udp_relay_port) {
     int dns_forwarder_started = 0;
 
     memset(engine, 0, sizeof(*engine));
@@ -507,6 +612,9 @@ error_t divert_start(divert_engine_t *engine, app_config_t *config,
     engine->conntrack = conntrack;
     engine->proc_lookup = proc_lookup;
     engine->dns_hijack = dns_hijack;
+    engine->tcp_relay_port = tcp_relay_port;
+    engine->udp_relay_port = udp_relay_port;
+    engine->loopback_if_idx = detect_loopback_if_idx();
     engine->running = 1;
     engine->udp_fwd_sock = INVALID_SOCKET;
 
@@ -532,7 +640,7 @@ error_t divert_start(divert_engine_t *engine, app_config_t *config,
         "or "
         "(outbound and ip and loopback and "
         "(tcp.SrcPort == %u or udp.SrcPort == %u))",
-        TCP_RELAY_PORT, UDP_RELAY_PORT);
+        engine->tcp_relay_port, engine->udp_relay_port);
 
     if (dns_hijack->enabled) {
         char dns_filter[512];
@@ -551,7 +659,7 @@ error_t divert_start(divert_engine_t *engine, app_config_t *config,
         strncat(filter, dns_filter, sizeof(filter) - strlen(filter) - 1);
     }
 
-    LOG_INFO("WinDivert filter: %s", filter);
+    LOG_DEBUG("WinDivert filter: %s", filter);
 
     engine->handle = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, 0, 0);
     if (engine->handle == INVALID_HANDLE_VALUE) {
@@ -563,8 +671,12 @@ error_t divert_start(divert_engine_t *engine, app_config_t *config,
         return ERR_PERMISSION;
     }
 
-    WinDivertSetParam(engine->handle, WINDIVERT_PARAM_QUEUE_LENGTH, DIVERT_QUEUE_LENGTH);
-    WinDivertSetParam(engine->handle, WINDIVERT_PARAM_QUEUE_TIME, DIVERT_QUEUE_TIME);
+    tune_windivert_queue(engine);
+    LOG_INFO("WinDivert queue: length=%llu time=%llums size=%llu bytes; loopback IfIdx=%lu",
+             (unsigned long long)engine->queue_length,
+             (unsigned long long)engine->queue_time,
+             (unsigned long long)engine->queue_size,
+             (unsigned long)engine->loopback_if_idx);
 
     /* UDP forwarding socket: sends intercepted UDP payloads to the relay via real loopback */
     engine->udp_fwd_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -621,4 +733,13 @@ void divert_stop(divert_engine_t *engine) {
     divert_join_workers(engine);
 
     LOG_INFO("WinDivert engine stopped");
+}
+
+void divert_snapshot_counters(divert_engine_t *engine, divert_counters_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->packets_recv = InterlockedExchange64(&engine->counters.packets_recv, 0);
+    out->packets_sent = InterlockedExchange64(&engine->counters.packets_sent, 0);
+    out->packets_dropped = InterlockedExchange64(&engine->counters.packets_dropped, 0);
+    out->send_failures = InterlockedExchange64(&engine->counters.send_failures, 0);
+    out->udp_forwarded = InterlockedExchange64(&engine->counters.udp_forwarded, 0);
 }

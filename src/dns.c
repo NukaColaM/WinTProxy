@@ -16,6 +16,22 @@ static unsigned int dns_nat_hash_forward(uint16_t fwd_src_port, uint16_t fwd_txi
     return (((unsigned int)fwd_src_port * 257U) ^ (unsigned int)fwd_txid) % DNS_NAT_BUCKETS;
 }
 
+static dns_nat_entry_t *dns_nat_pool_alloc(dns_hijack_t *dh) {
+    dns_nat_entry_t *e;
+    e = dh->free_list;
+    if (e) {
+        dh->free_list = e->next;
+        memset(e, 0, sizeof(*e));
+    }
+    return e;
+}
+
+static void dns_nat_pool_free(dns_hijack_t *dh, dns_nat_entry_t *e) {
+    memset(e, 0, sizeof(*e));
+    e->next = dh->free_list;
+    dh->free_list = e;
+}
+
 static dns_nat_entry_t *dns_nat_find_client(dns_hijack_t *dh, uint16_t src_port,
                                             uint16_t dns_txid, unsigned int idx) {
     dns_nat_entry_t *e = dh->buckets[idx];
@@ -45,7 +61,7 @@ static dns_nat_entry_t *dns_nat_upsert_client(dns_hijack_t *dh, uint16_t src_por
     dns_nat_entry_t *e = dns_nat_find_client(dh, src_port, dns_txid, idx);
     if (e) return e;
 
-    e = (dns_nat_entry_t *)calloc(1, sizeof(*e));
+    e = dns_nat_pool_alloc(dh);
     if (!e) return NULL;
 
     e->src_port = src_port;
@@ -58,7 +74,7 @@ static dns_nat_entry_t *dns_nat_upsert_client(dns_hijack_t *dh, uint16_t src_por
 static dns_nat_entry_t *dns_nat_insert_forward(dns_hijack_t *dh, uint16_t src_port,
                                                uint16_t dns_txid, uint16_t fwd_src_port,
                                                uint16_t fwd_txid, unsigned int idx) {
-    dns_nat_entry_t *e = (dns_nat_entry_t *)calloc(1, sizeof(*e));
+    dns_nat_entry_t *e = dns_nat_pool_alloc(dh);
     if (!e) return NULL;
 
     e->src_port = src_port;
@@ -75,7 +91,7 @@ static void dns_nat_remove_entry(dns_hijack_t *dh, unsigned int idx, dns_nat_ent
     while (*pp) {
         if (*pp == entry) {
             *pp = entry->next;
-            free(entry);
+            dns_nat_pool_free(dh, entry);
             return;
         }
         pp = &(*pp)->next;
@@ -90,7 +106,7 @@ static void dns_nat_cleanup_stale_bucket(dns_hijack_t *dh, unsigned int idx,
         if ((*pp) != keep && (now - (*pp)->timestamp) > DNS_NAT_TTL_MS) {
             dns_nat_entry_t *old = *pp;
             *pp = old->next;
-            free(old);
+            dns_nat_pool_free(dh, old);
         } else {
             pp = &(*pp)->next;
         }
@@ -143,7 +159,7 @@ static void dns_nat_fill_entry(dns_nat_entry_t *e, uint32_t original_dns_ip,
     e->timestamp = GetTickCount64();
 }
 
-void dns_hijack_init(dns_hijack_t *dh, int enabled, uint32_t redirect_ip, uint16_t redirect_port) {
+error_t dns_hijack_init(dns_hijack_t *dh, int enabled, uint32_t redirect_ip, uint16_t redirect_port) {
     memset(dh, 0, sizeof(*dh));
     dh->enabled = enabled;
     dh->redirect_ip = redirect_ip;
@@ -153,6 +169,22 @@ void dns_hijack_init(dns_hijack_t *dh, int enabled, uint32_t redirect_ip, uint16
     dh->next_fwd_txid = (uint16_t)GetTickCount64();
     if (dh->next_fwd_txid == 0) dh->next_fwd_txid = 1;
     InitializeSRWLock(&dh->lock);
+    dh->free_list = NULL;
+    dh->bucket_count = DNS_NAT_BUCKETS;
+    dh->pool_size = DNS_NAT_POOL_SIZE;
+    dh->buckets = (dns_nat_entry_t **)calloc(dh->bucket_count, sizeof(dh->buckets[0]));
+    dh->pool = (dns_nat_entry_t *)calloc(dh->pool_size, sizeof(dh->pool[0]));
+    if (!dh->buckets || !dh->pool) {
+        free(dh->buckets);
+        free(dh->pool);
+        memset(dh, 0, sizeof(*dh));
+        return ERR_MEMORY;
+    }
+    for (size_t i = 0; i < dh->pool_size; i++) {
+        dh->pool[i].next = dh->free_list;
+        dh->free_list = &dh->pool[i];
+    }
+    return ERR_OK;
 }
 
 void dns_hijack_shutdown(dns_hijack_t *dh) {
@@ -169,16 +201,23 @@ void dns_hijack_shutdown(dns_hijack_t *dh) {
     dh->fwd_src_port = 0;
 
     AcquireSRWLockExclusive(&dh->lock);
-    for (int i = 0; i < DNS_NAT_BUCKETS; i++) {
+    for (size_t i = 0; i < dh->bucket_count; i++) {
         dns_nat_entry_t *e = dh->buckets[i];
         while (e) {
             dns_nat_entry_t *next = e->next;
-            free(e);
+            dns_nat_pool_free(dh, e);
             e = next;
         }
         dh->buckets[i] = NULL;
     }
     ReleaseSRWLockExclusive(&dh->lock);
+    free(dh->buckets);
+    free(dh->pool);
+    dh->buckets = NULL;
+    dh->pool = NULL;
+    dh->free_list = NULL;
+    dh->bucket_count = 0;
+    dh->pool_size = 0;
 }
 
 int dns_hijack_is_dns_request(uint16_t dst_port) {
@@ -216,7 +255,7 @@ int dns_hijack_rewrite_request(dns_hijack_t *dh, uint32_t *dst_ip, uint16_t *dst
         char orig_str[16], redir_str[16];
         ip_to_str(original_dns_ip, orig_str, sizeof(orig_str));
         ip_to_str(dh->redirect_ip, redir_str, sizeof(redir_str));
-        LOG_TRACE("DNS hijack: port %u txid=0x%04x, %s:%u -> %s:%u",
+        LOG_PACKET("DNS hijack: port %u txid=0x%04x, %s:%u -> %s:%u",
             src_port, dns_txid, orig_str, original_dns_port, redir_str, dh->redirect_port);
     }
 
@@ -238,7 +277,7 @@ int dns_hijack_rewrite_response(dns_hijack_t *dh, uint32_t *src_ip, uint16_t *sr
     e = dns_nat_find_client(dh, dst_port, dns_txid, idx);
     if (!e) {
         ReleaseSRWLockExclusive(&dh->lock);
-        LOG_TRACE("DNS response: no NAT entry for client port %u txid=0x%04x", dst_port, dns_txid);
+        LOG_PACKET("DNS response: no NAT entry for client port %u txid=0x%04x", dst_port, dns_txid);
         return 0;
     }
 
@@ -246,7 +285,7 @@ int dns_hijack_rewrite_response(dns_hijack_t *dh, uint32_t *src_ip, uint16_t *sr
     if ((now - e->timestamp) > DNS_NAT_TTL_MS) {
         dns_nat_remove_entry(dh, idx, e);
         ReleaseSRWLockExclusive(&dh->lock);
-        LOG_TRACE("DNS response: stale NAT entry for client port %u txid=0x%04x", dst_port, dns_txid);
+        LOG_PACKET("DNS response: stale NAT entry for client port %u txid=0x%04x", dst_port, dns_txid);
         return 0;
     }
 
@@ -262,7 +301,7 @@ int dns_hijack_rewrite_response(dns_hijack_t *dh, uint32_t *src_ip, uint16_t *sr
         char orig_str[16], cli_str[16];
         ip_to_str(*src_ip, orig_str, sizeof(orig_str));
         if (client_ip) ip_to_str(*client_ip, cli_str, sizeof(cli_str));
-        LOG_TRACE("DNS response: restore src=%s:%u dst=%s for client port %u txid=0x%04x",
+        LOG_PACKET("DNS response: restore src=%s:%u dst=%s for client port %u txid=0x%04x",
             orig_str, *src_port, client_ip ? cli_str : "?", dst_port, dns_txid);
     }
     return 1;
@@ -316,7 +355,7 @@ static DWORD WINAPI dns_fwd_thread(LPVOID param) {
             ReleaseSRWLockExclusive(&dh->lock);
 
             if (!found) {
-                LOG_TRACE("DNS fwd: no NAT entry for forwarded txid 0x%04x", fwd_txid);
+                LOG_PACKET("DNS fwd: no NAT entry for forwarded txid 0x%04x", fwd_txid);
                 continue;
             }
 
@@ -366,7 +405,7 @@ static DWORD WINAPI dns_fwd_thread(LPVOID param) {
                 if (!WinDivertSend(dh->divert_handle, pkt, (UINT)pkt_len, NULL, &addr)) {
                     LOG_WARN("DNS fwd: WinDivertSend failed: err=%lu", GetLastError());
                 } else {
-                    LOG_TRACE("DNS fwd: txid=0x%04x restored from 0x%04x to %s:%u (orig dns %s:%u)",
+                    LOG_PACKET("DNS fwd: txid=0x%04x restored from 0x%04x to %s:%u (orig dns %s:%u)",
                         original_txid, fwd_txid, cli_str, client_src_port, orig_str, orig_dns_port);
                 }
             }
@@ -480,15 +519,15 @@ error_t dns_hijack_forward_query(dns_hijack_t *dh, const uint8_t *dns_payload, i
 
     sent = sendto(dh->fwd_sock, (const char *)fwd_payload, dns_len, 0,
                   (struct sockaddr *)&dest, sizeof(dest));
-    if (sent == SOCKET_ERROR) {
-        LOG_WARN("DNS fwd: sendto failed: %d", WSAGetLastError());
-        AcquireSRWLockExclusive(&dh->lock);
-        dns_nat_remove_entry(dh, idx, e);
-        ReleaseSRWLockExclusive(&dh->lock);
+        if (sent == SOCKET_ERROR) {
+            LOG_WARN("DNS fwd: sendto failed: %d", WSAGetLastError());
+            AcquireSRWLockExclusive(&dh->lock);
+            dns_nat_remove_entry(dh, idx, e);
+            ReleaseSRWLockExclusive(&dh->lock);
         return ERR_NETWORK;
     }
 
-    LOG_TRACE("DNS fwd: sent %d bytes to 127.0.0.1:%u (client port %u txid 0x%04x -> 0x%04x)",
+    LOG_PACKET("DNS fwd: sent %d bytes to 127.0.0.1:%u (client port %u txid 0x%04x -> 0x%04x)",
         sent, dh->redirect_port, src_port, original_txid, fwd_txid);
     return ERR_OK;
 }
