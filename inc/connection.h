@@ -17,8 +17,12 @@
 
 typedef struct conntrack_entry_s {
     uint32_t key_src_ip;
+    uint32_t key_dst_ip;
     uint32_t src_ip;
     uint16_t src_port;
+    uint16_t key_dst_port;
+    uint16_t client_port;
+    uint16_t relay_src_port;
     uint32_t orig_dst_ip;
     uint16_t orig_dst_port;
     uint8_t  protocol;
@@ -63,12 +67,26 @@ error_t conntrack_add_key(conntrack_t *ct, uint32_t key_src_ip, uint16_t src_por
                           uint32_t client_ip, uint32_t orig_dst_ip, uint16_t orig_dst_port,
                           uint8_t protocol, uint32_t pid, const char *process_name,
                           uint32_t if_idx, uint32_t sub_if_idx);
+error_t conntrack_add_key_full(conntrack_t *ct, uint32_t key_src_ip, uint16_t key_src_port,
+                               uint32_t key_dst_ip, uint16_t key_dst_port,
+                               uint32_t client_ip, uint16_t client_port,
+                               uint32_t orig_dst_ip, uint16_t orig_dst_port,
+                               uint8_t protocol, uint32_t pid, const char *process_name,
+                               uint32_t if_idx, uint32_t sub_if_idx,
+                               uint16_t relay_src_port);
 error_t conntrack_get(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol,
                       uint32_t *orig_dst_ip, uint16_t *orig_dst_port);
 error_t conntrack_get_full(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol,
                            conntrack_entry_t *out);
+error_t conntrack_get_full_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_port,
+                               uint32_t dst_ip, uint16_t dst_port, uint8_t protocol,
+                               conntrack_entry_t *out);
 void    conntrack_remove(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol);
+void    conntrack_remove_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_port,
+                             uint32_t dst_ip, uint16_t dst_port, uint8_t protocol);
 void    conntrack_touch(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol);
+void    conntrack_touch_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_port,
+                            uint32_t dst_ip, uint16_t dst_port, uint8_t protocol);
 void    conntrack_snapshot_counters(conntrack_t *ct, conntrack_counters_t *out);
 
 #endif

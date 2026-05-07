@@ -12,6 +12,15 @@
 #include <winsock2.h>
 #include <iphlpapi.h>
 
+#define TCP_OPT_EOL 0
+#define TCP_OPT_NOP 1
+#define TCP_OPT_MSS 2
+#define TCP_OPT_MSS_LEN 4
+#define TCP_MIN_HEADER_BYTES 20U
+#define TCP_MSS_CLAMP WTP_TCP_MSS_CLAMP
+#define TCP_RELAY_SRC_PORT_MIN WTP_TCP_RELAY_SRC_PORT_MIN
+#define TCP_RELAY_SRC_PORT_MAX WTP_TCP_RELAY_SRC_PORT_MAX
+
 /* Packet context passed to handler functions */
 typedef struct {
     uint8_t           *packet;
@@ -51,6 +60,68 @@ static void set_loopback_route(divert_engine_t *engine, WINDIVERT_ADDRESS *addr)
     addr->Loopback = 1;
     addr->Network.IfIdx = engine->loopback_if_idx;
     addr->Network.SubIfIdx = 0;
+}
+
+static int clamp_tcp_mss(pkt_ctx_t *ctx, uint16_t max_mss) {
+    uint8_t *tcp_start;
+    UINT tcp_header_len;
+    UINT opt_off;
+
+    if (!ctx->tcp_hdr || !ctx->tcp_hdr->Syn) return 0;
+
+    tcp_start = (uint8_t *)ctx->tcp_hdr;
+    tcp_header_len = (UINT)ctx->tcp_hdr->HdrLength * 4U;
+    if (tcp_header_len < TCP_MIN_HEADER_BYTES ||
+        tcp_start < ctx->packet ||
+        tcp_start + tcp_header_len > ctx->packet + ctx->packet_len) {
+        return 0;
+    }
+
+    opt_off = TCP_MIN_HEADER_BYTES;
+    while (opt_off < tcp_header_len) {
+        uint8_t kind = tcp_start[opt_off];
+        uint8_t opt_len;
+
+        if (kind == TCP_OPT_EOL) break;
+        if (kind == TCP_OPT_NOP) {
+            opt_off++;
+            continue;
+        }
+
+        if (opt_off + 1U >= tcp_header_len) break;
+        opt_len = tcp_start[opt_off + 1U];
+        if (opt_len < 2U || opt_off + opt_len > tcp_header_len) break;
+
+        if (kind == TCP_OPT_MSS && opt_len == TCP_OPT_MSS_LEN) {
+            uint16_t mss = (uint16_t)(((uint16_t)tcp_start[opt_off + 2U] << 8) |
+                                      (uint16_t)tcp_start[opt_off + 3U]);
+            if (mss > max_mss) {
+                tcp_start[opt_off + 2U] = (uint8_t)(max_mss >> 8);
+                tcp_start[opt_off + 3U] = (uint8_t)(max_mss & 0xFF);
+                return 1;
+            }
+            return 0;
+        }
+
+        opt_off += opt_len;
+    }
+
+    return 0;
+}
+
+static uint16_t next_tcp_relay_src_port(divert_engine_t *engine) {
+    LONG next = InterlockedIncrement(&engine->next_tcp_relay_src_port);
+    LONG span = (LONG)TCP_RELAY_SRC_PORT_MAX - (LONG)TCP_RELAY_SRC_PORT_MIN + 1L;
+    LONG offset;
+
+    if (span <= 0) return TCP_RELAY_SRC_PORT_MIN;
+
+    offset = (next - 1L) % span;
+    if (offset < 0) {
+        offset += span;
+    }
+
+    return (uint16_t)((LONG)TCP_RELAY_SRC_PORT_MIN + offset);
 }
 
 static uint32_t detect_loopback_if_idx(void) {
@@ -221,7 +292,15 @@ static void handle_return_path(divert_engine_t *engine, pkt_ctx_t *ctx,
                                 WINDIVERT_ADDRESS *addr, pkt_type_t type) {
     uint8_t proto_num = (type == PKT_TCP_RETURN) ? 6 : 17;
     conntrack_entry_t entry;
-    if (conntrack_get_full(engine->conntrack, ctx->dst_ip, ctx->dst_port, proto_num, &entry) != ERR_OK) {
+    error_t err;
+
+    if (type == PKT_TCP_RETURN) {
+        err = conntrack_get_full_key(engine->conntrack, LOOPBACK_ADDR, ctx->dst_port,
+                                     LOOPBACK_ADDR, ctx->src_port, proto_num, &entry);
+    } else {
+        err = conntrack_get_full(engine->conntrack, ctx->dst_ip, ctx->dst_port, proto_num, &entry);
+    }
+    if (err != ERR_OK) {
         LOG_PACKET("%s return: no conntrack for dst_port %u",
             (type == PKT_TCP_RETURN) ? "TCP" : "UDP", ctx->dst_port);
         counter_inc(&engine->counters.packets_dropped);
@@ -236,9 +315,24 @@ static void handle_return_path(divert_engine_t *engine, pkt_ctx_t *ctx,
     else
         ctx->udp_hdr->SrcPort = htons(entry.orig_dst_port);
 
-    conntrack_touch(engine->conntrack, entry.key_src_ip, ctx->dst_port, proto_num);
-    if (entry.src_ip != entry.key_src_ip) {
-        conntrack_touch(engine->conntrack, entry.src_ip, ctx->dst_port, proto_num);
+    if (type == PKT_TCP_RETURN) {
+        ctx->tcp_hdr->DstPort = htons(entry.client_port);
+    }
+
+    if (type == PKT_TCP_RETURN) {
+        clamp_tcp_mss(ctx, TCP_MSS_CLAMP);
+    }
+
+    if (type == PKT_TCP_RETURN) {
+        conntrack_touch_key(engine->conntrack, entry.key_src_ip, entry.src_port,
+                            entry.key_dst_ip, entry.key_dst_port, proto_num);
+        conntrack_touch_key(engine->conntrack, LOOPBACK_ADDR, entry.relay_src_port,
+                            LOOPBACK_ADDR, engine->tcp_relay_port, proto_num);
+    } else {
+        conntrack_touch(engine->conntrack, entry.key_src_ip, ctx->dst_port, proto_num);
+        if (entry.src_ip != entry.key_src_ip) {
+            conntrack_touch(engine->conntrack, entry.src_ip, ctx->dst_port, proto_num);
+        }
     }
     addr->Outbound = 0;
     addr->Loopback = 0;
@@ -344,14 +438,64 @@ static void proxy_redirect_udp_forward(divert_engine_t *engine, pkt_ctx_t *ctx) 
 static error_t add_proxy_conntrack(divert_engine_t *engine, pkt_ctx_t *ctx,
                                    WINDIVERT_ADDRESS *addr, uint32_t pid,
                                    const char *proc_name) {
-    error_t err = conntrack_add(engine->conntrack, ctx->src_port, ctx->src_ip,
-                                ctx->dst_ip, ctx->dst_port, ctx->protocol,
-                                pid, proc_name,
-                                addr->Network.IfIdx, addr->Network.SubIfIdx);
+    conntrack_entry_t existing;
+    uint16_t relay_src_port = ctx->src_port;
+    error_t err;
 
-    if (err != ERR_OK) return err;
+    if (ctx->tcp_hdr) {
+        if (conntrack_get_full_key(engine->conntrack,
+                                   ctx->src_ip, ctx->src_port,
+                                   ctx->dst_ip, ctx->dst_port,
+                                   ctx->protocol, &existing) == ERR_OK &&
+            existing.relay_src_port != 0) {
+            relay_src_port = existing.relay_src_port;
+        } else {
+            relay_src_port = next_tcp_relay_src_port(engine);
+        }
 
-    if (ctx->tcp_hdr || ctx->udp_hdr) {
+        err = conntrack_add_key_full(engine->conntrack,
+                                     ctx->src_ip, ctx->src_port,
+                                     ctx->dst_ip, ctx->dst_port,
+                                     ctx->src_ip, ctx->src_port,
+                                     ctx->dst_ip, ctx->dst_port,
+                                     ctx->protocol, pid, proc_name,
+                                     addr->Network.IfIdx, addr->Network.SubIfIdx,
+                                     relay_src_port);
+        if (err != ERR_OK) return err;
+
+        err = conntrack_add_key_full(engine->conntrack,
+                                     LOOPBACK_ADDR, relay_src_port,
+                                     LOOPBACK_ADDR, engine->tcp_relay_port,
+                                     ctx->src_ip, ctx->src_port,
+                                     ctx->dst_ip, ctx->dst_port,
+                                     ctx->protocol, pid, proc_name,
+                                     addr->Network.IfIdx, addr->Network.SubIfIdx,
+                                     relay_src_port);
+        if (err != ERR_OK) {
+            conntrack_remove_key(engine->conntrack, ctx->src_ip, ctx->src_port,
+                                 ctx->dst_ip, ctx->dst_port, ctx->protocol);
+            return err;
+        }
+
+        if (conntrack_get_full_key(engine->conntrack,
+                                   ctx->src_ip, ctx->src_port,
+                                   ctx->dst_ip, ctx->dst_port,
+                                   ctx->protocol, &existing) == ERR_OK &&
+            existing.relay_src_port != 0 &&
+            existing.relay_src_port != relay_src_port) {
+            conntrack_remove_key(engine->conntrack, LOOPBACK_ADDR, relay_src_port,
+                                 LOOPBACK_ADDR, engine->tcp_relay_port, ctx->protocol);
+            relay_src_port = existing.relay_src_port;
+        }
+
+        ctx->tcp_hdr->SrcPort = htons(relay_src_port);
+    } else if (ctx->udp_hdr) {
+        err = conntrack_add(engine->conntrack, ctx->src_port, ctx->src_ip,
+                            ctx->dst_ip, ctx->dst_port, ctx->protocol,
+                            pid, proc_name,
+                            addr->Network.IfIdx, addr->Network.SubIfIdx);
+        if (err != ERR_OK) return err;
+
         err = conntrack_add_key(engine->conntrack, LOOPBACK_ADDR, ctx->src_port,
                                 ctx->src_ip, ctx->dst_ip, ctx->dst_port,
                                 ctx->protocol, pid, proc_name,
@@ -368,16 +512,55 @@ static error_t add_proxy_conntrack(divert_engine_t *engine, pkt_ctx_t *ctx,
 /* === Helper: non-SYN TCP that is tracked — redirect to relay === */
 static int proxy_redirect_tcp_non_syn_tracked(divert_engine_t *engine, pkt_ctx_t *ctx,
                                                WINDIVERT_ADDRESS *addr) {
-    if (conntrack_get(engine->conntrack, ctx->src_ip, ctx->src_port, 6, NULL, NULL) != ERR_OK)
+    conntrack_entry_t entry;
+    if (conntrack_get_full_key(engine->conntrack, ctx->src_ip, ctx->src_port,
+                               ctx->dst_ip, ctx->dst_port, 6, &entry) != ERR_OK)
         return 0;
 
     ctx->ip_hdr->SrcAddr = LOOPBACK_ADDR;
     ctx->ip_hdr->DstAddr = LOOPBACK_ADDR;
+    ctx->tcp_hdr->SrcPort = htons(entry.relay_src_port);
     ctx->tcp_hdr->DstPort = htons(engine->tcp_relay_port);
     set_loopback_route(engine, addr);
     WinDivertHelperCalcChecksums(ctx->packet, ctx->packet_len, addr, 0);
     divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "TCP tracked non-SYN");
     return 1;
+}
+
+static void handle_tcp_non_syn_untracked(divert_engine_t *engine, pkt_ctx_t *ctx,
+                                         WINDIVERT_ADDRESS *addr) {
+    char proc_name[256] = {0};
+    uint32_t pid;
+    rule_action_t action;
+
+    pid = proc_lookup_tcp_retry(engine->proc_lookup, ctx->src_ip, ctx->src_port,
+                                proc_name, sizeof(proc_name));
+    if (pid > 0 && proc_is_self(engine->proc_lookup, pid)) {
+        divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "self pass");
+        return;
+    }
+
+    action = rules_match_ex(engine->config->rules, engine->config->rule_count,
+                            engine->config->default_action,
+                            proc_name, ctx->dst_ip, ctx->dst_port, ctx->protocol,
+                            NULL);
+
+    if (action == RULE_ACTION_DIRECT) {
+        divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "TCP non-SYN direct");
+        return;
+    }
+
+    if (action == RULE_ACTION_BLOCK) {
+        counter_inc(&engine->counters.packets_dropped);
+        return;
+    }
+
+    /*
+     * A proxied TCP packet without conntrack cannot be safely redirected:
+     * there is no relay source port to map the return path. Passing it
+     * through would leak that flow outside the proxy.
+     */
+    counter_inc(&engine->counters.packets_dropped);
 }
 
 /* === Handler: proxy redirect (process lookup, rules, relay injection) === */
@@ -397,7 +580,7 @@ static void handle_proxy_redirect(divert_engine_t *engine, pkt_ctx_t *ctx,
         } else {
             if (proxy_redirect_tcp_non_syn_tracked(engine, ctx, addr))
                 return;
-            divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "TCP non-SYN pass");
+            handle_tcp_non_syn_untracked(engine, ctx, addr);
             return;
         }
     } else {
@@ -467,6 +650,7 @@ static void handle_proxy_redirect(divert_engine_t *engine, pkt_ctx_t *ctx,
     }
 
     if (ctx->tcp_hdr) {
+        clamp_tcp_mss(ctx, TCP_MSS_CLAMP);
         ctx->ip_hdr->SrcAddr = LOOPBACK_ADDR;
         ctx->ip_hdr->DstAddr = LOOPBACK_ADDR;
         ctx->tcp_hdr->DstPort = htons(relay_port);

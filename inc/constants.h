@@ -37,6 +37,9 @@
 #define WTP_TCP_RELAY_WORKER_MAX       32
 #define WTP_TCP_RELAY_CONN_MAX         8192
 #define WTP_TCP_RELAY_BUFFER_SIZE      32768
+#define WTP_TCP_MSS_CLAMP              1360
+#define WTP_TCP_RELAY_SRC_PORT_MIN     40000
+#define WTP_TCP_RELAY_SRC_PORT_MAX     60999
 
 #define WTP_IPV4_LOOPBACK              0x0100007FU
 

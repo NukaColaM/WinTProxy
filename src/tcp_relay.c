@@ -44,14 +44,19 @@ struct tcp_conn_s {
     SOCKET            client;
     SOCKET            proxy;
     uint32_t          lookup_ip;
+    uint32_t          lookup_dst_ip;
+    uint16_t          lookup_dst_port;
     uint32_t          client_ip;
     uint16_t          client_port;
+    uint16_t          orig_client_port;
     uint32_t          orig_dst_ip;
     uint16_t          orig_dst_port;
     tcp_conn_state_t  state;
     LONG              closing;
     LONG              refs;
     int               active_counted;
+    int               client_read_closed;
+    int               proxy_read_closed;
     uint64_t          bytes_up;
     uint64_t          bytes_down;
     char              dst_str[16];
@@ -83,10 +88,10 @@ static void close_socket_if_valid(SOCKET *sock) {
 }
 
 static void tcp_conn_touch_conntrack(tcp_conn_t *conn) {
-    conntrack_touch(conn->relay->conntrack, conn->lookup_ip, conn->client_port, 6);
-    if (conn->lookup_ip != conn->client_ip) {
-        conntrack_touch(conn->relay->conntrack, conn->client_ip, conn->client_port, 6);
-    }
+    conntrack_touch_key(conn->relay->conntrack, conn->lookup_ip, conn->client_port,
+                        conn->lookup_dst_ip, conn->lookup_dst_port, 6);
+    conntrack_touch_key(conn->relay->conntrack, conn->client_ip, conn->orig_client_port,
+                        conn->orig_dst_ip, conn->orig_dst_port, 6);
 }
 
 static void tcp_conn_release(tcp_conn_t *conn);
@@ -203,8 +208,10 @@ static void tcp_conn_close(tcp_conn_t *conn) {
     close_socket_if_valid(&conn->client);
     close_socket_if_valid(&conn->proxy);
     if (conn->client_port) {
-        conntrack_remove(relay->conntrack, conn->lookup_ip, conn->client_port, 6);
-        conntrack_remove(relay->conntrack, conn->client_ip, conn->client_port, 6);
+        conntrack_remove_key(relay->conntrack, conn->lookup_ip, conn->client_port,
+                             conn->lookup_dst_ip, conn->lookup_dst_port, 6);
+        conntrack_remove_key(relay->conntrack, conn->client_ip, conn->orig_client_port,
+                             conn->orig_dst_ip, conn->orig_dst_port, 6);
     }
     tcp_conn_release(conn);
 }
@@ -220,6 +227,13 @@ static void tcp_conn_release(tcp_conn_t *conn) {
                 (unsigned long long)conn->bytes_up, (unsigned long long)conn->bytes_down);
         }
         tcp_conn_free(conn);
+    }
+}
+
+static void tcp_conn_maybe_close_after_eof(tcp_conn_t *conn) {
+    if (conn->client_read_closed && conn->proxy_read_closed &&
+        !conn->client_send.pending && !conn->proxy_send.pending) {
+        tcp_conn_close(conn);
     }
 }
 
@@ -419,7 +433,10 @@ static void tcp_conn_start(tcp_relay_t *relay, SOCKET client) {
 
     {
         conntrack_entry_t entry;
-        if (conntrack_get_full(relay->conntrack, conn->client_ip, conn->client_port, 6, &entry) == ERR_OK) {
+        if (conntrack_get_full_key(relay->conntrack, LOOPBACK_ADDR, conn->client_port,
+                                   LOOPBACK_ADDR, relay->port, 6, &entry) == ERR_OK) {
+            conn->lookup_ip = entry.key_src_ip;
+        } else if (conntrack_get_full(relay->conntrack, conn->client_ip, conn->client_port, 6, &entry) == ERR_OK) {
             conn->lookup_ip = entry.key_src_ip;
         } else if (conntrack_get_full(relay->conntrack, LOOPBACK_ADDR, conn->client_port, 6, &entry) == ERR_OK) {
             conn->lookup_ip = entry.key_src_ip;
@@ -430,12 +447,12 @@ static void tcp_conn_start(tcp_relay_t *relay, SOCKET client) {
             tcp_conn_close(conn);
             return;
         }
+        conn->lookup_dst_ip = entry.key_dst_ip;
+        conn->lookup_dst_port = entry.key_dst_port;
         conn->client_ip = entry.src_ip;
+        conn->orig_client_port = entry.client_port;
         conn->orig_dst_ip = entry.orig_dst_ip;
         conn->orig_dst_port = entry.orig_dst_port;
-        if (conn->lookup_ip == LOOPBACK_ADDR) {
-            conntrack_touch(relay->conntrack, conn->client_ip, conn->client_port, 6);
-        }
     }
 
     ip_to_str(conn->orig_dst_ip, conn->dst_str, sizeof(conn->dst_str));
@@ -480,7 +497,11 @@ static void on_proxy_send_complete(tcp_conn_t *conn, DWORD bytes) {
 
     if (conn->state == TCP_STATE_RELAY) {
         conn->bytes_up += io->used;
-        if (!post_recv(conn, &conn->client_recv, conn->client, TCP_IO_CLIENT_RECV)) tcp_conn_close(conn);
+        if (!conn->client_read_closed) {
+            if (!post_recv(conn, &conn->client_recv, conn->client, TCP_IO_CLIENT_RECV)) tcp_conn_close(conn);
+        } else {
+            tcp_conn_maybe_close_after_eof(conn);
+        }
     }
 }
 
@@ -493,7 +514,11 @@ static void on_client_send_complete(tcp_conn_t *conn, DWORD bytes) {
         return;
     }
     conn->bytes_down += io->used;
-    if (!post_recv(conn, &conn->proxy_recv, conn->proxy, TCP_IO_PROXY_RECV)) tcp_conn_close(conn);
+    if (!conn->proxy_read_closed) {
+        if (!post_recv(conn, &conn->proxy_recv, conn->proxy, TCP_IO_PROXY_RECV)) tcp_conn_close(conn);
+    } else {
+        tcp_conn_maybe_close_after_eof(conn);
+    }
 }
 
 static void on_proxy_recv_complete(tcp_conn_t *conn, DWORD bytes) {
@@ -501,7 +526,13 @@ static void on_proxy_recv_complete(tcp_conn_t *conn, DWORD bytes) {
     io->pending = 0;
 
     if (bytes == 0) {
-        tcp_conn_close(conn);
+        if (conn->state == TCP_STATE_RELAY) {
+            conn->proxy_read_closed = 1;
+            shutdown(conn->client, SD_SEND);
+            tcp_conn_maybe_close_after_eof(conn);
+        } else {
+            tcp_conn_close(conn);
+        }
         return;
     }
 
@@ -605,7 +636,9 @@ static void on_client_recv_complete(tcp_conn_t *conn, DWORD bytes) {
     tcp_io_t *io = &conn->client_recv;
     io->pending = 0;
     if (bytes == 0) {
-        tcp_conn_close(conn);
+        conn->client_read_closed = 1;
+        shutdown(conn->proxy, SD_SEND);
+        tcp_conn_maybe_close_after_eof(conn);
         return;
     }
     tcp_conn_touch_conntrack(conn);

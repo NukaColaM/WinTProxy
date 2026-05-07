@@ -33,6 +33,7 @@ typedef struct {
     SOCKET           udp_fwd_sock;
     uint16_t         tcp_relay_port;
     uint16_t         udp_relay_port;
+    volatile LONG    next_tcp_relay_src_port;
     uint32_t         loopback_if_idx;
     uint64_t         queue_length;
     uint64_t         queue_time;

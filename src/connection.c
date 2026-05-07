@@ -8,12 +8,24 @@ static uint64_t get_tick_ms(void) {
     return GetTickCount64();
 }
 
-static unsigned int bucket_index(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol) {
-    uint32_t x = src_ip ^ ((uint32_t)src_port << 16) ^ ((uint32_t)protocol * 0x9E3779B1U);
+static unsigned int bucket_index_full(conntrack_t *ct, uint32_t src_ip, uint16_t src_port,
+                                      uint32_t dst_ip, uint16_t dst_port, uint8_t protocol) {
+    uint32_t x = src_ip ^ dst_ip ^
+                 ((uint32_t)src_port << 16) ^ (uint32_t)dst_port ^
+                 ((uint32_t)protocol * 0x9E3779B1U);
     x ^= x >> 16;
     x *= 0x7FEB352DU;
     x ^= x >> 15;
     return x % (unsigned int)ct->bucket_count;
+}
+
+static int conntrack_key_matches(const conntrack_entry_t *e, uint32_t src_ip, uint16_t src_port,
+                                 uint32_t dst_ip, uint16_t dst_port, uint8_t protocol) {
+    return e->key_src_ip == src_ip &&
+           e->src_port == src_port &&
+           e->key_dst_ip == dst_ip &&
+           e->key_dst_port == dst_port &&
+           e->protocol == protocol;
 }
 
 static conntrack_entry_t *pool_alloc(conntrack_t *ct) {
@@ -168,14 +180,32 @@ error_t conntrack_add_key(conntrack_t *ct, uint32_t key_src_ip, uint16_t src_por
                           uint32_t client_ip, uint32_t orig_dst_ip, uint16_t orig_dst_port,
                           uint8_t protocol, uint32_t pid, const char *process_name,
                           uint32_t if_idx, uint32_t sub_if_idx) {
-    unsigned int idx = bucket_index(ct, key_src_ip, src_port, protocol);
+    return conntrack_add_key_full(ct, key_src_ip, src_port, 0, 0, client_ip, src_port,
+                                  orig_dst_ip, orig_dst_port, protocol, pid, process_name,
+                                  if_idx, sub_if_idx, src_port);
+}
+
+error_t conntrack_add_key_full(conntrack_t *ct, uint32_t key_src_ip, uint16_t key_src_port,
+                               uint32_t key_dst_ip, uint16_t key_dst_port,
+                               uint32_t client_ip, uint16_t client_port,
+                               uint32_t orig_dst_ip, uint16_t orig_dst_port,
+                               uint8_t protocol, uint32_t pid, const char *process_name,
+                               uint32_t if_idx, uint32_t sub_if_idx,
+                               uint16_t relay_src_port) {
+    unsigned int idx = bucket_index_full(ct, key_src_ip, key_src_port, key_dst_ip, key_dst_port, protocol);
 
     AcquireSRWLockExclusive(&ct->locks[idx]);
 
     conntrack_entry_t *e = ct->buckets[idx];
     while (e) {
-        if (e->key_src_ip == key_src_ip && e->src_port == src_port && e->protocol == protocol) {
+        if (conntrack_key_matches(e, key_src_ip, key_src_port, key_dst_ip, key_dst_port, protocol)) {
             e->key_src_ip = key_src_ip;
+            e->key_dst_ip = key_dst_ip;
+            e->key_dst_port = key_dst_port;
+            e->client_port = client_port;
+            if (e->relay_src_port == 0) {
+                e->relay_src_port = relay_src_port;
+            }
             e->src_ip = client_ip;
             e->orig_dst_ip = orig_dst_ip;
             e->orig_dst_port = orig_dst_port;
@@ -199,8 +229,12 @@ error_t conntrack_add_key(conntrack_t *ct, uint32_t key_src_ip, uint16_t src_por
         return ERR_BUSY;
     }
 
-    e->src_port = src_port;
+    e->src_port = key_src_port;
     e->key_src_ip = key_src_ip;
+    e->key_dst_ip = key_dst_ip;
+    e->key_dst_port = key_dst_port;
+    e->client_port = client_port;
+    e->relay_src_port = relay_src_port;
     e->src_ip = client_ip;
     e->orig_dst_ip = orig_dst_ip;
     e->orig_dst_port = orig_dst_port;
@@ -222,41 +256,36 @@ error_t conntrack_add(conntrack_t *ct, uint16_t src_port, uint32_t src_ip,
                      uint32_t orig_dst_ip, uint16_t orig_dst_port, uint8_t protocol,
                      uint32_t pid, const char *process_name,
                      uint32_t if_idx, uint32_t sub_if_idx) {
-    return conntrack_add_key(ct, src_ip, src_port, src_ip, orig_dst_ip, orig_dst_port,
-                             protocol, pid, process_name, if_idx, sub_if_idx);
+    return conntrack_add_key_full(ct, src_ip, src_port, 0, 0, src_ip, src_port,
+                                  orig_dst_ip, orig_dst_port, protocol, pid, process_name,
+                                  if_idx, sub_if_idx, src_port);
 }
 
 error_t conntrack_get(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol,
                       uint32_t *orig_dst_ip, uint16_t *orig_dst_port) {
-    unsigned int idx = bucket_index(ct, src_ip, src_port, protocol);
-
-    AcquireSRWLockShared(&ct->locks[idx]);
-
-    conntrack_entry_t *e = ct->buckets[idx];
-    while (e) {
-        if (e->key_src_ip == src_ip && e->src_port == src_port && e->protocol == protocol) {
-            if (orig_dst_ip) *orig_dst_ip = e->orig_dst_ip;
-            if (orig_dst_port) *orig_dst_port = e->orig_dst_port;
-            ReleaseSRWLockShared(&ct->locks[idx]);
-            return ERR_OK;
-        }
-        e = e->next;
-    }
-
-    ReleaseSRWLockShared(&ct->locks[idx]);
-    counter_inc(&ct->counters.misses);
-    return ERR_NOT_FOUND;
+    conntrack_entry_t entry;
+    error_t err = conntrack_get_full(ct, src_ip, src_port, protocol, &entry);
+    if (err != ERR_OK) return err;
+    if (orig_dst_ip) *orig_dst_ip = entry.orig_dst_ip;
+    if (orig_dst_port) *orig_dst_port = entry.orig_dst_port;
+    return ERR_OK;
 }
 
 error_t conntrack_get_full(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol,
                            conntrack_entry_t *out) {
-    unsigned int idx = bucket_index(ct, src_ip, src_port, protocol);
+    return conntrack_get_full_key(ct, src_ip, src_port, 0, 0, protocol, out);
+}
+
+error_t conntrack_get_full_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_port,
+                               uint32_t dst_ip, uint16_t dst_port, uint8_t protocol,
+                               conntrack_entry_t *out) {
+    unsigned int idx = bucket_index_full(ct, src_ip, src_port, dst_ip, dst_port, protocol);
 
     AcquireSRWLockShared(&ct->locks[idx]);
 
     conntrack_entry_t *e = ct->buckets[idx];
     while (e) {
-        if (e->key_src_ip == src_ip && e->src_port == src_port && e->protocol == protocol) {
+        if (conntrack_key_matches(e, src_ip, src_port, dst_ip, dst_port, protocol)) {
             memcpy(out, e, sizeof(*out));
             out->next = NULL;
             ReleaseSRWLockShared(&ct->locks[idx]);
@@ -271,13 +300,18 @@ error_t conntrack_get_full(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, 
 }
 
 void conntrack_remove(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol) {
-    unsigned int idx = bucket_index(ct, src_ip, src_port, protocol);
+    conntrack_remove_key(ct, src_ip, src_port, 0, 0, protocol);
+}
+
+void conntrack_remove_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_port,
+                          uint32_t dst_ip, uint16_t dst_port, uint8_t protocol) {
+    unsigned int idx = bucket_index_full(ct, src_ip, src_port, dst_ip, dst_port, protocol);
 
     AcquireSRWLockExclusive(&ct->locks[idx]);
 
     conntrack_entry_t **pp = &ct->buckets[idx];
     while (*pp) {
-        if ((*pp)->key_src_ip == src_ip && (*pp)->src_port == src_port && (*pp)->protocol == protocol) {
+        if (conntrack_key_matches(*pp, src_ip, src_port, dst_ip, dst_port, protocol)) {
             conntrack_entry_t *old = *pp;
             *pp = old->next;
             pool_free(ct, old);
@@ -292,13 +326,18 @@ void conntrack_remove(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8
 }
 
 void conntrack_touch(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol) {
-    unsigned int idx = bucket_index(ct, src_ip, src_port, protocol);
+    conntrack_touch_key(ct, src_ip, src_port, 0, 0, protocol);
+}
+
+void conntrack_touch_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_port,
+                         uint32_t dst_ip, uint16_t dst_port, uint8_t protocol) {
+    unsigned int idx = bucket_index_full(ct, src_ip, src_port, dst_ip, dst_port, protocol);
 
     AcquireSRWLockExclusive(&ct->locks[idx]);
 
     conntrack_entry_t *e = ct->buckets[idx];
     while (e) {
-        if (e->key_src_ip == src_ip && e->src_port == src_port && e->protocol == protocol) {
+        if (conntrack_key_matches(e, src_ip, src_port, dst_ip, dst_port, protocol)) {
             e->timestamp = get_tick_ms();
             break;
         }
