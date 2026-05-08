@@ -1,0 +1,60 @@
+{
+    "_comment": "WinTProxy configuration example. Copy this file and edit to suit your needs.",
+    "proxy": {
+        "_comment": "SOCKS5 proxy server address and port. Must be an IPv4 literal.",
+        "address": "127.0.0.1",
+        "port": 7890
+    },
+    "dns": {
+        "_comment": "Enable to intercept outbound DNS (port 53) and redirect to a local resolver. Loopback resolvers are supported via UDP forwarding.",
+        "enabled": true,
+        "redirect_address": "127.0.0.1",
+        "redirect_port": 1053
+    },
+    "default_action": "proxy",
+    "_comment_default_action": "Fallback action when no rule matches: proxy, direct, or block.",
+
+    "bypass_private_ips": false,
+    "_comment_bypass_private_ips": "When true, traffic to RFC 1918 / link-local / CGNAT addresses bypasses rule evaluation entirely and goes direct.",
+
+    "log_level": "info",
+    "_comment_log_level": "One of: error, warn, info, debug, trace, packet.",
+
+    "log_file": "",
+    "_comment_log_file": "Optional path for file logging. Leave empty for stderr only.",
+
+    "rules": [
+        {
+            "_comment": "Rule 1: Let the local SOCKS5 server talk directly so we don't proxy-loop ourselves.",
+            "process": "sockd.exe",
+            "action": "direct"
+        },
+        {
+            "_comment": "Rule 2: Direct-connect private/RFC 1918 ranges (10.x, 172.16-31.x, 192.168.x). CIDR notation.",
+            "ip": "10.0.0.0/8;172.16.0.0/12;192.168.0.0/16",
+            "action": "direct"
+        },
+        {
+            "_comment": "Rule 3: Direct-connect loopback traffic.",
+            "ip": "127.0.0.0/8",
+            "action": "direct"
+        },
+        {
+            "_comment": "Rule 4: Proxy these specific browsers. Process matching supports wildcards: prefix* *suffix *contains*.",
+            "process": "chrome.exe,firefox.exe,msedge.exe",
+            "action": "proxy"
+        },
+        {
+            "_comment": "Rule 5: Proxy common web ports for all other processes. Port ranges use dash notation.",
+            "process": "*",
+            "port": "80,443,8080,8443",
+            "protocol": "tcp",
+            "action": "proxy"
+        },
+        {
+            "_comment": "Rule 6: Catch-all — proxy everything else. First-match-wins ordering means earlier direct/block rules take priority over this.",
+            "process": "*",
+            "action": "proxy"
+        }
+    ]
+}

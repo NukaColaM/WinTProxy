@@ -23,7 +23,7 @@ cmake --build build
 Place `WinDivert.dll` and `WinDivert64.sys` next to `WinTProxy.exe`, then run from an elevated Windows shell:
 
 ```powershell
-WinTProxy.exe --config examples\basic.json
+WinTProxy.exe --config config.example.json
 ```
 
 ## Usage
@@ -45,15 +45,8 @@ Command-line options override config file values.
 
 ## Documentation
 
-- [Build and runtime requirements](docs/build-and-runtime.md)
-- [Configuration reference](docs/configuration.md)
-- [Architecture notes](docs/architecture.md)
-
-Example configurations live in [examples](examples):
-
-- [basic.json](examples/basic.json): practical browser proxying with direct local/private destinations.
-- [proxy-all.json](examples/proxy-all.json): proxy every non-private destination.
-- [dns-hijack.json](examples/dns-hijack.json): proxy traffic and redirect DNS to a local resolver.
+- [Guide](guide.md) — build, configuration, and architecture
+- [config.example.json](config.example.json) — annotated example covering all options
 
 ## License
 

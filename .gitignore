@@ -1,21 +1,8 @@
-build/
-build-*/
+build*/
 
-# CMake/Ninja/Make generated files when configured in-tree
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-install_manifest.txt
-compile_commands.json
-Makefile
-*.ninja
-.ninja_deps
-.ninja_log
-
-# MinGW/build outputs
+# Build artifacts
 *.exe
 *.dll
-*.dll.a
 *.o
 *.obj
 *.pdb
@@ -25,13 +12,13 @@ Makefile
 *.a
 !lib/windivert/libWinDivert.a
 
-# Runtime WinDivert drops
+# WinDivert runtime
 WinDivert.dll
 WinDivert32.sys
 WinDivert64.sys
 WinDivert.sys
 
-# Logs and local editor files
+# Logs and editor
 *.log
 *.tmp
 .vscode/
@@ -39,5 +26,7 @@ WinDivert.sys
 *.swp
 *.swo
 
-# AI assistant artifacts
+# AI artifacts
 context-snapshot.json
+session-log.md
+known-issues.md

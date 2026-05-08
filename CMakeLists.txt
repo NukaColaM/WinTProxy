@@ -53,5 +53,4 @@ else()
 endif()
 
 install(TARGETS WinTProxy RUNTIME DESTINATION bin)
-install(FILES README.md LICENSE DESTINATION share/WinTProxy)
-install(DIRECTORY docs examples DESTINATION share/WinTProxy)
+install(FILES README.md LICENSE guide.md config.example.json DESTINATION share/WinTProxy)
