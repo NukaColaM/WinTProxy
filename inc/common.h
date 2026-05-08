@@ -1,7 +1,7 @@
 #ifndef WINTPROXY_COMMON_H
 #define WINTPROXY_COMMON_H
 
-#define WINTPROXY_VERSION  "v0.3.0"
+#define WINTPROXY_VERSION  "v0.4.0"
 
 #include <stdint.h>
 

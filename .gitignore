@@ -38,3 +38,6 @@ WinDivert.sys
 .idea/
 *.swp
 *.swo
+
+# AI assistant artifacts
+context-snapshot.json

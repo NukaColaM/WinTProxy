@@ -51,6 +51,8 @@ struct tcp_conn_s {
     uint16_t          orig_client_port;
     uint32_t          orig_dst_ip;
     uint16_t          orig_dst_port;
+    uint32_t          connect_dst_ip;
+    uint16_t          connect_dst_port;
     tcp_conn_state_t  state;
     LONG              closing;
     LONG              refs;
@@ -91,7 +93,7 @@ static void tcp_conn_touch_conntrack(tcp_conn_t *conn) {
     conntrack_touch_key(conn->relay->conntrack, conn->lookup_ip, conn->client_port,
                         conn->lookup_dst_ip, conn->lookup_dst_port, 6);
     conntrack_touch_key(conn->relay->conntrack, conn->client_ip, conn->orig_client_port,
-                        conn->orig_dst_ip, conn->orig_dst_port, 6);
+                        conn->connect_dst_ip, conn->connect_dst_port, 6);
 }
 
 static void tcp_conn_release(tcp_conn_t *conn);
@@ -211,7 +213,7 @@ static void tcp_conn_close(tcp_conn_t *conn) {
         conntrack_remove_key(relay->conntrack, conn->lookup_ip, conn->client_port,
                              conn->lookup_dst_ip, conn->lookup_dst_port, 6);
         conntrack_remove_key(relay->conntrack, conn->client_ip, conn->orig_client_port,
-                             conn->orig_dst_ip, conn->orig_dst_port, 6);
+                             conn->connect_dst_ip, conn->connect_dst_port, 6);
     }
     tcp_conn_release(conn);
 }
@@ -223,7 +225,7 @@ static void tcp_conn_release(tcp_conn_t *conn) {
             counter_add(&conn->relay->counters.bytes_down, (LONG64)conn->bytes_down);
             InterlockedDecrement64(&conn->relay->counters.active_connections);
             LOG_TRACE("TCP relay: closed :%u -> %s:%u (up=%llu down=%llu bytes)",
-                conn->client_port, conn->dst_str, conn->orig_dst_port,
+                conn->client_port, conn->dst_str, conn->connect_dst_port,
                 (unsigned long long)conn->bytes_up, (unsigned long long)conn->bytes_down);
         }
         tcp_conn_free(conn);
@@ -352,7 +354,7 @@ static int post_recv_exact(tcp_conn_t *conn, tcp_io_t *io, SOCKET sock, tcp_io_t
 static void start_relay_io(tcp_conn_t *conn) {
     conn->state = TCP_STATE_RELAY;
     LOG_TRACE("TCP relay: tunnel established :%u -> %s:%u",
-              conn->client_port, conn->dst_str, conn->orig_dst_port);
+              conn->client_port, conn->dst_str, conn->connect_dst_port);
     if (!post_recv(conn, &conn->client_recv, conn->client, TCP_IO_CLIENT_RECV)) tcp_conn_close(conn);
     if (!post_recv(conn, &conn->proxy_recv, conn->proxy, TCP_IO_PROXY_RECV)) tcp_conn_close(conn);
 }
@@ -453,11 +455,13 @@ static void tcp_conn_start(tcp_relay_t *relay, SOCKET client) {
         conn->orig_client_port = entry.client_port;
         conn->orig_dst_ip = entry.orig_dst_ip;
         conn->orig_dst_port = entry.orig_dst_port;
+        conn->connect_dst_ip = entry.connect_dst_ip;
+        conn->connect_dst_port = entry.connect_dst_port;
     }
 
-    ip_to_str(conn->orig_dst_ip, conn->dst_str, sizeof(conn->dst_str));
+    ip_to_str(conn->connect_dst_ip, conn->dst_str, sizeof(conn->dst_str));
     LOG_PACKET("TCP relay: port %u -> %s:%u, connecting to SOCKS5 proxy",
-               conn->client_port, conn->dst_str, conn->orig_dst_port);
+               conn->client_port, conn->dst_str, conn->connect_dst_port);
 
     if (!associate_socket(relay, client, conn) || !post_proxy_connect(conn)) {
         counter_inc(&relay->counters.connect_failures);
@@ -556,8 +560,8 @@ static void on_proxy_recv_complete(tcp_conn_t *conn, DWORD bytes) {
                 SOCKS5_VERSION, SOCKS5_CMD_CONNECT, SOCKS5_RSV, SOCKS5_ATYP_IPV4,
                 0, 0, 0, 0, 0, 0
             };
-            uint16_t port_n = htons(conn->orig_dst_port);
-            memcpy(req + 4, &conn->orig_dst_ip, 4);
+            uint16_t port_n = htons(conn->connect_dst_port);
+            memcpy(req + 4, &conn->connect_dst_ip, 4);
             memcpy(req + 8, &port_n, 2);
             conn->state = TCP_STATE_HANDSHAKE_REQ_SEND;
             if (!post_send(conn, &conn->proxy_send, conn->proxy, TCP_IO_PROXY_SEND, req, sizeof(req))) {

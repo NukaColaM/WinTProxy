@@ -38,6 +38,7 @@ typedef struct {
     int                dns_data_valid;
     uint16_t           dns_txid;
     int                dns_txid_valid;
+    int                tcp_dns_hijack;
 } pkt_ctx_t;
 
 static void counter_inc(volatile LONG64 *counter) {
@@ -219,6 +220,9 @@ static pkt_type_t classify_packet(divert_engine_t *engine, pkt_ctx_t *ctx, WINDI
 
     if (ctx->udp_hdr && dns_hijack_is_dns_request(ctx->dst_port) && engine->dns_hijack->enabled)
         return PKT_DNS_HIJACK;
+
+    if (ctx->tcp_hdr && dns_hijack_is_dns_request(ctx->dst_port) && engine->dns_hijack->enabled)
+        return PKT_PROXY_REDIRECT;
 
     /* Broadcast and multicast destinations can't be proxied — pass through */
     if (ctx->dst_ip == 0xFFFFFFFF) return PKT_BYPASS;
@@ -440,12 +444,14 @@ static error_t add_proxy_conntrack(divert_engine_t *engine, pkt_ctx_t *ctx,
                                    const char *proc_name) {
     conntrack_entry_t existing;
     uint16_t relay_src_port = ctx->src_port;
+    uint32_t relay_dst_ip = ctx->tcp_dns_hijack ? engine->dns_hijack->redirect_ip : ctx->dst_ip;
+    uint16_t relay_dst_port = ctx->tcp_dns_hijack ? engine->dns_hijack->redirect_port : ctx->dst_port;
     error_t err;
 
     if (ctx->tcp_hdr) {
         if (conntrack_get_full_key(engine->conntrack,
                                    ctx->src_ip, ctx->src_port,
-                                   ctx->dst_ip, ctx->dst_port,
+                                   relay_dst_ip, relay_dst_port,
                                    ctx->protocol, &existing) == ERR_OK &&
             existing.relay_src_port != 0) {
             relay_src_port = existing.relay_src_port;
@@ -455,9 +461,10 @@ static error_t add_proxy_conntrack(divert_engine_t *engine, pkt_ctx_t *ctx,
 
         err = conntrack_add_key_full(engine->conntrack,
                                      ctx->src_ip, ctx->src_port,
-                                     ctx->dst_ip, ctx->dst_port,
+                                     relay_dst_ip, relay_dst_port,
                                      ctx->src_ip, ctx->src_port,
                                      ctx->dst_ip, ctx->dst_port,
+                                     relay_dst_ip, relay_dst_port,
                                      ctx->protocol, pid, proc_name,
                                      addr->Network.IfIdx, addr->Network.SubIfIdx,
                                      relay_src_port);
@@ -468,18 +475,19 @@ static error_t add_proxy_conntrack(divert_engine_t *engine, pkt_ctx_t *ctx,
                                      LOOPBACK_ADDR, engine->tcp_relay_port,
                                      ctx->src_ip, ctx->src_port,
                                      ctx->dst_ip, ctx->dst_port,
+                                     relay_dst_ip, relay_dst_port,
                                      ctx->protocol, pid, proc_name,
                                      addr->Network.IfIdx, addr->Network.SubIfIdx,
                                      relay_src_port);
         if (err != ERR_OK) {
             conntrack_remove_key(engine->conntrack, ctx->src_ip, ctx->src_port,
-                                 ctx->dst_ip, ctx->dst_port, ctx->protocol);
+                                 relay_dst_ip, relay_dst_port, ctx->protocol);
             return err;
         }
 
         if (conntrack_get_full_key(engine->conntrack,
                                    ctx->src_ip, ctx->src_port,
-                                   ctx->dst_ip, ctx->dst_port,
+                                   relay_dst_ip, relay_dst_port,
                                    ctx->protocol, &existing) == ERR_OK &&
             existing.relay_src_port != 0 &&
             existing.relay_src_port != relay_src_port) {
@@ -513,8 +521,11 @@ static error_t add_proxy_conntrack(divert_engine_t *engine, pkt_ctx_t *ctx,
 static int proxy_redirect_tcp_non_syn_tracked(divert_engine_t *engine, pkt_ctx_t *ctx,
                                                WINDIVERT_ADDRESS *addr) {
     conntrack_entry_t entry;
+    uint32_t lookup_dst_ip = ctx->tcp_dns_hijack ? engine->dns_hijack->redirect_ip : ctx->dst_ip;
+    uint16_t lookup_dst_port = ctx->tcp_dns_hijack ? engine->dns_hijack->redirect_port : ctx->dst_port;
+
     if (conntrack_get_full_key(engine->conntrack, ctx->src_ip, ctx->src_port,
-                               ctx->dst_ip, ctx->dst_port, 6, &entry) != ERR_OK)
+                               lookup_dst_ip, lookup_dst_port, 6, &entry) != ERR_OK)
         return 0;
 
     ctx->ip_hdr->SrcAddr = LOOPBACK_ADDR;
@@ -613,10 +624,11 @@ static void handle_proxy_redirect(divert_engine_t *engine, pkt_ctx_t *ctx,
     }
 
     /* Rule matching */
-    rule_action_t action = rules_match_ex(engine->config->rules, engine->config->rule_count,
-                                          engine->config->default_action,
-                                          proc_name, ctx->dst_ip, ctx->dst_port, ctx->protocol,
-                                          &matched_rule_id);
+    rule_action_t action = ctx->tcp_dns_hijack ? RULE_ACTION_PROXY :
+        rules_match_ex(engine->config->rules, engine->config->rule_count,
+                       engine->config->default_action,
+                       proc_name, ctx->dst_ip, ctx->dst_port, ctx->protocol,
+                       &matched_rule_id);
     if (matched_rule_id > 0) snprintf(rule_str, sizeof(rule_str), "#%d", matched_rule_id);
     else safe_str_copy(rule_str, sizeof(rule_str), "default");
 
@@ -715,6 +727,7 @@ static DWORD WINAPI divert_worker_proc(LPVOID param) {
         ctx.src_port = src_port;
         ctx.dst_port = dst_port;
         ctx.protocol = ip_hdr->Protocol;
+        ctx.tcp_dns_hijack = tcp_hdr && dns_hijack_is_dns_request(dst_port) && engine->dns_hijack->enabled;
 
         pkt_type_t type = classify_packet(engine, &ctx, &addr);
 

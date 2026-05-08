@@ -181,7 +181,8 @@ error_t conntrack_add_key(conntrack_t *ct, uint32_t key_src_ip, uint16_t src_por
                           uint8_t protocol, uint32_t pid, const char *process_name,
                           uint32_t if_idx, uint32_t sub_if_idx) {
     return conntrack_add_key_full(ct, key_src_ip, src_port, 0, 0, client_ip, src_port,
-                                  orig_dst_ip, orig_dst_port, protocol, pid, process_name,
+                                  orig_dst_ip, orig_dst_port, orig_dst_ip, orig_dst_port,
+                                  protocol, pid, process_name,
                                   if_idx, sub_if_idx, src_port);
 }
 
@@ -189,6 +190,7 @@ error_t conntrack_add_key_full(conntrack_t *ct, uint32_t key_src_ip, uint16_t ke
                                uint32_t key_dst_ip, uint16_t key_dst_port,
                                uint32_t client_ip, uint16_t client_port,
                                uint32_t orig_dst_ip, uint16_t orig_dst_port,
+                               uint32_t connect_dst_ip, uint16_t connect_dst_port,
                                uint8_t protocol, uint32_t pid, const char *process_name,
                                uint32_t if_idx, uint32_t sub_if_idx,
                                uint16_t relay_src_port) {
@@ -209,6 +211,8 @@ error_t conntrack_add_key_full(conntrack_t *ct, uint32_t key_src_ip, uint16_t ke
             e->src_ip = client_ip;
             e->orig_dst_ip = orig_dst_ip;
             e->orig_dst_port = orig_dst_port;
+            e->connect_dst_ip = connect_dst_ip;
+            e->connect_dst_port = connect_dst_port;
             e->pid = pid;
             if (process_name) safe_str_copy(e->process_name, sizeof(e->process_name), process_name);
             e->timestamp = get_tick_ms();
@@ -238,6 +242,8 @@ error_t conntrack_add_key_full(conntrack_t *ct, uint32_t key_src_ip, uint16_t ke
     e->src_ip = client_ip;
     e->orig_dst_ip = orig_dst_ip;
     e->orig_dst_port = orig_dst_port;
+    e->connect_dst_ip = connect_dst_ip;
+    e->connect_dst_port = connect_dst_port;
     e->protocol = protocol;
     e->pid = pid;
     if (process_name) safe_str_copy(e->process_name, sizeof(e->process_name), process_name);
@@ -257,7 +263,8 @@ error_t conntrack_add(conntrack_t *ct, uint16_t src_port, uint32_t src_ip,
                      uint32_t pid, const char *process_name,
                      uint32_t if_idx, uint32_t sub_if_idx) {
     return conntrack_add_key_full(ct, src_ip, src_port, 0, 0, src_ip, src_port,
-                                  orig_dst_ip, orig_dst_port, protocol, pid, process_name,
+                                  orig_dst_ip, orig_dst_port, orig_dst_ip, orig_dst_port,
+                                  protocol, pid, process_name,
                                   if_idx, sub_if_idx, src_port);
 }
 
