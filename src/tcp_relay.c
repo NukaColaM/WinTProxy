@@ -8,6 +8,7 @@
 
 #define TCP_RELAY_BUF_SIZE  WTP_TCP_RELAY_BUFFER_SIZE
 #define TCP_KEY_SHUTDOWN    ((ULONG_PTR)1)
+#define TCP_CONNTRACK_REFRESH_MS 20000U
 
 typedef enum {
     TCP_IO_ACCEPT = 1,
@@ -204,17 +205,10 @@ static void tcp_conn_free(tcp_conn_t *conn) {
 }
 
 static void tcp_conn_close(tcp_conn_t *conn) {
-    tcp_relay_t *relay = conn->relay;
     if (InterlockedExchange(&conn->closing, 1) != 0) return;
     conn->state = TCP_STATE_CLOSING;
     close_socket_if_valid(&conn->client);
     close_socket_if_valid(&conn->proxy);
-    if (conn->client_port) {
-        conntrack_remove_key(relay->conntrack, conn->lookup_ip, conn->client_port,
-                             conn->lookup_dst_ip, conn->lookup_dst_port, 6);
-        conntrack_remove_key(relay->conntrack, conn->client_ip, conn->orig_client_port,
-                             conn->connect_dst_ip, conn->connect_dst_port, 6);
-    }
     tcp_conn_release(conn);
 }
 
@@ -716,6 +710,24 @@ static DWORD WINAPI tcp_accept_thread(LPVOID param) {
     return 0;
 }
 
+static DWORD WINAPI tcp_refresh_thread(LPVOID param) {
+    tcp_relay_t *relay = (tcp_relay_t *)param;
+
+    while (relay->running) {
+        Sleep(TCP_CONNTRACK_REFRESH_MS);
+        if (!relay->running) break;
+
+        AcquireSRWLockShared(&relay->conn_lock);
+        for (tcp_conn_t *c = relay->active_list; c; c = c->next_active) {
+            if (!c->closing && c->client_port) {
+                tcp_conn_touch_conntrack(c);
+            }
+        }
+        ReleaseSRWLockShared(&relay->conn_lock);
+    }
+    return 0;
+}
+
 static void tcp_close_active(tcp_relay_t *relay) {
     tcp_conn_t **snapshot;
     size_t count = 0;
@@ -805,6 +817,13 @@ error_t tcp_relay_start(tcp_relay_t *relay, conntrack_t *conntrack, proxy_config
         }
     }
 
+    relay->refresh_thread = CreateThread(NULL, 0, tcp_refresh_thread, relay, 0, NULL);
+    if (!relay->refresh_thread) {
+        LOG_ERROR("TCP relay: failed to create refresh thread");
+        tcp_relay_stop(relay);
+        return ERR_GENERIC;
+    }
+
     relay->thread = CreateThread(NULL, 0, tcp_accept_thread, relay, 0, NULL);
     if (!relay->thread) {
         LOG_ERROR("TCP relay: failed to create accept thread");
@@ -820,6 +839,12 @@ error_t tcp_relay_start(tcp_relay_t *relay, conntrack_t *conntrack, proxy_config
 void tcp_relay_stop(tcp_relay_t *relay) {
     relay->running = 0;
     close_socket_if_valid(&relay->listen_sock);
+
+    if (relay->refresh_thread) {
+        WaitForSingleObject(relay->refresh_thread, TCP_CONNTRACK_REFRESH_MS + 1000U);
+        CloseHandle(relay->refresh_thread);
+        relay->refresh_thread = NULL;
+    }
 
     if (relay->thread) {
         WaitForSingleObject(relay->thread, 5000);

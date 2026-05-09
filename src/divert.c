@@ -38,7 +38,7 @@ typedef struct {
     int                dns_data_valid;
     uint16_t           dns_txid;
     int                dns_txid_valid;
-    int                tcp_dns_hijack;
+    int                reserved;
 } pkt_ctx_t;
 
 static void counter_inc(volatile LONG64 *counter) {
@@ -188,6 +188,12 @@ static int is_private_ip(uint32_t ip) {
 }
 
 static pkt_type_t classify_packet(divert_engine_t *engine, pkt_ctx_t *ctx, WINDIVERT_ADDRESS *addr) {
+    if (ctx->tcp_hdr && engine->dns_hijack->enabled &&
+        ctx->src_ip == engine->dns_hijack->redirect_ip &&
+        ctx->src_port == engine->dns_hijack->redirect_port &&
+        ((!addr->Outbound) || (addr->Outbound && addr->Loopback && ctx->dst_ip != LOOPBACK_ADDR)))
+        return PKT_TCP_DNS_RETURN;
+
     if (ctx->udp_hdr && addr->Outbound && addr->Loopback &&
         engine->dns_hijack->enabled &&
         ctx->src_ip == engine->dns_hijack->redirect_ip &&
@@ -222,7 +228,7 @@ static pkt_type_t classify_packet(divert_engine_t *engine, pkt_ctx_t *ctx, WINDI
         return PKT_DNS_HIJACK;
 
     if (ctx->tcp_hdr && dns_hijack_is_dns_request(ctx->dst_port) && engine->dns_hijack->enabled)
-        return PKT_PROXY_REDIRECT;
+        return PKT_TCP_DNS_HIJACK;
 
     /* Broadcast and multicast destinations can't be proxied — pass through */
     if (ctx->dst_ip == 0xFFFFFFFF) return PKT_BYPASS;
@@ -289,6 +295,38 @@ static void handle_inbound(divert_engine_t *engine, pkt_ctx_t *ctx,
         }
     }
     divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "inbound");
+}
+
+static void handle_tcp_dns_return(divert_engine_t *engine, pkt_ctx_t *ctx,
+                                  WINDIVERT_ADDRESS *addr) {
+    conntrack_entry_t entry;
+
+    if (conntrack_get_full_key(engine->conntrack, ctx->dst_ip, ctx->dst_port,
+                               ctx->src_ip, ctx->src_port, 6, &entry) != ERR_OK) {
+        LOG_PACKET("TCP DNS return: no conntrack for dst_port %u", ctx->dst_port);
+        counter_inc(&engine->counters.packets_dropped);
+        return;
+    }
+
+    ctx->ip_hdr->SrcAddr = entry.orig_dst_ip;
+    ctx->ip_hdr->DstAddr = entry.src_ip;
+    ctx->tcp_hdr->SrcPort = htons(entry.orig_dst_port);
+    ctx->tcp_hdr->DstPort = htons(entry.client_port);
+
+    if (engine->dns_hijack->redirect_ip == LOOPBACK_ADDR) {
+        addr->Outbound = 1;
+        addr->Loopback = 1;
+        addr->Network.IfIdx = engine->loopback_if_idx;
+        addr->Network.SubIfIdx = 0;
+    } else {
+        addr->Outbound = 0;
+        addr->Loopback = 0;
+        addr->Network.IfIdx = entry.if_idx;
+        addr->Network.SubIfIdx = entry.sub_if_idx;
+    }
+    WinDivertHelperCalcChecksums(ctx->packet, ctx->packet_len, addr, 0);
+
+    divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "TCP DNS return");
 }
 
 /* === Handler: TCP/UDP return path (shared logic) === */
@@ -398,6 +436,40 @@ static void handle_dns_hijack(divert_engine_t *engine, pkt_ctx_t *ctx,
     }
 }
 
+static void handle_tcp_dns_hijack(divert_engine_t *engine, pkt_ctx_t *ctx,
+                                  WINDIVERT_ADDRESS *addr) {
+    char orig_str[16], redir_str[16];
+    error_t err;
+
+    err = conntrack_add_key_full(engine->conntrack,
+                                 ctx->src_ip, ctx->src_port,
+                                 engine->dns_hijack->redirect_ip, engine->dns_hijack->redirect_port,
+                                 ctx->src_ip, ctx->src_port,
+                                 ctx->dst_ip, ctx->dst_port,
+                                 engine->dns_hijack->redirect_ip, engine->dns_hijack->redirect_port,
+                                 6, 0, "",
+                                 addr->Network.IfIdx, addr->Network.SubIfIdx,
+                                 ctx->src_port);
+    if (err != ERR_OK) {
+        LOG_WARN("TCP DNS hijack: conntrack unavailable, dropping");
+        counter_inc(&engine->counters.packets_dropped);
+        return;
+    }
+
+    ctx->ip_hdr->DstAddr = engine->dns_hijack->redirect_ip;
+    ctx->tcp_hdr->DstPort = htons(engine->dns_hijack->redirect_port);
+    if (engine->dns_hijack->redirect_ip == LOOPBACK_ADDR) {
+        set_loopback_route(engine, addr);
+    }
+    WinDivertHelperCalcChecksums(ctx->packet, ctx->packet_len, addr, 0);
+
+    ip_to_str(ctx->dst_ip, orig_str, sizeof(orig_str));
+    ip_to_str(engine->dns_hijack->redirect_ip, redir_str, sizeof(redir_str));
+    LOG_PACKET("TCP DNS hijack: %s:%u -> %s:%u", orig_str, ctx->dst_port,
+        redir_str, engine->dns_hijack->redirect_port);
+    divert_send_packet(engine, ctx->packet, ctx->packet_len, addr, "TCP DNS hijack");
+}
+
 /* === Helper: forward UDP payload to relay via real socket === */
 static void proxy_redirect_udp_forward(divert_engine_t *engine, pkt_ctx_t *ctx) {
     PVOID udp_data = NULL;
@@ -444,8 +516,8 @@ static error_t add_proxy_conntrack(divert_engine_t *engine, pkt_ctx_t *ctx,
                                    const char *proc_name) {
     conntrack_entry_t existing;
     uint16_t relay_src_port = ctx->src_port;
-    uint32_t relay_dst_ip = ctx->tcp_dns_hijack ? engine->dns_hijack->redirect_ip : ctx->dst_ip;
-    uint16_t relay_dst_port = ctx->tcp_dns_hijack ? engine->dns_hijack->redirect_port : ctx->dst_port;
+    uint32_t relay_dst_ip = ctx->dst_ip;
+    uint16_t relay_dst_port = ctx->dst_port;
     error_t err;
 
     if (ctx->tcp_hdr) {
@@ -521,8 +593,8 @@ static error_t add_proxy_conntrack(divert_engine_t *engine, pkt_ctx_t *ctx,
 static int proxy_redirect_tcp_non_syn_tracked(divert_engine_t *engine, pkt_ctx_t *ctx,
                                                WINDIVERT_ADDRESS *addr) {
     conntrack_entry_t entry;
-    uint32_t lookup_dst_ip = ctx->tcp_dns_hijack ? engine->dns_hijack->redirect_ip : ctx->dst_ip;
-    uint16_t lookup_dst_port = ctx->tcp_dns_hijack ? engine->dns_hijack->redirect_port : ctx->dst_port;
+    uint32_t lookup_dst_ip = ctx->dst_ip;
+    uint16_t lookup_dst_port = ctx->dst_port;
 
     if (conntrack_get_full_key(engine->conntrack, ctx->src_ip, ctx->src_port,
                                lookup_dst_ip, lookup_dst_port, 6, &entry) != ERR_OK)
@@ -624,7 +696,7 @@ static void handle_proxy_redirect(divert_engine_t *engine, pkt_ctx_t *ctx,
     }
 
     /* Rule matching */
-    rule_action_t action = ctx->tcp_dns_hijack ? RULE_ACTION_PROXY :
+    rule_action_t action =
         rules_match_ex(engine->config->rules, engine->config->rule_count,
                        engine->config->default_action,
                        proc_name, ctx->dst_ip, ctx->dst_port, ctx->protocol,
@@ -727,7 +799,6 @@ static DWORD WINAPI divert_worker_proc(LPVOID param) {
         ctx.src_port = src_port;
         ctx.dst_port = dst_port;
         ctx.protocol = ip_hdr->Protocol;
-        ctx.tcp_dns_hijack = tcp_hdr && dns_hijack_is_dns_request(dst_port) && engine->dns_hijack->enabled;
 
         pkt_type_t type = classify_packet(engine, &ctx, &addr);
 
@@ -738,6 +809,9 @@ static DWORD WINAPI divert_worker_proc(LPVOID param) {
         case PKT_INBOUND:
         case PKT_DNS_RESP:
             handle_inbound(engine, &ctx, &addr, type);
+            break;
+        case PKT_TCP_DNS_RETURN:
+            handle_tcp_dns_return(engine, &ctx, &addr);
             break;
         case PKT_TCP_RETURN:
         case PKT_UDP_RETURN:
@@ -751,6 +825,9 @@ static DWORD WINAPI divert_worker_proc(LPVOID param) {
             break;
         case PKT_DNS_HIJACK:
             handle_dns_hijack(engine, &ctx, &addr);
+            break;
+        case PKT_TCP_DNS_HIJACK:
+            handle_tcp_dns_hijack(engine, &ctx, &addr);
             break;
         case PKT_PROXY_REDIRECT:
             handle_proxy_redirect(engine, &ctx, &addr);
@@ -847,9 +924,12 @@ error_t divert_start(divert_engine_t *engine, app_config_t *config,
             /* Loopback DNS uses socket-based forwarding — no filter needed */
             dns_filter[0] = '\0';
         } else {
-            /* Non-loopback DNS server: capture inbound responses by IP */
+            /* Non-loopback DNS server: capture inbound UDP/TCP responses by IP */
             snprintf(dns_filter, sizeof(dns_filter),
-                " or (inbound and ip and udp and ip.SrcAddr == %u.%u.%u.%u and udp.SrcPort == %u)",
+                " or (inbound and ip and ((udp and ip.SrcAddr == %u.%u.%u.%u and udp.SrcPort == %u) or "
+                "(tcp and ip.SrcAddr == %u.%u.%u.%u and tcp.SrcPort == %u)))",
+                ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
+                dns_hijack->redirect_port,
                 ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
                 dns_hijack->redirect_port);
         }

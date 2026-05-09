@@ -32,6 +32,7 @@ typedef struct {
     uint16_t         port;
     volatile int     running;
     HANDLE           thread;
+    HANDLE           refresh_thread;
     HANDLE           iocp;
     HANDLE           workers[TCP_RELAY_WORKER_MAX];
     int              worker_count;

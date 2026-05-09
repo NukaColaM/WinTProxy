@@ -1,7 +1,7 @@
 #ifndef WINTPROXY_COMMON_H
 #define WINTPROXY_COMMON_H
 
-#define WINTPROXY_VERSION  "v0.4.0"
+#define WINTPROXY_VERSION  "v0.5.0"
 
 #include <stdint.h>
 
@@ -27,12 +27,14 @@ typedef enum {
     PKT_INBOUND = 0,
     PKT_DNS_RESP_LOOPBACK,
     PKT_DNS_RESP,
+    PKT_TCP_DNS_RETURN,
     PKT_TCP_RETURN,
     PKT_UDP_RETURN,
     PKT_SELF_PROXY,
     PKT_SELF_RELAY,
     PKT_SELF_DNS,
     PKT_DNS_HIJACK,
+    PKT_TCP_DNS_HIJACK,
     PKT_PROXY_REDIRECT,
     PKT_BYPASS
 } pkt_type_t;
