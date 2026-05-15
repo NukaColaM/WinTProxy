@@ -1,0 +1,9 @@
+{"file":".trellis/spec/backend/index.md","reason":"Backend task entrypoint and pre-development checklist for C/WinDivert refactor."}
+{"file":".trellis/spec/backend/directory-structure.md","reason":"Directory/module organization guidance for the complete multi-folder traffic-flow restructure."}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Project error handling conventions for subsystem init/config/parser failures."}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Logging conventions for new traffic verdict/action, DNS, relay, and config messages."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Quality expectations for the broad packet-path refactor and build validation."}
+{"file":".trellis/spec/guides/index.md","reason":"Thinking-guide index for cross-layer and reuse checks during architecture refactor."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Avoid duplicated packet/action/config parsing helpers while splitting modules."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Map data flow across config, policy, flow planning, actions, conntrack, DNS, relay, and docs."}
+{"file":".trellis/tasks/05-15-restructure-traffic-flow-path/research/traffic-flow-refactor-options.md","reason":"Research notes comparing refactor options and documenting current packet-path responsibilities/risks."}

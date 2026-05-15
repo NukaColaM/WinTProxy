@@ -1,0 +1,8 @@
+{"file":".trellis/spec/backend/index.md","reason":"Backend task entrypoint and checklist for review."}
+{"file":".trellis/spec/backend/directory-structure.md","reason":"Verify new folder/module layout follows documented project direction."}
+{"file":".trellis/spec/backend/error-handling.md","reason":"Review error propagation and cleanup paths in config/init/packet modules."}
+{"file":".trellis/spec/backend/logging-guidelines.md","reason":"Review traffic/action/DNS/relay logging consistency."}
+{"file":".trellis/spec/backend/quality-guidelines.md","reason":"Quality checks and build validation expectations."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Check for duplicated logic after broad module splitting."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Review cross-layer consistency from config schema through docs and packet actions."}
+{"file":".trellis/tasks/05-15-restructure-traffic-flow-path/research/traffic-flow-refactor-options.md","reason":"Review implementation against documented current responsibilities, risks, and selected verdict/action direction."}
