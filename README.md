@@ -1,13 +1,15 @@
 # WinTProxy
 
-Transparent SOCKS5 proxy for Windows. WinTProxy intercepts IPv4 TCP and UDP traffic with [WinDivert](https://github.com/basil00/WinDivert), classifies packets by process and destination, and applies ordered proxy/direct/block rules.
+Transparent SOCKS5 proxy for Windows. WinTProxy intercepts IPv4 TCP and UDP traffic with [WinDivert](https://github.com/basil00/WinDivert), plans each packet through explicit DNS, bypass, policy, proxy, return-path, and action-execution stages, then applies a proxy/direct verdict.
 
 ## Features
 
-- Rule-based transparent proxying by process name, IP range, port, and protocol.
+- Explicit verdict/action traffic engine with centralized pass, drop, rewrite/send, DNS-forward, and UDP-relay actions.
+- Traffic-stage JSON config: `capture`, `dns`, `bypass`, `policy`, `proxy`, and `logging`.
+- Ordered first-match proxy/direct policy rules by process name, IP range, port, and protocol.
 - TCP forwarding through SOCKS5 CONNECT.
 - UDP forwarding through SOCKS5 UDP ASSOCIATE.
-- Optional DNS hijacking to a configured IPv4 resolver.
+- DNS hijacking for both UDP and TCP DNS before normal policy decisions.
 - Fixed-size hot-path tables for connection tracking, DNS NAT, process lookup, and relay state.
 
 ## Quick Start
@@ -33,20 +35,24 @@ WinTProxy.exe [options]
 
 Options:
   --config <path>     Path to JSON config file
-  --proxy <addr:port> SOCKS5 proxy address (default: 127.0.0.1:7890)
-  --dns <addr:port>   Enable DNS hijacking (redirect to addr:port)
-  --log <path>        Write logs to file (in addition to stderr)
-  -v, --verbose       Increase verbosity (repeat for more: -vv, -vvv, -vvvv)
+  --log <path>        Override logging.file from config
+  -v, --verbose       Override logging.level (repeat for more: -vv, -vvv, -vvvv)
   --version           Show version
   -h, --help          Show help
 ```
 
-Command-line options override config file values.
+Traffic behavior belongs in the config file. CLI flags are intentionally limited to bootstrap/logging/help/version.
+
+## Configuration
+
+WinTProxy now uses a traffic-stage schema. Policy decisions are `proxy` or `direct` only; the previous policy-level `block` action has been removed from the traffic model.
+
+See [config.example.json](config.example.json) for an annotated example.
 
 ## Documentation
 
 - [Guide](guide.md) — build, configuration, and architecture
-- [config.example.json](config.example.json) — annotated example covering all options
+- [config.example.json](config.example.json) — annotated traffic-stage config
 
 ## License
 

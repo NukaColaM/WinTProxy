@@ -11,17 +11,26 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
 endif()
 
 set(SOURCES
-    src/main.c
-    src/log.c
-    src/config.c
-    src/connection.c
-    src/process.c
-    src/rules.c
-    src/socks5.c
-    src/dns.c
-    src/divert.c
-    src/tcp_relay.c
-    src/udp_relay.c
+    src/app/main.c
+    src/app/log.c
+    src/app/config.c
+    src/conntrack/conntrack.c
+    src/process/lookup.c
+    src/policy/rules.c
+    src/dns/hijack.c
+    src/dns/plan.c
+    src/divert/adapter.c
+    src/packet/context.c
+    src/flow/action.c
+    src/flow/executor.c
+    src/flow/plan.c
+    src/path/bypass.c
+    src/path/classify.c
+    src/path/proxy.c
+    src/path/return.c
+    src/relay/socks5.c
+    src/relay/tcp.c
+    src/relay/udp.c
     lib/cJSON/cJSON.c
 )
 
