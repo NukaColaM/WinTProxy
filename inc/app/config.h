@@ -65,12 +65,6 @@ typedef struct {
 } policy_rule_t;
 
 typedef struct {
-    uint64_t queue_length;
-    uint64_t queue_time_ms;
-    uint64_t queue_size;
-} capture_config_t;
-
-typedef struct {
     int      enabled;
     char     redirect_address[64];
     uint16_t redirect_port;
@@ -101,7 +95,6 @@ typedef struct {
 } logging_config_t;
 
 typedef struct {
-    capture_config_t capture;
     dns_config_t     dns;
     bypass_config_t  bypass;
     policy_config_t  policy;

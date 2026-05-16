@@ -20,10 +20,6 @@
 void config_set_defaults(app_config_t *cfg) {
     memset(cfg, 0, sizeof(*cfg));
 
-    cfg->capture.queue_length = WTP_DIVERT_QUEUE_LENGTH;
-    cfg->capture.queue_time_ms = WTP_DIVERT_QUEUE_TIME_MS;
-    cfg->capture.queue_size = WTP_DIVERT_QUEUE_SIZE;
-
     cfg->dns.enabled = 0;
     safe_str_copy(cfg->dns.redirect_address, sizeof(cfg->dns.redirect_address), "127.0.0.1");
     cfg->dns.redirect_port = 1053;
@@ -487,30 +483,6 @@ static int compile_process_patterns(policy_rule_t *r) {
     return 1;
 }
 
-static int parse_capture_object(app_config_t *cfg, cJSON *capture) {
-    static const char *const allowed_keys[] = { "queue_length", "queue_time_ms", "queue_size" };
-
-    if (!capture) return 1;
-    if (!cJSON_IsObject(capture)) {
-        LOG_ERROR("Invalid config: capture must be an object");
-        return 0;
-    }
-    if (!validate_object_keys(capture, "capture", allowed_keys, ARRAY_LEN(allowed_keys))) {
-        return 0;
-    }
-
-    if (!parse_json_u64(cJSON_GetObjectItemCaseSensitive(capture, "queue_length"),
-                        "capture.queue_length", 1, 1048576, &cfg->capture.queue_length) ||
-        !parse_json_u64(cJSON_GetObjectItemCaseSensitive(capture, "queue_time_ms"),
-                        "capture.queue_time_ms", 1, 60000, &cfg->capture.queue_time_ms) ||
-        !parse_json_u64(cJSON_GetObjectItemCaseSensitive(capture, "queue_size"),
-                        "capture.queue_size", 1, 0x7FFFFFFF, &cfg->capture.queue_size)) {
-        return 0;
-    }
-
-    return 1;
-}
-
 static int parse_proxy_object(app_config_t *cfg, cJSON *proxy) {
     static const char *const allowed_keys[] = { "address", "port" };
     cJSON *addr;
@@ -781,7 +753,7 @@ static int parse_logging_object(app_config_t *cfg, cJSON *logging) {
 
 error_t config_load(app_config_t *cfg, const char *path) {
     static const char *const top_level_keys[] = {
-        "capture", "dns", "bypass", "policy", "proxy", "logging"
+        "dns", "bypass", "policy", "proxy", "logging"
     };
     FILE *f = NULL;
     char *buf = NULL;
@@ -834,8 +806,7 @@ error_t config_load(app_config_t *cfg, const char *path) {
         goto done;
     }
 
-    if (!parse_capture_object(&next, cJSON_GetObjectItemCaseSensitive(root, "capture")) ||
-        !parse_dns_object(&next, cJSON_GetObjectItemCaseSensitive(root, "dns")) ||
+    if (!parse_dns_object(&next, cJSON_GetObjectItemCaseSensitive(root, "dns")) ||
         !parse_bypass_object(&next, cJSON_GetObjectItemCaseSensitive(root, "bypass")) ||
         !parse_policy_object(&next, cJSON_GetObjectItemCaseSensitive(root, "policy")) ||
         !parse_proxy_object(&next, cJSON_GetObjectItemCaseSensitive(root, "proxy")) ||
@@ -871,10 +842,6 @@ error_t config_apply_cli(app_config_t *cfg, int verbosity) {
 
 void config_dump(const app_config_t *cfg) {
     LOG_INFO("=== WinTProxy Configuration ===");
-    LOG_INFO("Capture: queue_length=%llu queue_time=%llums queue_size=%llu",
-             (unsigned long long)cfg->capture.queue_length,
-             (unsigned long long)cfg->capture.queue_time_ms,
-             (unsigned long long)cfg->capture.queue_size);
     LOG_INFO("SOCKS5 proxy: %s:%u", cfg->proxy.address, cfg->proxy.port);
     LOG_INFO("DNS hijacking: %s", cfg->dns.enabled ? "enabled" : "disabled");
     if (cfg->dns.enabled) {

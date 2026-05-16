@@ -65,13 +65,9 @@ static uint32_t detect_loopback_if_idx(void) {
 }
 
 static void tune_windivert_queue(divert_engine_t *engine) {
-    uint64_t queue_length = engine->config ? engine->config->capture.queue_length : DIVERT_QUEUE_LENGTH;
-    uint64_t queue_time = engine->config ? engine->config->capture.queue_time_ms : DIVERT_QUEUE_TIME;
-    uint64_t queue_size = engine->config ? engine->config->capture.queue_size : DIVERT_QUEUE_SIZE;
-
-    WinDivertSetParam(engine->handle, WINDIVERT_PARAM_QUEUE_LENGTH, queue_length);
-    WinDivertSetParam(engine->handle, WINDIVERT_PARAM_QUEUE_TIME, queue_time);
-    WinDivertSetParam(engine->handle, WINDIVERT_PARAM_QUEUE_SIZE, queue_size);
+    WinDivertSetParam(engine->handle, WINDIVERT_PARAM_QUEUE_LENGTH, DIVERT_QUEUE_LENGTH);
+    WinDivertSetParam(engine->handle, WINDIVERT_PARAM_QUEUE_TIME, DIVERT_QUEUE_TIME);
+    WinDivertSetParam(engine->handle, WINDIVERT_PARAM_QUEUE_SIZE, DIVERT_QUEUE_SIZE);
     WinDivertGetParam(engine->handle, WINDIVERT_PARAM_QUEUE_LENGTH, &engine->queue_length);
     WinDivertGetParam(engine->handle, WINDIVERT_PARAM_QUEUE_TIME, &engine->queue_time);
     WinDivertGetParam(engine->handle, WINDIVERT_PARAM_QUEUE_SIZE, &engine->queue_size);

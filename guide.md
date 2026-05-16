@@ -52,7 +52,6 @@ WinTProxy reads a strict JSON config file. All addresses must be IPv4 literals â
 
 ```json
 {
-    "capture": { "queue_length": 16384, "queue_time_ms": 100, "queue_size": 33554432 },
     "dns": { "enabled": true, "redirect_address": "127.0.0.1", "redirect_port": 1053 },
     "bypass": { "private_ips": false, "multicast": true, "broadcast": true },
     "policy": {
@@ -71,7 +70,6 @@ WinTProxy reads a strict JSON config file. All addresses must be IPv4 literals â
 
 | Section | Description |
 |---|---|
-| `capture` | WinDivert adapter queue settings. Capture is intentionally broad enough for bypass/direct decisions to be visible in the planner instead of hidden in the filter. |
 | `dns` | First-class DNS stage. When enabled, UDP/TCP port 53 traffic is handled before bypass and policy. |
 | `bypass` | Non-proxyable/direct destination classes for non-DNS traffic: private/link-local/CGNAT, multicast, and broadcast. |
 | `policy` | Ordered first-match proxy/direct rules and default decision. |

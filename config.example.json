@@ -1,11 +1,5 @@
 {
-    "_comment": "WinTProxy traffic-stage configuration. Top-level sections mirror the runtime flow: capture -> dns -> bypass -> policy -> proxy -> logging.",
-    "capture": {
-        "_comment": "WinDivert adapter settings. The filter captures TCP/UDP packet paths and relay/DNS returns; queue knobs tune the driver queue.",
-        "queue_length": 16384,
-        "queue_time_ms": 100,
-        "queue_size": 33554432
-    },
+    "_comment": "WinTProxy traffic-stage configuration. Top-level sections mirror the runtime flow: dns -> bypass -> policy -> proxy -> logging.",
     "dns": {
         "_comment": "DNS is a first-class stage before bypass/policy. Matching TCP/UDP port 53 traffic is redirected when enabled.",
         "enabled": true,

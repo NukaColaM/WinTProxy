@@ -115,7 +115,6 @@ The runtime config uses a traffic-stage schema. Top-level sections are:
 
 ```json
 {
-  "capture": {},
   "dns": {},
   "bypass": {},
   "policy": {},
@@ -123,6 +122,9 @@ The runtime config uses a traffic-stage schema. Top-level sections are:
   "logging": {}
 }
 ```
+
+WinDivert capture queue tuning is an internal adapter detail, not a public config
+section.
 
 Policy is proxy/direct only:
 

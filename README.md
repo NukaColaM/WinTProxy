@@ -5,7 +5,7 @@ Transparent SOCKS5 proxy for Windows. WinTProxy intercepts IPv4 TCP and UDP traf
 ## Features
 
 - Explicit verdict/action traffic engine with centralized pass, drop, rewrite/send, DNS-forward, and UDP-relay actions.
-- Traffic-stage JSON config: `capture`, `dns`, `bypass`, `policy`, `proxy`, and `logging`.
+- Traffic-stage JSON config: `dns`, `bypass`, `policy`, `proxy`, and `logging`.
 - Ordered first-match proxy/direct policy rules by process name, IP range, port, and protocol.
 - TCP forwarding through SOCKS5 CONNECT.
 - UDP forwarding through SOCKS5 UDP ASSOCIATE.
