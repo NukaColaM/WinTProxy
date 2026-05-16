@@ -39,3 +39,37 @@ Refactored WinTProxy around explicit traffic-flow submodules and a verdict/actio
 ### Next Steps
 
 - None - task complete
+
+
+## Session 2: Refactor logging levels and diagnostics
+
+**Date**: 2026-05-16
+**Task**: Refactor logging levels and diagnostics
+**Branch**: `main`
+
+### Summary
+
+Refactored WinTProxy logging to five public levels, reallocated debug/trace diagnostics, added DNS query summaries, moved performance snapshots to grouped DEBUG output, suppressed noisy PID 4 FLOW watcher debug logs, updated docs and logging specs, and archived the task.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c9c7953` | (see git log) |
+| `a136f62` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
