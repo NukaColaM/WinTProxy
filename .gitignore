@@ -1,4 +1,5 @@
 build*/
+.trellis/
 
 # Build artifacts
 *.exe
@@ -27,6 +28,9 @@ WinDivert.sys
 *.swo
 
 # AI artifacts
+.trellis/
+.pi/
+AGENTS.md
 context-snapshot.json
 session-log.md
 known-issues.md

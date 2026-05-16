@@ -1,7 +1,7 @@
 #ifndef WINTPROXY_CORE_COMMON_H
 #define WINTPROXY_CORE_COMMON_H
 
-#define WINTPROXY_VERSION  "v0.6.0-dev"
+#define WINTPROXY_VERSION  "v0.6.0"
 
 #include <stdint.h>
 
