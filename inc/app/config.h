@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "core/common.h"
+#include "app/log.h"
 
 #define RULE_PROCESS_TOKEN_MAX  16
 #define RULE_IP_RANGE_MAX       32
@@ -95,8 +96,8 @@ typedef struct {
 } policy_config_t;
 
 typedef struct {
-    int  level;
-    char file[260];
+    log_level_t level;
+    char        file[260];
 } logging_config_t;
 
 typedef struct {

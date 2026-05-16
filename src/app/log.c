@@ -44,12 +44,40 @@ static log_queue_t  g_log_queue;
 static CRITICAL_SECTION g_output_lock;
 static int g_output_lock_init = 0;
 
-static const char *level_names[] = { "ERROR", "WARN", "INFO", "DEBUG", "TRACE", "PKT" };
-static const char *level_colors[] = { "\033[31m", "\033[33m", "\033[32m", "\033[36m", "\033[90m", "\033[35m" };
+static const char *level_names[LOG_LEVEL_COUNT] = { "error", "warn", "info", "debug", "trace" };
+static const char *level_labels[LOG_LEVEL_COUNT] = { "ERROR", "WARN", "INFO", "DEBUG", "TRACE" };
+static const char *level_colors[LOG_LEVEL_COUNT] = { "\033[31m", "\033[33m", "\033[32m", "\033[36m", "\033[90m" };
+static const char *level_names_csv = "error, warn, info, debug, trace";
 
 static void log_output_entry(const log_entry_t *entry);
 static void log_output_dropped(unsigned long dropped);
 static DWORD WINAPI log_worker_proc(LPVOID param);
+
+const char *log_level_name(log_level_t level) {
+    if (level < LOG_ERROR || level >= LOG_LEVEL_COUNT) return "unknown";
+    return level_names[level];
+}
+
+const char *log_level_label(log_level_t level) {
+    if (level < LOG_ERROR || level >= LOG_LEVEL_COUNT) return "UNKNOWN";
+    return level_labels[level];
+}
+
+const char *log_level_allowed_names(void) {
+    return level_names_csv;
+}
+
+int log_level_parse(const char *s, log_level_t *out) {
+    if (!s || !out) return 0;
+
+    for (int i = 0; i < LOG_LEVEL_COUNT; i++) {
+        if (_stricmp(s, level_names[i]) == 0) {
+            *out = (log_level_t)i;
+            return 1;
+        }
+    }
+    return 0;
+}
 
 int log_is_enabled(log_level_t level) {
     return level <= g_log_level;
@@ -124,14 +152,20 @@ void log_shutdown(void) {
 }
 
 static void log_output_entry_unlocked(const log_entry_t *entry) {
-    if (g_log_queue.use_color) fprintf(stderr, "%s", level_colors[entry->level]);
-    fprintf(stderr, "[%s][TID:%lu][%-5s] ", entry->time_str, entry->tid, level_names[entry->level]);
-    if (g_log_queue.use_color) fprintf(stderr, "\033[0m");
+    const char *level_label = log_level_label(entry->level);
+
+    if (g_log_queue.use_color && entry->level >= LOG_ERROR && entry->level < LOG_LEVEL_COUNT) {
+        fprintf(stderr, "%s", level_colors[entry->level]);
+    }
+    fprintf(stderr, "[%s][TID:%lu][%-5s] ", entry->time_str, entry->tid, level_label);
+    if (g_log_queue.use_color && entry->level >= LOG_ERROR && entry->level < LOG_LEVEL_COUNT) {
+        fprintf(stderr, "\033[0m");
+    }
     fprintf(stderr, "%s\n", entry->message);
 
     if (g_log_file) {
         fprintf(g_log_file, "[%s][TID:%lu][%-5s] %s\n",
-                entry->time_str, entry->tid, level_names[entry->level], entry->message);
+                entry->time_str, entry->tid, level_label, entry->message);
     }
 }
 

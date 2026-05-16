@@ -418,14 +418,14 @@ static void handle_client_datagram(udp_relay_t *relay, uint8_t *recv_buf, int n,
     udp_payload_len = n - 6;
 
     if (conntrack_get(relay->conntrack, client_ip, client_port, 17, &orig_dst_ip, &orig_dst_port) != ERR_OK) {
-        LOG_PACKET("UDP relay: no conntrack for port %u, dropping", client_port);
+        LOG_TRACE("UDP relay: no conntrack for port %u, dropping", client_port);
         counter_inc(&relay->counters.dropped_datagrams);
         return;
     }
 
     if (!ensure_session(relay, client_ip, client_port) ||
         !snapshot_session(relay, client_ip, client_port, &snapshot)) {
-        LOG_PACKET("UDP relay: no available SOCKS UDP session for port %u", client_port);
+        LOG_WARN("UDP relay: no available SOCKS UDP session for port %u", client_port);
         counter_inc(&relay->counters.dropped_datagrams);
         return;
     }
@@ -443,7 +443,7 @@ static void handle_client_datagram(udp_relay_t *relay, uint8_t *recv_buf, int n,
                 update_session_activity(relay, &snapshot);
                 counter_add(&relay->counters.bytes_up, udp_payload_len);
                 ip_to_str(orig_dst_ip, dst_str, sizeof(dst_str));
-                LOG_PACKET("UDP relay: forwarded %d bytes from :%u to %s:%u",
+                LOG_TRACE("UDP relay: forwarded %d bytes from :%u to %s:%u",
                     udp_payload_len, client_port, dst_str, orig_dst_port);
             } else {
                 close_failed_snapshot(relay, &snapshot);

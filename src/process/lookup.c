@@ -338,7 +338,7 @@ static void flow_event_cache(proc_lookup_t *pl, const WINDIVERT_ADDRESS *addr) {
 
     proc_name_for_pid(pl, pid, name, sizeof(name));
     if (pid == 4 && (!name[0] || strcmp(name, "unknown") == 0)) {
-        LOG_PACKET("Process flow event ignored: unknown [4] for %s port %u",
+        LOG_TRACE("Process flow event ignored: System [4] for %s port %u",
                    protocol == 6 ? "TCP" : "UDP", local_port);
         return;
     }
@@ -351,7 +351,7 @@ static void flow_event_cache(proc_lookup_t *pl, const WINDIVERT_ADDRESS *addr) {
     }
     counter_inc(&pl->counters.flow_events);
 
-    LOG_PACKET("Process flow event: %s [%u] for %s port %u",
+    LOG_TRACE("Process flow event: %s [%u] for %s port %u",
               name[0] ? name : "unknown", pid, protocol == 6 ? "TCP" : "UDP", local_port);
 }
 
@@ -365,7 +365,7 @@ static DWORD WINAPI flow_thread_proc(LPVOID param) {
             if (!pl->running) break;
             DWORD err = GetLastError();
             if (err == ERROR_NO_DATA || err == ERROR_INSUFFICIENT_BUFFER) continue;
-            LOG_DEBUG("Process flow watcher recv failed: %lu", err);
+            LOG_TRACE("Process flow watcher recv failed: %lu", err);
             Sleep(10);
             continue;
         }
@@ -423,7 +423,7 @@ error_t proc_lookup_init(proc_lookup_t *pl) {
         pl->flow_handle = WinDivertOpen("true", WINDIVERT_LAYER_FLOW, 1000,
                                         WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY);
         if (pl->flow_handle != INVALID_HANDLE_VALUE) {
-            LOG_DEBUG("Process flow watcher using broad FLOW filter after filtered open failed");
+            LOG_TRACE("Process flow watcher using broad FLOW filter after filtered open failed");
         }
     }
     if (pl->flow_handle == INVALID_HANDLE_VALUE) {

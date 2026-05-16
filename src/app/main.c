@@ -32,6 +32,8 @@ static DWORD WINAPI metrics_thread_proc(LPVOID param) {
     while (g_running) {
         Sleep(30000);
         if (!g_running) break;
+        if (!log_is_enabled(LOG_DEBUG)) continue;
+
         divert_counters_t divert_counters;
         conntrack_counters_t conntrack_counters;
         proc_lookup_counters_t proc_counters;
@@ -44,38 +46,44 @@ static DWORD WINAPI metrics_thread_proc(LPVOID param) {
         tcp_relay_snapshot_counters(&g_tcp_relay, &tcp_counters);
         udp_relay_snapshot_counters(&g_udp_relay, &udp_counters);
 
-        LOG_INFO("perf: pkt recv=%llu sent=%llu drop=%llu send_fail=%llu udp_fwd=%llu; "
-                 "ct add=%llu upd=%llu rem=%llu miss=%llu exhausted=%llu stale=%llu; "
-                 "proc hit=%llu wildcard=%llu miss=%llu refresh=%llu flow_events=%llu; "
-                 "tcp active=%llu accepted=%llu rejected=%llu up=%llu down=%llu; "
-                 "udp active=%llu created=%llu evicted=%llu drop=%llu up=%llu down=%llu",
-                 (unsigned long long)divert_counters.packets_recv,
-                 (unsigned long long)divert_counters.packets_sent,
-                 (unsigned long long)divert_counters.packets_dropped,
-                 (unsigned long long)divert_counters.send_failures,
-                 (unsigned long long)divert_counters.udp_forwarded,
-                 (unsigned long long)conntrack_counters.adds,
-                 (unsigned long long)conntrack_counters.updates,
-                 (unsigned long long)conntrack_counters.removes,
-                 (unsigned long long)conntrack_counters.misses,
-                 (unsigned long long)conntrack_counters.pool_exhausted,
-                 (unsigned long long)conntrack_counters.stale_cleanups,
-                 (unsigned long long)proc_counters.flow_hits,
-                 (unsigned long long)proc_counters.wildcard_hits,
-                 (unsigned long long)proc_counters.misses,
-                 (unsigned long long)proc_counters.refreshes,
-                 (unsigned long long)proc_counters.flow_events,
-                 (unsigned long long)tcp_counters.active_connections,
-                 (unsigned long long)tcp_counters.accepted_connections,
-                 (unsigned long long)tcp_counters.rejected_connections,
-                 (unsigned long long)tcp_counters.bytes_up,
-                 (unsigned long long)tcp_counters.bytes_down,
-                 (unsigned long long)udp_counters.active_sessions,
-                 (unsigned long long)udp_counters.created_sessions,
-                 (unsigned long long)udp_counters.evicted_sessions,
-                 (unsigned long long)udp_counters.dropped_datagrams,
-                 (unsigned long long)udp_counters.bytes_up,
-                 (unsigned long long)udp_counters.bytes_down);
+        LOG_DEBUG("performance snapshot (cumulative)");
+        LOG_DEBUG("  capture: packets recv=%llu sent=%llu dropped=%llu send_fail=%llu udp_to_relay=%llu",
+                  (unsigned long long)divert_counters.packets_recv,
+                  (unsigned long long)divert_counters.packets_sent,
+                  (unsigned long long)divert_counters.packets_dropped,
+                  (unsigned long long)divert_counters.send_failures,
+                  (unsigned long long)divert_counters.udp_forwarded);
+        LOG_DEBUG("  conntrack: add=%llu update=%llu remove=%llu miss=%llu exhausted=%llu stale_removed=%llu",
+                  (unsigned long long)conntrack_counters.adds,
+                  (unsigned long long)conntrack_counters.updates,
+                  (unsigned long long)conntrack_counters.removes,
+                  (unsigned long long)conntrack_counters.misses,
+                  (unsigned long long)conntrack_counters.pool_exhausted,
+                  (unsigned long long)conntrack_counters.stale_cleanups);
+        LOG_DEBUG("  process: flow_hit=%llu wildcard_hit=%llu miss=%llu refresh=%llu flow_event=%llu pid_hit=%llu pid_miss=%llu exhausted=%llu",
+                  (unsigned long long)proc_counters.flow_hits,
+                  (unsigned long long)proc_counters.wildcard_hits,
+                  (unsigned long long)proc_counters.misses,
+                  (unsigned long long)proc_counters.refreshes,
+                  (unsigned long long)proc_counters.flow_events,
+                  (unsigned long long)proc_counters.pid_hits,
+                  (unsigned long long)proc_counters.pid_misses,
+                  (unsigned long long)proc_counters.pool_exhausted);
+        LOG_DEBUG("  tcp relay: active=%llu accepted=%llu rejected=%llu connect_fail=%llu handshake_fail=%llu bytes_up=%llu bytes_down=%llu",
+                  (unsigned long long)tcp_counters.active_connections,
+                  (unsigned long long)tcp_counters.accepted_connections,
+                  (unsigned long long)tcp_counters.rejected_connections,
+                  (unsigned long long)tcp_counters.connect_failures,
+                  (unsigned long long)tcp_counters.handshake_failures,
+                  (unsigned long long)tcp_counters.bytes_up,
+                  (unsigned long long)tcp_counters.bytes_down);
+        LOG_DEBUG("  udp relay: active=%llu created=%llu evicted=%llu dropped=%llu bytes_up=%llu bytes_down=%llu",
+                  (unsigned long long)udp_counters.active_sessions,
+                  (unsigned long long)udp_counters.created_sessions,
+                  (unsigned long long)udp_counters.evicted_sessions,
+                  (unsigned long long)udp_counters.dropped_datagrams,
+                  (unsigned long long)udp_counters.bytes_up,
+                  (unsigned long long)udp_counters.bytes_down);
     }
     return 0;
 }
@@ -98,7 +106,7 @@ static void print_usage(const char *prog) {
         "Options:\n"
         "  --config <path>     Path to JSON config file\n"
         "  --log <path>        Override logging.file from config\n"
-        "  -v, --verbose       Override logging.level (repeat for more: -vv, -vvv, -vvvv)\n"
+        "  -v, --verbose       Override logging.level (-v=info, -vv=debug, -vvv=trace; -vvvv also clamps to trace)\n"
         "  --version           Show version\n"
         "  -h, --help          Show this help\n"
         "\n"
@@ -110,6 +118,20 @@ static void print_usage(const char *prog) {
         "      Download WinDivert.dll and WinDivert64.sys from\n"
         "      https://github.com/basil00/WinDivert/releases\n",
         prog, prog, prog);
+}
+
+static int parse_verbosity_arg(const char *arg) {
+    int count = 0;
+
+    if (!arg) return 0;
+    if (strcmp(arg, "--verbose") == 0) return 1;
+    if (arg[0] != '-' || arg[1] != 'v') return 0;
+
+    for (int i = 1; arg[i]; i++) {
+        if (arg[i] != 'v') return 0;
+        count++;
+    }
+    return count;
 }
 
 int main(int argc, char *argv[]) {
@@ -125,19 +147,20 @@ int main(int argc, char *argv[]) {
     int exit_code = 1;
 
     for (int i = 1; i < argc; i++) {
+        int verbose_count = 0;
+
         if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
             config_path = argv[++i];
         } else if (strcmp(argv[i], "--log") == 0 && i + 1 < argc) {
             log_path = argv[++i];
-        } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
-            if (verbosity < LOG_INFO) verbosity = LOG_INFO;
-            else if (verbosity < LOG_PACKET) verbosity++;
-        } else if (strcmp(argv[i], "-vv") == 0) {
-            verbosity = LOG_DEBUG;
-        } else if (strcmp(argv[i], "-vvv") == 0) {
-            verbosity = LOG_TRACE;
-        } else if (strcmp(argv[i], "-vvvv") == 0) {
-            verbosity = LOG_PACKET;
+        } else if ((verbose_count = parse_verbosity_arg(argv[i])) > 0) {
+            if (verbose_count == 1) {
+                if (verbosity < LOG_INFO) verbosity = LOG_INFO;
+                else if (verbosity < LOG_TRACE) verbosity++;
+            } else {
+                verbosity = LOG_INFO + verbose_count - 1;
+                if (verbosity > LOG_TRACE) verbosity = LOG_TRACE;
+            }
         } else if (strcmp(argv[i], "--version") == 0) {
             fprintf(stderr, "WinTProxy " WINTPROXY_VERSION "\n");
             return 0;

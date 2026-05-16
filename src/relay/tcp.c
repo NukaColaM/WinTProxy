@@ -425,7 +425,7 @@ static void tcp_conn_start(tcp_relay_t *relay, SOCKET client) {
     conn->active_counted = 1;
     counter_inc(&relay->counters.active_connections);
 
-    LOG_PACKET("TCP relay: accepted connection, peer port=%u", conn->client_port);
+    LOG_TRACE("TCP relay: accepted connection, peer port=%u", conn->client_port);
 
     {
         conntrack_entry_t entry;
@@ -454,7 +454,7 @@ static void tcp_conn_start(tcp_relay_t *relay, SOCKET client) {
     }
 
     ip_to_str(conn->connect_dst_ip, conn->dst_str, sizeof(conn->dst_str));
-    LOG_PACKET("TCP relay: port %u -> %s:%u, connecting to SOCKS5 proxy",
+    LOG_TRACE("TCP relay: port %u -> %s:%u, connecting to SOCKS5 proxy",
                conn->client_port, conn->dst_str, conn->connect_dst_port);
 
     if (!associate_socket(relay, client, conn) || !post_proxy_connect(conn)) {

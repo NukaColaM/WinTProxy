@@ -85,7 +85,7 @@ static DWORD WINAPI cleanup_thread_proc(LPVOID param) {
 
         if (removed > 0) {
             InterlockedAdd64(&ct->counters.stale_cleanups, removed);
-            LOG_DEBUG("Conntrack cleanup: removed %d stale entries", removed);
+            LOG_TRACE("Conntrack cleanup: removed %d stale entries", removed);
         }
     }
     return 0;

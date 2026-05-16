@@ -7,8 +7,13 @@ typedef enum {
     LOG_INFO  = 2,
     LOG_DEBUG = 3,
     LOG_TRACE = 4,
-    LOG_PACKET = 5
+    LOG_LEVEL_COUNT
 } log_level_t;
+
+const char *log_level_name(log_level_t level);
+const char *log_level_label(log_level_t level);
+const char *log_level_allowed_names(void);
+int         log_level_parse(const char *s, log_level_t *out);
 
 void log_init(log_level_t level, const char *log_file_path);
 void log_shutdown(void);
@@ -21,6 +26,5 @@ void log_write(log_level_t level, const char *fmt, ...);
 #define LOG_INFO(fmt, ...)   do { if (log_is_enabled(LOG_INFO))   log_write(LOG_INFO,   fmt, ##__VA_ARGS__); } while (0)
 #define LOG_DEBUG(fmt, ...)  do { if (log_is_enabled(LOG_DEBUG))  log_write(LOG_DEBUG,  fmt, ##__VA_ARGS__); } while (0)
 #define LOG_TRACE(fmt, ...)  do { if (log_is_enabled(LOG_TRACE))  log_write(LOG_TRACE,  fmt, ##__VA_ARGS__); } while (0)
-#define LOG_PACKET(fmt, ...) do { if (log_is_enabled(LOG_PACKET)) log_write(LOG_PACKET, fmt, ##__VA_ARGS__); } while (0)
 
 #endif

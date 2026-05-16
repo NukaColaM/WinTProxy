@@ -17,7 +17,7 @@ void path_plan_return(divert_engine_t *engine, packet_ctx_t *ctx,
         err = conntrack_get_full(engine->conntrack, ctx->dst_ip, ctx->dst_port, proto_num, &entry);
     }
     if (err != ERR_OK) {
-        LOG_PACKET("%s return: no conntrack for dst_port %u", is_tcp ? "TCP" : "UDP", ctx->dst_port);
+        LOG_WARN("%s return: no conntrack for dst_port %u", is_tcp ? "TCP" : "UDP", ctx->dst_port);
         traffic_action_drop(action, ctx, addr, is_tcp ? "TCP return missing conntrack" : "UDP return missing conntrack");
         return;
     }
@@ -49,7 +49,7 @@ void path_plan_return(divert_engine_t *engine, packet_ctx_t *ctx,
     char orig_dst_str[16], orig_src_str[16];
     ip_to_str(entry.orig_dst_ip, orig_dst_str, sizeof(orig_dst_str));
     ip_to_str(entry.src_ip, orig_src_str, sizeof(orig_src_str));
-    LOG_PACKET("%s return: rewrite 127.0.0.1:%u -> %s:%u, dst -> %s, IfIdx=%lu",
+    LOG_TRACE("%s return: rewrite 127.0.0.1:%u -> %s:%u, dst -> %s, IfIdx=%lu",
         is_tcp ? "TCP" : "UDP",
         is_tcp ? engine->tcp_relay_port : engine->udp_relay_port,
         orig_dst_str, entry.orig_dst_port, orig_src_str, (unsigned long)entry.if_idx);

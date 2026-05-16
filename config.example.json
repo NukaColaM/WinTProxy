@@ -62,7 +62,7 @@
         "port": 7890
     },
     "logging": {
-        "_comment": "level is one of: error, warn, info, debug, trace, packet. file is optional; empty means stderr only.",
+        "_comment": "level is one of: error, warn, info, debug, trace. info is lifecycle/config only; debug adds flow decisions, DNS query summaries, and grouped performance snapshots; trace adds packet/protocol internals. file is optional; empty means stderr only.",
         "level": "info",
         "file": ""
     }

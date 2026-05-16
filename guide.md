@@ -39,7 +39,7 @@ Command-line options:
 ```text
   --config <path>     Path to JSON config file
   --log <path>        Override logging.file from config
-  -v, --verbose       Override logging.level (repeat: -vv, -vvv, -vvvv)
+  -v, --verbose       Override logging.level (-v=info, -vv=debug, -vvv=trace; -vvvv also clamps to trace)
   --version           Show version
   -h, --help          Show help
 ```
@@ -108,12 +108,13 @@ Because matching is first-match-wins, place `direct` exceptions before broad `pr
 
 | Level | Output |
 |---|---|
-| `error` | Fatal conditions only |
-| `warn` | Recoverable problems |
-| `info` | Lifecycle, listener startup/shutdown (default) |
-| `debug` | Process ownership, rule matches, final decisions |
-| `trace` | Relay and session lifecycle |
-| `packet` | Packet rewrites, DNS TXID mapping, SOCKS5 handshake details |
+| `error` | Startup/config failures and unrecoverable subsystem errors |
+| `warn` | Recoverable degraded behavior, drops from missing state, fallback paths worth operator attention |
+| `info` | Lifecycle, config summary, listener startup/shutdown (default); no recurring metrics noise |
+| `debug` | Normal troubleshooting: proxy/direct/self-loop decisions, DNS query summaries, and readable periodic performance snapshots |
+| `trace` | Relay/session lifecycle, packet rewrites, DNS TXID/NAT mapping internals, SOCKS5 handshake bytes, FLOW watcher internals, and other highest-volume diagnostics |
+
+`-v` selects `info`, `-vv` selects `debug`, and `-vvv` selects `trace`; additional verbosity such as `-vvvv` is accepted but clamps to `trace`. Legacy `packet` is no longer a public level.
 
 ### Intentional Behavior and Interface Changes
 
@@ -208,4 +209,4 @@ Initialization order (reverse on shutdown):
 Winsock → Config → Conntrack → Process lookup → DNS hijack → TCP relay → UDP relay → Divert adapter
 ```
 
-A 30-second metrics thread logs aggregate counters for each subsystem.
+A metrics thread logs grouped capture/conntrack/process/TCP/UDP performance snapshots at `debug` level. Counters are cumulative snapshots, emitted periodically for health checks rather than per-interval deltas. The default `info` level stays limited to lifecycle, config, and listener messages.

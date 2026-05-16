@@ -154,17 +154,6 @@ static int parse_protocol(const char *s, rule_protocol_t *out) {
     return 0;
 }
 
-static int parse_log_level(const char *s, int *out) {
-    if (!s) return 0;
-    if (_stricmp(s, "error") == 0)  { *out = LOG_ERROR;  return 1; }
-    if (_stricmp(s, "warn") == 0)   { *out = LOG_WARN;   return 1; }
-    if (_stricmp(s, "info") == 0)   { *out = LOG_INFO;   return 1; }
-    if (_stricmp(s, "debug") == 0)  { *out = LOG_DEBUG;  return 1; }
-    if (_stricmp(s, "trace") == 0)  { *out = LOG_TRACE;  return 1; }
-    if (_stricmp(s, "packet") == 0) { *out = LOG_PACKET; return 1; }
-    return 0;
-}
-
 static int parse_ipv4_net(const char *s, uint32_t *out_net) {
     struct in_addr in;
     if (!s || inet_pton(AF_INET, s, &in) != 1) return 0;
@@ -772,10 +761,13 @@ static int parse_logging_object(app_config_t *cfg, cJSON *logging) {
     cJSON *file = cJSON_GetObjectItemCaseSensitive(logging, "file");
 
     if (level) {
-        if (!cJSON_IsString(level) || !parse_log_level(level->valuestring, &cfg->logging.level)) {
-            LOG_ERROR("Invalid config: logging.level must be error, warn, info, debug, trace, or packet");
+        log_level_t parsed_level;
+
+        if (!cJSON_IsString(level) || !log_level_parse(level->valuestring, &parsed_level)) {
+            LOG_ERROR("Invalid config: logging.level must be %s", log_level_allowed_names());
             return 0;
         }
+        cfg->logging.level = parsed_level;
     }
     if (file) {
         if (!cJSON_IsString(file) ||
@@ -871,8 +863,8 @@ done:
 
 error_t config_apply_cli(app_config_t *cfg, int verbosity) {
     if (verbosity >= 0) {
-        if (verbosity > LOG_PACKET) verbosity = LOG_PACKET;
-        cfg->logging.level = verbosity;
+        if (verbosity > LOG_TRACE) verbosity = LOG_TRACE;
+        cfg->logging.level = (log_level_t)verbosity;
     }
     return ERR_OK;
 }
@@ -905,4 +897,7 @@ void config_dump(const app_config_t *cfg) {
             r->enabled ? "" : " disabled");
     }
     LOG_INFO("Total policy rules: %u", (unsigned int)cfg->policy.rule_count);
+    LOG_INFO("Logging: level=%s file=%s",
+             log_level_name(cfg->logging.level),
+             cfg->logging.file[0] ? cfg->logging.file : "stderr");
 }

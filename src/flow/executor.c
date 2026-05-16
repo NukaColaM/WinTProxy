@@ -61,7 +61,7 @@ void traffic_execute_action(divert_engine_t *engine, traffic_action_t *action) {
             LOG_WARN("UDP fwd sendto failed: %d", WSAGetLastError());
         } else {
             divert_count_udp_forwarded(engine);
-            LOG_PACKET("UDP fwd: sent %u bytes (port %u) to relay", udp_data_len, ctx->src_port);
+            LOG_TRACE("UDP fwd: sent %u bytes (port %u) to relay", udp_data_len, ctx->src_port);
         }
         break;
     }

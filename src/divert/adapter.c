@@ -201,7 +201,7 @@ error_t divert_start(divert_engine_t *engine, app_config_t *config,
         strncat(filter, dns_filter, sizeof(filter) - strlen(filter) - 1);
     }
 
-    LOG_DEBUG("WinDivert filter: %s", filter);
+    LOG_TRACE("WinDivert filter: %s", filter);
 
     engine->handle = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, 0, 0);
     if (engine->handle == INVALID_HANDLE_VALUE) {

@@ -255,7 +255,7 @@ int dns_hijack_rewrite_request(dns_hijack_t *dh, uint32_t *dst_ip, uint16_t *dst
         char orig_str[16], redir_str[16];
         ip_to_str(original_dns_ip, orig_str, sizeof(orig_str));
         ip_to_str(dh->redirect_ip, redir_str, sizeof(redir_str));
-        LOG_PACKET("DNS hijack: port %u txid=0x%04x, %s:%u -> %s:%u",
+        LOG_TRACE("DNS hijack: port %u txid=0x%04x, %s:%u -> %s:%u",
             src_port, dns_txid, orig_str, original_dns_port, redir_str, dh->redirect_port);
     }
 
@@ -277,7 +277,7 @@ int dns_hijack_rewrite_response(dns_hijack_t *dh, uint32_t *src_ip, uint16_t *sr
     e = dns_nat_find_client(dh, dst_port, dns_txid, idx);
     if (!e) {
         ReleaseSRWLockExclusive(&dh->lock);
-        LOG_PACKET("DNS response: no NAT entry for client port %u txid=0x%04x", dst_port, dns_txid);
+        LOG_TRACE("DNS response: no NAT entry for client port %u txid=0x%04x", dst_port, dns_txid);
         return 0;
     }
 
@@ -285,7 +285,7 @@ int dns_hijack_rewrite_response(dns_hijack_t *dh, uint32_t *src_ip, uint16_t *sr
     if ((now - e->timestamp) > DNS_NAT_TTL_MS) {
         dns_nat_remove_entry(dh, idx, e);
         ReleaseSRWLockExclusive(&dh->lock);
-        LOG_PACKET("DNS response: stale NAT entry for client port %u txid=0x%04x", dst_port, dns_txid);
+        LOG_TRACE("DNS response: stale NAT entry for client port %u txid=0x%04x", dst_port, dns_txid);
         return 0;
     }
 
@@ -301,7 +301,7 @@ int dns_hijack_rewrite_response(dns_hijack_t *dh, uint32_t *src_ip, uint16_t *sr
         char orig_str[16], cli_str[16];
         ip_to_str(*src_ip, orig_str, sizeof(orig_str));
         if (client_ip) ip_to_str(*client_ip, cli_str, sizeof(cli_str));
-        LOG_PACKET("DNS response: restore src=%s:%u dst=%s for client port %u txid=0x%04x",
+        LOG_TRACE("DNS response: restore src=%s:%u dst=%s for client port %u txid=0x%04x",
             orig_str, *src_port, client_ip ? cli_str : "?", dst_port, dns_txid);
     }
     return 1;
@@ -355,7 +355,7 @@ static DWORD WINAPI dns_fwd_thread(LPVOID param) {
             ReleaseSRWLockExclusive(&dh->lock);
 
             if (!found) {
-                LOG_PACKET("DNS fwd: no NAT entry for forwarded txid 0x%04x", fwd_txid);
+                LOG_TRACE("DNS fwd: no NAT entry for forwarded txid 0x%04x", fwd_txid);
                 continue;
             }
 
@@ -405,7 +405,7 @@ static DWORD WINAPI dns_fwd_thread(LPVOID param) {
                 if (!WinDivertSend(dh->divert_handle, pkt, (UINT)pkt_len, NULL, &addr)) {
                     LOG_WARN("DNS fwd: WinDivertSend failed: err=%lu", GetLastError());
                 } else {
-                    LOG_PACKET("DNS fwd: txid=0x%04x restored from 0x%04x to %s:%u (orig dns %s:%u)",
+                    LOG_TRACE("DNS fwd: txid=0x%04x restored from 0x%04x to %s:%u (orig dns %s:%u)",
                         original_txid, fwd_txid, cli_str, client_src_port, orig_str, orig_dns_port);
                 }
             }
@@ -527,7 +527,7 @@ error_t dns_hijack_forward_query(dns_hijack_t *dh, const uint8_t *dns_payload, i
         return ERR_NETWORK;
     }
 
-    LOG_PACKET("DNS fwd: sent %d bytes to 127.0.0.1:%u (client port %u txid 0x%04x -> 0x%04x)",
+    LOG_TRACE("DNS fwd: sent %d bytes to 127.0.0.1:%u (client port %u txid 0x%04x -> 0x%04x)",
         sent, dh->redirect_port, src_port, original_txid, fwd_txid);
     return ERR_OK;
 }

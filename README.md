@@ -36,12 +36,12 @@ WinTProxy.exe [options]
 Options:
   --config <path>     Path to JSON config file
   --log <path>        Override logging.file from config
-  -v, --verbose       Override logging.level (repeat for more: -vv, -vvv, -vvvv)
+  -v, --verbose       Override logging.level (-v=info, -vv=debug, -vvv=trace; extra -v clamps to trace)
   --version           Show version
   -h, --help          Show help
 ```
 
-Traffic behavior belongs in the config file. CLI flags are intentionally limited to bootstrap/logging/help/version.
+Traffic behavior belongs in the config file. CLI flags are intentionally limited to bootstrap/logging/help/version. The five public log levels are `error`, `warn`, `info`, `debug`, and `trace`; `debug` is the normal troubleshooting view with flow decisions, DNS query summaries, and grouped performance snapshots, while `trace` is reserved for packet/protocol detail. Extra verbosity such as `-vvvv` clamps to `trace`.
 
 ## Configuration
 
