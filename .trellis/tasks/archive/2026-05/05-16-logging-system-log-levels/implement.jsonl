@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "Top-level backend conventions and spec index for this C/WinDivert codebase."}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "Defines subsystem boundaries for app/config/logging, traffic-flow modules, and docs/config/CLI contracts touched by this refactor."}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Task is explicitly about logging conventions and should align implementation with this project logging spec, updating it if needed."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Config parsing and logging-level validation changes must keep error reporting conventions consistent."}
+{"file": ".trellis/spec/guides/index.md", "reason": "Thinking-guide entry point for reuse and cross-layer checks relevant to centralized log-level metadata."}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Level parsing/formatting should be centralized rather than duplicated across logger, config parser, CLI mapping, and docs."}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "This task spans code, CLI behavior, config parsing, and docs, so cross-layer contract consistency matters."}

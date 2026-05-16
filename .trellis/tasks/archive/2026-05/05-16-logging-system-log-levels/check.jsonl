@@ -1,0 +1,8 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "Top-level backend conventions and spec index for review context."}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "Quality review should verify logging changes stay within proper subsystem boundaries and config/CLI contracts."}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Check agent should verify final logger semantics and any spec updates against the logging conventions file."}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Primary quality-check spec for review, even though it is currently minimal."}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Review config validation messages and failure-path logging behavior for consistency."}
+{"file": ".trellis/spec/guides/index.md", "reason": "Thinking-guide entry point for review context."}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "Review should confirm log-level metadata/parsing is centralized with no drift or duplication left behind."}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Review should verify implementation/doc/config/CLI consistency across touched layers."}
