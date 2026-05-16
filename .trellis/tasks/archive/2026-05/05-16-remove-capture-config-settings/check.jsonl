@@ -1,4 +1,0 @@
-{"file": ".trellis/spec/backend/index.md", "reason": "Backend entry point and checklist for review."}
-{"file": ".trellis/spec/backend/directory-structure.md", "reason": "Verify config/CLI schema contract, strict validation, and subsystem boundaries."}
-{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Verify config dump/logging output remains consistent with logging conventions."}
-{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "General backend quality review expectations."}
