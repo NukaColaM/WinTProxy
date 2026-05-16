@@ -73,3 +73,36 @@ Refactored WinTProxy logging to five public levels, reallocated debug/trace diag
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: Remove capture config settings
+
+**Date**: 2026-05-16
+**Task**: Remove capture config settings
+**Branch**: `main`
+
+### Summary
+
+Removed the public capture config section and queue tuning fields, switched WinDivert adapter queue tuning to internal constants, updated docs/example config/backend spec, verified build and checks.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `edd1f5b` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
