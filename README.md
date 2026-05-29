@@ -1,5 +1,7 @@
 # WinTProxy
 
+> **⚠️ Low-level refactoring in progress — WinDivert is being replaced by WinpkFilter. APIs, config schema, and behavior may change without notice.**
+
 Transparent SOCKS5 proxy for Windows. WinTProxy intercepts IPv4 TCP and UDP traffic with [WinDivert](https://github.com/basil00/WinDivert), plans each packet through explicit DNS, bypass, policy, proxy, return-path, and action-execution stages, then applies a proxy/direct verdict.
 
 ## Features
