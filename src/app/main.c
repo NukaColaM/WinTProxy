@@ -13,7 +13,7 @@
 #include "process/lookup.h"
 #include "policy/rules.h"
 #include "dns/hijack.h"
-#include "divert/adapter.h"
+#include "ndisapi/adapter.h"
 #include "relay/tcp.h"
 #include "relay/udp.h"
 
@@ -22,7 +22,7 @@ static volatile int g_running = 1;
 static conntrack_t      g_conntrack;
 static proc_lookup_t    g_proc_lookup;
 static dns_hijack_t     g_dns_hijack;
-static divert_engine_t  g_divert;
+static ndisapi_engine_t  g_ndisapi;
 static tcp_relay_t      g_tcp_relay;
 static udp_relay_t      g_udp_relay;
 static HANDLE           g_metrics_thread;
@@ -34,13 +34,13 @@ static DWORD WINAPI metrics_thread_proc(LPVOID param) {
         if (!g_running) break;
         if (!log_is_enabled(LOG_DEBUG)) continue;
 
-        divert_counters_t divert_counters;
+        ndisapi_counters_t ndisapi_counters;
         conntrack_counters_t conntrack_counters;
         proc_lookup_counters_t proc_counters;
         tcp_relay_counters_t tcp_counters;
         udp_relay_counters_t udp_counters;
 
-        divert_snapshot_counters(&g_divert, &divert_counters);
+        ndisapi_snapshot_counters(&g_ndisapi, &ndisapi_counters);
         conntrack_snapshot_counters(&g_conntrack, &conntrack_counters);
         proc_lookup_snapshot_counters(&g_proc_lookup, &proc_counters);
         tcp_relay_snapshot_counters(&g_tcp_relay, &tcp_counters);
@@ -48,11 +48,11 @@ static DWORD WINAPI metrics_thread_proc(LPVOID param) {
 
         LOG_DEBUG("performance snapshot (cumulative)");
         LOG_DEBUG("  capture: packets recv=%llu sent=%llu dropped=%llu send_fail=%llu udp_to_relay=%llu",
-                  (unsigned long long)divert_counters.packets_recv,
-                  (unsigned long long)divert_counters.packets_sent,
-                  (unsigned long long)divert_counters.packets_dropped,
-                  (unsigned long long)divert_counters.send_failures,
-                  (unsigned long long)divert_counters.udp_forwarded);
+                  (unsigned long long)ndisapi_counters.packets_recv,
+                  (unsigned long long)ndisapi_counters.packets_sent,
+                  (unsigned long long)ndisapi_counters.packets_dropped,
+                  (unsigned long long)ndisapi_counters.send_failures,
+                  (unsigned long long)ndisapi_counters.udp_forwarded);
         LOG_DEBUG("  conntrack: add=%llu update=%llu remove=%llu miss=%llu exhausted=%llu stale_removed=%llu",
                   (unsigned long long)conntrack_counters.adds,
                   (unsigned long long)conntrack_counters.updates,
@@ -114,9 +114,9 @@ static void print_usage(const char *prog) {
         "  %s --config config.json\n"
         "  %s --config config.json -vv\n"
         "\n"
-        "NOTE: Must run as Administrator (WinDivert requires kernel access).\n"
-        "      Download WinDivert.dll and WinDivert64.sys from\n"
-        "      https://github.com/basil00/WinDivert/releases\n",
+        "NOTE: Must run as Administrator (ndisapi requires kernel access).\n"
+        "      Install WinpkFilter driver (ndisrd.sys) and place ndisapi.dll\n"
+        "      next to WinTProxy.exe.  See https://github.com/wiresock/ndisapi\n",
         prog, prog, prog);
 }
 
@@ -143,7 +143,7 @@ int main(int argc, char *argv[]) {
     int dns_ok = 0;
     int tcp_ok = 0;
     int udp_ok = 0;
-    int divert_ok = 0;
+    int ndisapi_ok = 0;
     int exit_code = 1;
 
     for (int i = 1; i < argc; i++) {
@@ -242,12 +242,12 @@ int main(int argc, char *argv[]) {
     }
     udp_ok = 1;
 
-    if (divert_start(&g_divert, &config, &g_conntrack, &g_proc_lookup, &g_dns_hijack,
+    if (ndisapi_start(&g_ndisapi, &config, &g_conntrack, &g_proc_lookup, &g_dns_hijack,
                      g_tcp_relay.port, g_udp_relay.port) != ERR_OK) {
-        LOG_ERROR("Failed to start WinDivert engine");
+        LOG_ERROR("Failed to start ndisapi engine");
         goto cleanup;
     }
-    divert_ok = 1;
+    ndisapi_ok = 1;
 
     g_metrics_thread = CreateThread(NULL, 0, metrics_thread_proc, NULL, 0, NULL);
     if (!g_metrics_thread) {
@@ -271,7 +271,7 @@ cleanup:
         g_metrics_thread = NULL;
     }
 
-    if (divert_ok)  divert_stop(&g_divert);
+    if (ndisapi_ok)  ndisapi_stop(&g_ndisapi);
     if (udp_ok)     udp_relay_stop(&g_udp_relay);
     if (tcp_ok)     tcp_relay_stop(&g_tcp_relay);
     if (dns_ok)     dns_hijack_shutdown(&g_dns_hijack);

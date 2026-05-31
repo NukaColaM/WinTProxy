@@ -21,9 +21,9 @@ cmake --build build-release
 
 - Windows 10 or later, 64-bit.
 - Administrator privileges.
-- [WinDivert](https://github.com/basil00/WinDivert/releases) 2.x runtime files next to `WinTProxy.exe`:
-  - `WinDivert.dll`
-  - `WinDivert64.sys`
+- [WinpkFilter / ndisapi](https://github.com/wiresock/ndisapi/releases) runtime files next to `WinTProxy.exe`:
+  - `ndisapi.dll`
+  - `ndisrd.sys` (kernel driver; must be trusted — install the signed driver or enable test-signing: `bcdedit /set testsigning on`)
 - A SOCKS5 proxy reachable by IPv4 address.
 
 ## Running
@@ -134,7 +134,7 @@ The codebase is organized by traffic-flow responsibility:
 ```text
 src/app/          config, logging, process bootstrap, metrics
 src/core/         common constants and utility helpers
-src/divert/       WinDivert adapter: filter, queue, workers, send/receive I/O
+src/ndisapi/      ndisapi adapter: driver, adapter enumeration, workers, batch I/O
 src/packet/       packet parsing/cache/checksum/MSS helpers
 src/flow/         verdict/action model, planner orchestration, executor
 src/dns/          DNS NAT, DNS forwarding, UDP/TCP DNS planning
@@ -148,7 +148,7 @@ src/relay/        SOCKS5 protocol helpers plus TCP/UDP relays
 ### Packet Flow
 
 ```text
-WinDivert adapter (divert/adapter.c)
+ndisapi adapter (ndisapi/adapter.c)
   → packet context parse (packet/context.c)
   → classify path (path/classify.c)
       ├─ inbound / DNS response / relay return / TCP-DNS return
@@ -164,22 +164,22 @@ The planner/executor split is pragmatic: planners may perform required lookups o
 
 ### TCP
 
-TCP SYN packets selected for proxying reserve conntrack state, are rewritten to a local relay port through WinDivert loopback injection, and produce a rewrite/send action. The relay opens a SOCKS5 connection, sends a CONNECT request for the original destination, and relays bytes bidirectionally.
+TCP SYN packets selected for proxying reserve conntrack state, are rewritten with swapped addresses to a local relay port, and delivered to the OS TCP/IP stack via MSTCP revert (SendPacketsToMstcpUnsorted). The relay opens a SOCKS5 connection, sends a CONNECT request for the original destination, and relays bytes bidirectionally.
 
-Return traffic on loopback is classified as a return path, restored to the original tuple from conntrack, and injected as inbound traffic on the original adapter. TCP MSS is clamped to 1360 to avoid fragmentation after NAT rewrite.
+Return traffic from the relay socket is classified as a return path at the NDIS layer (ON_SEND with relay source port), restored to the original tuple from conntrack, and delivered to the client via MSTCP. TCP MSS is clamped to 1360 to avoid fragmentation after NAT rewrite.
 
 Tracked non-SYN TCP packets are redirected to the relay using the existing conntrack mapping. Untracked TCP packets that policy would proxy are dropped because forwarding them direct would leak a proxied flow without a return mapping.
 
 ### UDP
 
-UDP payloads selected for proxying reserve conntrack state and produce a `FORWARD_UDP_TO_RELAY` action. The executor forwards the payload to the local UDP relay with a source IP/port frame. The relay opens a SOCKS5 UDP ASSOCIATE control channel, wraps payloads in SOCKS5 UDP datagrams, and sends responses back through loopback for return-path restoration.
+UDP payloads selected for proxying reserve conntrack state and produce a `FORWARD_UDP_TO_RELAY` action. The executor forwards the payload to the local UDP relay with a source IP/port frame. The relay opens a SOCKS5 UDP ASSOCIATE control channel, wraps payloads in SOCKS5 UDP datagrams, and sends responses back to the original server IP so they route through the adapter for return-path restoration at the NDIS layer.
 
 ### DNS
 
 When enabled, outbound DNS queries to port 53 are intercepted before bypass/policy.
 
 - UDP DNS to a non-loopback resolver is rewritten to the configured resolver and restored on inbound response using DNS NAT.
-- UDP DNS to a loopback resolver uses a socket forwarder with TXID remapping, then injects restored responses through WinDivert.
+- UDP DNS to a loopback resolver uses a socket forwarder with TXID remapping, then builds Ethernet+IP+UDP+DNS frames and injects restored responses through MSTCP (SendPacketsToMstcpUnsorted).
 - TCP DNS is redirected with conntrack so the TCP return path can be restored like other stateful traffic.
 
 Self/loop protection still prevents packets destined for the SOCKS5 proxy, local relay ports, and configured DNS resolver from being proxied into loops.
@@ -191,7 +191,7 @@ All hot-path state uses fixed-size pools allocated at startup — no runtime all
 | Subsystem | Mechanism | Default Size |
 |---|---|---|
 | Policy | Compiled once at config load — patterns normalized, IP/port ranges sorted | — |
-| Process lookup | Seeded by WinDivert flow events, repaired by background TCP/UDP owner-table index | 65536 flows, 8192 PIDs |
+| Process lookup | Background TCP/UDP owner-table index with periodic refresh | 65536 flows, 8192 PIDs |
 | Connection tracking | Hash table with per-bucket SRW locks, background TTL cleanup | 65536 entries, 16384 buckets |
 | DNS NAT | Hash table keyed by client port + TXID, TTL 30s | 4096 entries, 256 buckets |
 | TCP relay | Fixed worker pool, bounded active connection table | 32 workers, 8192 connections |
@@ -204,7 +204,7 @@ Relay listeners prefer ports `34010` (TCP) and `34011` (UDP), with fallback to O
 Initialization order (reverse on shutdown):
 
 ```text
-Winsock → Config → Conntrack → Process lookup → DNS hijack → TCP relay → UDP relay → Divert adapter
+Winsock → Config → Conntrack → Process lookup → DNS hijack → TCP relay → UDP relay → ndisapi engine
 ```
 
 A metrics thread logs grouped capture/conntrack/process/TCP/UDP performance snapshots at `debug` level. Counters are cumulative snapshots, emitted periodically for health checks rather than per-interval deltas. The default `info` level stays limited to lifecycle, config, and listener messages.

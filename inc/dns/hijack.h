@@ -22,8 +22,7 @@ typedef struct dns_nat_entry_s {
     uint32_t original_dns_ip;
     uint16_t original_dns_port;
     uint32_t client_ip;
-    uint32_t if_idx;
-    uint32_t sub_if_idx;
+    HANDLE   adapter_handle;   /* NDIS adapter for MSTCP response delivery */
     uint64_t timestamp;
     struct dns_nat_entry_s *next;
 } dns_nat_entry_t;
@@ -40,7 +39,7 @@ struct dns_hijack_s {
     uint16_t         next_fwd_txid;
     HANDLE           fwd_thread;
     volatile int     fwd_running;
-    void            *divert_handle;
+    void            *engine_ctx;
     dns_nat_entry_t **buckets;
     dns_nat_entry_t  *pool;
     dns_nat_entry_t *free_list;
@@ -57,15 +56,14 @@ int dns_hijack_is_dns_request(uint16_t dst_port);
 int dns_hijack_rewrite_request(dns_hijack_t *dh, uint32_t *dst_ip, uint16_t *dst_port,
                                 uint16_t src_port, uint16_t dns_txid,
                                 uint32_t original_dns_ip, uint16_t original_dns_port,
-                                uint32_t client_ip, uint32_t if_idx, uint32_t sub_if_idx);
+                                uint32_t client_ip, HANDLE adapter_handle);
 
 int dns_hijack_rewrite_response(dns_hijack_t *dh, uint32_t *src_ip, uint16_t *src_port,
-                                 uint16_t dst_port, uint16_t dns_txid,
-                                 uint32_t *client_ip, uint32_t *if_idx, uint32_t *sub_if_idx);
+                                 uint16_t dst_port, uint16_t dns_txid);
 
-error_t dns_hijack_start_forwarder(dns_hijack_t *dh, void *divert_handle);
+error_t dns_hijack_start_forwarder(dns_hijack_t *dh, void *engine_ctx);
 error_t dns_hijack_forward_query(dns_hijack_t *dh, const uint8_t *dns_payload, int dns_len,
                                  uint16_t src_port, uint32_t original_dns_ip, uint16_t original_dns_port,
-                                 uint32_t client_ip, uint32_t if_idx, uint32_t sub_if_idx);
+                                 uint32_t client_ip, HANDLE adapter_handle);
 
 #endif

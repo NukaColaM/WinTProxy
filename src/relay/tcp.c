@@ -147,7 +147,7 @@ static error_t bind_tcp_listener(tcp_relay_t *relay) {
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(TCP_RELAY_PORT);
 
     if (bind(relay->listen_sock, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
@@ -155,8 +155,9 @@ static error_t bind_tcp_listener(tcp_relay_t *relay) {
         LOG_WARN("TCP relay: bind failed on preferred port %u: %d; trying an ephemeral port",
                  TCP_RELAY_PORT, err);
         addr.sin_port = 0;
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
         if (bind(relay->listen_sock, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
-            LOG_ERROR("TCP relay: bind failed on ephemeral loopback port: %d", WSAGetLastError());
+            LOG_ERROR("TCP relay: bind failed on ephemeral port: %d", WSAGetLastError());
             return ERR_NETWORK;
         }
     }
@@ -425,16 +426,35 @@ static void tcp_conn_start(tcp_relay_t *relay, SOCKET client) {
     conn->active_counted = 1;
     counter_inc(&relay->counters.active_connections);
 
-    LOG_TRACE("TCP relay: accepted connection, peer port=%u", conn->client_port);
+    LOG_TRACE("TCP relay: accepted connection, peer=%s:%u",
+              inet_ntoa(peer.sin_addr), conn->client_port);
 
     {
+        struct sockaddr_in local;
+        int local_len = sizeof(local);
         conntrack_entry_t entry;
-        if (conntrack_get_full_key(relay->conntrack, LOOPBACK_ADDR, conn->client_port,
-                                   LOOPBACK_ADDR, relay->port, 6, &entry) == ERR_OK) {
+
+        /* Get local address (client_ip, since relay binds INADDR_ANY) */
+        if (getsockname(client, (struct sockaddr *)&local,
+                        &local_len) == SOCKET_ERROR) {
+            LOG_WARN("TCP relay: getsockname failed: %d", WSAGetLastError());
+            counter_inc(&relay->counters.rejected_connections);
+            tcp_conn_close(conn);
+            return;
+        }
+
+        /* Lookup entry B: key = (server_ip, relay_src_port, client_ip, relay_port)
+         *   conn->client_ip   = server_ip  (from getpeername, set by MSTCP-injected SYN)
+         *   conn->client_port = relay_src_port
+         *   local.sin_addr    = client_ip  (from getsockname)
+         *   relay->port       = relay_port */
+        if (conntrack_get_full_key(relay->conntrack,
+                                   conn->client_ip, conn->client_port,
+                                   local.sin_addr.s_addr, relay->port,
+                                   6, &entry) == ERR_OK) {
             conn->lookup_ip = entry.key_src_ip;
-        } else if (conntrack_get_full(relay->conntrack, conn->client_ip, conn->client_port, 6, &entry) == ERR_OK) {
-            conn->lookup_ip = entry.key_src_ip;
-        } else if (conntrack_get_full(relay->conntrack, LOOPBACK_ADDR, conn->client_port, 6, &entry) == ERR_OK) {
+        } else if (conntrack_get_full(relay->conntrack, conn->client_ip,
+                                       conn->client_port, 6, &entry) == ERR_OK) {
             conn->lookup_ip = entry.key_src_ip;
         } else {
             LOG_WARN("TCP relay: no conntrack entry for %s:%u",
@@ -702,9 +722,13 @@ static DWORD WINAPI tcp_accept_thread(LPVOID param) {
         SOCKET client = accept(relay->listen_sock, (struct sockaddr *)&client_addr, &addr_len);
         if (client == INVALID_SOCKET) {
             if (!relay->running) break;
+            LOG_TRACE("TCP accept error: %d", WSAGetLastError());
             Sleep(1);
             continue;
         }
+        LOG_TRACE("TCP relay: accept from %s:%d",
+                  inet_ntoa(client_addr.sin_addr),
+                  ntohs(client_addr.sin_port));
         tcp_conn_start(relay, client);
     }
     return 0;
@@ -831,7 +855,7 @@ error_t tcp_relay_start(tcp_relay_t *relay, conntrack_t *conntrack, proxy_config
         return ERR_GENERIC;
     }
 
-    LOG_INFO("TCP relay listening on 127.0.0.1:%u with %d IOCP workers and %u connection slots",
+    LOG_INFO("TCP relay listening on 0.0.0.0:%u with %d IOCP workers and %u connection slots",
              relay->port, relay->worker_count, (unsigned int)relay->connection_capacity);
     return ERR_OK;
 }

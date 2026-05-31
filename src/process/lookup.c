@@ -8,8 +8,9 @@
 #include <winsock2.h>
 #include <iphlpapi.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 
-#include "windivert/windivert.h"
+/* ndisapi: no WFP flow events available; owner-table polling only */
 
 static uint64_t tick_ms(void) {
     return GetTickCount64();
@@ -21,15 +22,6 @@ static unsigned int flow_hash(uint32_t ip, uint16_t port, uint8_t protocol) {
     x *= 0x7FEB352DU;
     x ^= x >> 15;
     return x % PROC_FLOW_BUCKETS;
-}
-
-static uint32_t windivert_flow_ipv4(const UINT32 addr[4]) {
-    for (int i = 0; i < 4; i++) {
-        if (addr[i] != 0 && addr[i] != 0x0000FFFFU && addr[i] != 0xFFFF0000U) {
-            return addr[i];
-        }
-    }
-    return 0;
 }
 
 static unsigned int pid_hash(uint32_t pid) {
@@ -48,32 +40,29 @@ static void put_unknown(char *name, int name_len) {
     if (name && name_len > 0) safe_str_copy(name, (size_t)name_len, "unknown");
 }
 
+/* Primary: CreateToolhelp32Snapshot works for all processes including
+ * SYSTEM-level, no permission issues unlike OpenProcess. */
 static int get_process_name_slow(uint32_t pid, char *name, int name_len) {
-    HANDLE hProc;
-    WCHAR wpath[MAX_PATH];
-    DWORD wpath_len = MAX_PATH;
-    WCHAR *slash;
-    WCHAR *fname;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W pe;
+    int found = 0;
 
     if (pid == 0 || !name || name_len <= 0) return 0;
+    if (snap == INVALID_HANDLE_VALUE) return 0;
 
-    hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!hProc) return 0;
-
-    if (!QueryFullProcessImageNameW(hProc, 0, wpath, &wpath_len)) {
-        CloseHandle(hProc);
-        return 0;
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (pe.th32ProcessID == pid) {
+                if (WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1,
+                                        name, name_len, NULL, NULL) > 0)
+                    found = 1;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
     }
-
-    slash = wcsrchr(wpath, L'\\');
-    fname = slash ? slash + 1 : wpath;
-    if (WideCharToMultiByte(CP_UTF8, 0, fname, -1, name, name_len, NULL, NULL) <= 0) {
-        CloseHandle(hProc);
-        return 0;
-    }
-
-    CloseHandle(hProc);
-    return 1;
+    CloseHandle(snap);
+    return found;
 }
 
 static int pid_cache_get(proc_lookup_t *pl, uint32_t pid, char *name, int name_len) {
@@ -317,64 +306,6 @@ static DWORD WINAPI refresh_thread_proc(LPVOID param) {
     return 0;
 }
 
-static void flow_event_cache(proc_lookup_t *pl, const WINDIVERT_ADDRESS *addr) {
-    uint8_t protocol;
-    uint16_t local_port;
-    uint32_t pid;
-    char name[256] = {0};
-
-    if (addr->Layer != WINDIVERT_LAYER_FLOW || addr->IPv6) return;
-
-    if (addr->Event != WINDIVERT_EVENT_FLOW_ESTABLISHED) {
-        return;
-    }
-
-    protocol = addr->Flow.Protocol;
-    if (protocol != 6 && protocol != 17) return;
-
-    pid = addr->Flow.ProcessId;
-    local_port = addr->Flow.LocalPort;
-    if (pid == 0 || local_port == 0) return;
-
-    proc_name_for_pid(pl, pid, name, sizeof(name));
-    if (pid == 4 && (!name[0] || strcmp(name, "unknown") == 0)) {
-        LOG_TRACE("Process flow event ignored: System [4] for %s port %u",
-                   protocol == 6 ? "TCP" : "UDP", local_port);
-        return;
-    }
-
-    {
-        uint32_t local_ip = windivert_flow_ipv4(addr->Flow.LocalAddr);
-        if (local_ip != 0) {
-            flow_cache_put(pl, local_ip, local_port, protocol, pid, name);
-        }
-    }
-    counter_inc(&pl->counters.flow_events);
-
-    LOG_TRACE("Process flow event: %s [%u] for %s port %u",
-              name[0] ? name : "unknown", pid, protocol == 6 ? "TCP" : "UDP", local_port);
-}
-
-static DWORD WINAPI flow_thread_proc(LPVOID param) {
-    proc_lookup_t *pl = (proc_lookup_t *)param;
-
-    while (pl->running) {
-        WINDIVERT_ADDRESS addr;
-        memset(&addr, 0, sizeof(addr));
-        if (!WinDivertRecv(pl->flow_handle, NULL, 0, NULL, &addr)) {
-            if (!pl->running) break;
-            DWORD err = GetLastError();
-            if (err == ERROR_NO_DATA || err == ERROR_INSUFFICIENT_BUFFER) continue;
-            LOG_TRACE("Process flow watcher recv failed: %lu", err);
-            Sleep(10);
-            continue;
-        }
-        flow_event_cache(pl, &addr);
-    }
-
-    return 0;
-}
-
 error_t proc_lookup_init(proc_lookup_t *pl) {
     memset(pl, 0, sizeof(*pl));
     pl->flow_bucket_count = PROC_FLOW_BUCKETS;
@@ -416,40 +347,12 @@ error_t proc_lookup_init(proc_lookup_t *pl) {
 
     proc_lookup_refresh(pl);
 
-    pl->flow_handle = WinDivertOpen("outbound and event == ESTABLISHED and (tcp or udp)",
-                                    WINDIVERT_LAYER_FLOW, 1000,
-                                    WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY);
-    if (pl->flow_handle == INVALID_HANDLE_VALUE && GetLastError() == 87) {
-        pl->flow_handle = WinDivertOpen("true", WINDIVERT_LAYER_FLOW, 1000,
-                                        WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY);
-        if (pl->flow_handle != INVALID_HANDLE_VALUE) {
-            LOG_TRACE("Process flow watcher using broad FLOW filter after filtered open failed");
-        }
-    }
-    if (pl->flow_handle == INVALID_HANDLE_VALUE) {
-        LOG_WARN("Process flow watcher unavailable; owner-table refresh remains background-only: %lu",
-                 GetLastError());
-    } else {
-        pl->flow_thread = CreateThread(NULL, 0, flow_thread_proc, pl, 0, NULL);
-        if (!pl->flow_thread) {
-            LOG_WARN("Failed to create process flow watcher thread");
-            WinDivertClose(pl->flow_handle);
-            pl->flow_handle = INVALID_HANDLE_VALUE;
-        }
-    }
+    pl->flow_handle = INVALID_HANDLE_VALUE;
+    LOG_INFO("Process flow watcher not available (ndisapi); owner-table refresh only");
 
     pl->refresh_thread = CreateThread(NULL, 0, refresh_thread_proc, pl, 0, NULL);
     if (!pl->refresh_thread) {
         pl->running = 0;
-        if (pl->flow_handle && pl->flow_handle != INVALID_HANDLE_VALUE) {
-            WinDivertClose(pl->flow_handle);
-            pl->flow_handle = INVALID_HANDLE_VALUE;
-        }
-        if (pl->flow_thread) {
-            WaitForSingleObject(pl->flow_thread, INFINITE);
-            CloseHandle(pl->flow_thread);
-            pl->flow_thread = NULL;
-        }
         if (pl->refresh_event) CloseHandle(pl->refresh_event);
         DeleteCriticalSection(&pl->refresh_lock);
         free(pl->flow_buckets);
@@ -468,15 +371,7 @@ error_t proc_lookup_init(proc_lookup_t *pl) {
 
 void proc_lookup_shutdown(proc_lookup_t *pl) {
     pl->running = 0;
-    if (pl->flow_handle && pl->flow_handle != INVALID_HANDLE_VALUE) {
-        WinDivertClose(pl->flow_handle);
-        pl->flow_handle = INVALID_HANDLE_VALUE;
-    }
-    if (pl->flow_thread) {
-        WaitForSingleObject(pl->flow_thread, INFINITE);
-        CloseHandle(pl->flow_thread);
-        pl->flow_thread = NULL;
-    }
+    /* ndisapi: no flow handle or flow thread to close */
     if (pl->refresh_thread) {
         if (pl->refresh_event) SetEvent(pl->refresh_event);
         WaitForSingleObject(pl->refresh_thread, INFINITE);

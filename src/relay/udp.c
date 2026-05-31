@@ -1,6 +1,7 @@
 #define FD_SETSIZE 2048
 #include "relay/udp.h"
 #include "relay/socks5.h"
+#include "conntrack/conntrack.h"
 #include "app/log.h"
 #include "core/util.h"
 #include <mswsock.h>
@@ -48,7 +49,7 @@ static error_t bind_udp_listener(udp_relay_t *relay) {
 
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(UDP_RELAY_PORT);
 
     if (bind(relay->local_sock, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
@@ -56,8 +57,9 @@ static error_t bind_udp_listener(udp_relay_t *relay) {
         LOG_WARN("UDP relay: bind failed on preferred port %u: %d; trying an ephemeral port",
                  UDP_RELAY_PORT, err);
         addr.sin_port = 0;
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
         if (bind(relay->local_sock, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
-            LOG_ERROR("UDP relay: bind failed on ephemeral loopback port: %d", WSAGetLastError());
+            LOG_ERROR("UDP relay: bind failed on ephemeral port: %d", WSAGetLastError());
             return ERR_NETWORK;
         }
     }
@@ -266,15 +268,20 @@ static int ensure_session(udp_relay_t *relay, uint32_t client_ip, uint16_t clien
     }
 
     if (had_session) {
+        /* Control socket closed — don't kill the session.  The UDP
+         * relay_sock is still valid.  Only time out on idle expiry. */
+        close_socket_if_valid(&ctrl_sock);
         AcquireSRWLockExclusive(&relay->session_lock);
         {
             udp_session_t *s = find_session(relay, client_ip, client_port);
-            if (s && s->generation == generation && s->ctrl_sock == ctrl_sock) {
-                LOG_TRACE("UDP relay: session control closed for port %u", client_port);
-                session_close(relay, s, 1);
+            if (s && s->generation == generation) {
+                s->ctrl_sock = INVALID_SOCKET;
+                LOG_TRACE("UDP relay: control closed for port %u (session kept)",
+                          client_port);
             }
         }
         ReleaseSRWLockExclusive(&relay->session_lock);
+        return 1;
     }
 
     {
@@ -471,9 +478,24 @@ static void handle_proxy_datagram(udp_relay_t *relay, udp_session_snapshot_t *sn
 
         if (socks5_udp_unwrap(recv_buf, n, &src_ip, &src_port, &payload, &payload_len) == ERR_OK) {
             struct sockaddr_in dst;
+            uint32_t dst_ip = LOOPBACK_ADDR;
+
+            /* Send response to orig_dst_ip so it routes through the adapter
+             * where NDIS catches it for return-path rewrite.  Keep the relay
+             * bound to INADDR_LOOPBACK for receiving client data. */
+            {
+                uint32_t orig_ip = 0;
+                uint16_t orig_port = 0;
+                if (conntrack_get(relay->conntrack, snapshot->client_ip,
+                                  snapshot->client_port, 17,
+                                  &orig_ip, &orig_port) == ERR_OK && orig_ip != 0) {
+                    dst_ip = orig_ip;
+                }
+            }
+
             memset(&dst, 0, sizeof(dst));
             dst.sin_family = AF_INET;
-            dst.sin_addr.s_addr = LOOPBACK_ADDR;
+            dst.sin_addr.s_addr = dst_ip;
             dst.sin_port = htons(snapshot->client_port);
 
             if (sendto(relay->local_sock, (const char *)payload, payload_len, 0,

@@ -19,7 +19,7 @@ set(SOURCES
     src/policy/rules.c
     src/dns/hijack.c
     src/dns/plan.c
-    src/divert/adapter.c
+    src/ndisapi/adapter.c
     src/packet/context.c
     src/flow/action.c
     src/flow/executor.c
@@ -49,16 +49,16 @@ target_link_libraries(WinTProxy PRIVATE
     psapi
 )
 
-# WinDivert: link against MinGW import library.
+# ndisapi: link against MinGW import library.
 # Generate it once from the .def file:
-#   x86_64-w64-mingw32-dlltool -d lib/windivert/WinDivert.def -l lib/windivert/libWinDivert.a
-# At runtime: place WinDivert.dll and WinDivert64.sys next to WinTProxy.exe
-set(WINDIVERT_LIB_DIR "${CMAKE_SOURCE_DIR}/lib/windivert" CACHE PATH "Path to WinDivert import library")
-if(EXISTS "${WINDIVERT_LIB_DIR}/libWinDivert.a")
-    target_link_libraries(WinTProxy PRIVATE "${WINDIVERT_LIB_DIR}/libWinDivert.a")
+#   x86_64-w64-mingw32-dlltool -d lib/ndisapi/ndisapi.def -l lib/ndisapi/libndisapi.a
+# At runtime: place ndisapi.dll and ndisrd.sys next to WinTProxy.exe
+set(NDISAPI_LIB_DIR "${CMAKE_SOURCE_DIR}/lib/ndisapi" CACHE PATH "Path to ndisapi import library")
+if(EXISTS "${NDISAPI_LIB_DIR}/libndisapi.a")
+    target_link_libraries(WinTProxy PRIVATE "${NDISAPI_LIB_DIR}/libndisapi.a")
 else()
-    message(WARNING "libWinDivert.a not found in ${WINDIVERT_LIB_DIR}. "
-                    "Run: x86_64-w64-mingw32-dlltool -d ${WINDIVERT_LIB_DIR}/WinDivert.def -l ${WINDIVERT_LIB_DIR}/libWinDivert.a")
+    message(WARNING "libndisapi.a not found in ${NDISAPI_LIB_DIR}. "
+                    "Run: x86_64-w64-mingw32-dlltool -d ${NDISAPI_LIB_DIR}/ndisapi.def -l ${NDISAPI_LIB_DIR}/libndisapi.a")
 endif()
 
 install(TARGETS WinTProxy RUNTIME DESTINATION bin)

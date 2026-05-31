@@ -4,11 +4,7 @@
 #define WTP_TCP_RELAY_PORT             34010
 #define WTP_UDP_RELAY_PORT             34011
 
-#define WTP_DIVERT_WORKER_COUNT        4
-#define WTP_DIVERT_MAX_PACKET_SIZE     65535
-#define WTP_DIVERT_QUEUE_LENGTH        16384
-#define WTP_DIVERT_QUEUE_TIME_MS       100
-#define WTP_DIVERT_QUEUE_SIZE          33554432U
+/* ndisapi engine tunables are defined in inc/ndisapi/adapter.h */
 
 #define WTP_DNS_NAT_BUCKETS            256
 #define WTP_DNS_NAT_POOL_SIZE          4096

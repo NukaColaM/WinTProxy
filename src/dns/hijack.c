@@ -4,7 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "windivert/windivert.h"
+#include "net/headers.h"
+
+#include "ndisapi/adapter.h"
+#include "ndisapi/ndisapi.h"
 
 #include <winsock2.h>
 
@@ -150,12 +153,11 @@ static uint16_t dns_nat_alloc_forward_txid(dns_hijack_t *dh, uint16_t fwd_src_po
 
 static void dns_nat_fill_entry(dns_nat_entry_t *e, uint32_t original_dns_ip,
                                uint16_t original_dns_port, uint32_t client_ip,
-                               uint32_t if_idx, uint32_t sub_if_idx) {
+                               HANDLE adapter_handle) {
     e->original_dns_ip = original_dns_ip;
     e->original_dns_port = original_dns_port;
     e->client_ip = client_ip;
-    e->if_idx = if_idx;
-    e->sub_if_idx = sub_if_idx;
+    e->adapter_handle = adapter_handle;
     e->timestamp = GetTickCount64();
 }
 
@@ -227,7 +229,7 @@ int dns_hijack_is_dns_request(uint16_t dst_port) {
 int dns_hijack_rewrite_request(dns_hijack_t *dh, uint32_t *dst_ip, uint16_t *dst_port,
                                 uint16_t src_port, uint16_t dns_txid,
                                 uint32_t original_dns_ip, uint16_t original_dns_port,
-                                uint32_t client_ip, uint32_t if_idx, uint32_t sub_if_idx) {
+                                uint32_t client_ip, HANDLE adapter_handle) {
     unsigned int idx;
     dns_nat_entry_t *e;
 
@@ -243,7 +245,7 @@ int dns_hijack_rewrite_request(dns_hijack_t *dh, uint32_t *dst_ip, uint16_t *dst
         return -1;
     }
 
-    dns_nat_fill_entry(e, original_dns_ip, original_dns_port, client_ip, if_idx, sub_if_idx);
+    dns_nat_fill_entry(e, original_dns_ip, original_dns_port, client_ip, adapter_handle);
     dns_nat_cleanup_stale_bucket(dh, idx, e);
 
     ReleaseSRWLockExclusive(&dh->lock);
@@ -263,8 +265,7 @@ int dns_hijack_rewrite_request(dns_hijack_t *dh, uint32_t *dst_ip, uint16_t *dst
 }
 
 int dns_hijack_rewrite_response(dns_hijack_t *dh, uint32_t *src_ip, uint16_t *src_port,
-                                 uint16_t dst_port, uint16_t dns_txid,
-                                 uint32_t *client_ip, uint32_t *if_idx, uint32_t *sub_if_idx) {
+                                 uint16_t dst_port, uint16_t dns_txid) {
     unsigned int idx;
     dns_nat_entry_t *e;
     uint64_t now;
@@ -291,18 +292,14 @@ int dns_hijack_rewrite_response(dns_hijack_t *dh, uint32_t *src_ip, uint16_t *sr
 
     *src_ip = e->original_dns_ip;
     *src_port = e->original_dns_port;
-    if (client_ip) *client_ip = e->client_ip;
-    if (if_idx) *if_idx = e->if_idx;
-    if (sub_if_idx) *sub_if_idx = e->sub_if_idx;
     dns_nat_remove_entry(dh, idx, e);
     ReleaseSRWLockExclusive(&dh->lock);
 
     {
-        char orig_str[16], cli_str[16];
+        char orig_str[16];
         ip_to_str(*src_ip, orig_str, sizeof(orig_str));
-        if (client_ip) ip_to_str(*client_ip, cli_str, sizeof(cli_str));
-        LOG_TRACE("DNS response: restore src=%s:%u dst=%s for client port %u txid=0x%04x",
-            orig_str, *src_port, client_ip ? cli_str : "?", dst_port, dns_txid);
+        LOG_TRACE("DNS response: restore src=%s:%u for client port %u txid=0x%04x",
+            orig_str, *src_port, dst_port, dns_txid);
     }
     return 1;
 }
@@ -310,7 +307,6 @@ int dns_hijack_rewrite_response(dns_hijack_t *dh, uint32_t *src_ip, uint16_t *sr
 static DWORD WINAPI dns_fwd_thread(LPVOID param) {
     dns_hijack_t *dh = (dns_hijack_t *)param;
     uint8_t buf[WTP_DNS_FORWARD_BUFFER_SIZE];
-    WINDIVERT_ADDRESS addr;
 
     while (dh->fwd_running) {
         struct sockaddr_in from;
@@ -318,6 +314,9 @@ static DWORD WINAPI dns_fwd_thread(LPVOID param) {
         int n = recvfrom(dh->fwd_sock, (char *)buf, sizeof(buf), 0,
                          (struct sockaddr *)&from, &from_len);
         if (n <= 0) {
+            if (n < 0) {
+                LOG_TRACE("DNS fwd: recvfrom error: %d", WSAGetLastError());
+            }
             if (!dh->fwd_running) break;
             continue;
         }
@@ -331,8 +330,7 @@ static DWORD WINAPI dns_fwd_thread(LPVOID param) {
             uint16_t orig_dns_port = 0;
             uint16_t client_src_port = 0;
             uint16_t original_txid = 0;
-            uint32_t orig_if_idx = 0;
-            uint32_t orig_sub_if_idx = 0;
+            HANDLE orig_adapter_handle = NULL;
             unsigned int idx = dns_nat_hash_forward(dh->fwd_src_port, fwd_txid);
             dns_nat_entry_t *e;
             int found = 0;
@@ -345,8 +343,7 @@ static DWORD WINAPI dns_fwd_thread(LPVOID param) {
                 client_ip = e->client_ip;
                 client_src_port = e->src_port;
                 original_txid = e->dns_txid;
-                orig_if_idx = e->if_idx;
-                orig_sub_if_idx = e->sub_if_idx;
+                orig_adapter_handle = e->adapter_handle;
                 dns_nat_remove_entry(dh, idx, e);
                 found = 1;
             } else if (e) {
@@ -362,52 +359,100 @@ static DWORD WINAPI dns_fwd_thread(LPVOID param) {
             buf[0] = (uint8_t)(original_txid >> 8);
             buf[1] = (uint8_t)(original_txid & 0xFF);
 
+            /* Build full Ethernet+IP+UDP+DNS packet and inject via MSTCP */
             {
-                int pkt_len = (int)(sizeof(WINDIVERT_IPHDR) + sizeof(WINDIVERT_UDPHDR) + (size_t)n);
-                uint8_t pkt[sizeof(WINDIVERT_IPHDR) + sizeof(WINDIVERT_UDPHDR) + WTP_DNS_FORWARD_BUFFER_SIZE];
-                PWINDIVERT_IPHDR ip;
-                PWINDIVERT_UDPHDR udp;
-                uint8_t *payload;
+                ndisapi_engine_t *eng = (ndisapi_engine_t *)dh->engine_ctx;
                 char cli_str[16], orig_str[16];
 
-                if (pkt_len > (int)sizeof(pkt)) continue;
+                /* Allocate an INTERMEDIATE_BUFFER on the heap — the driver
+                 * handle is opened with FILE_FLAG_OVERLAPPED; heap memory
+                 * avoids potential issues with stack-allocated buffers. */
+                PINTERMEDIATE_BUFFER pkt = (PINTERMEDIATE_BUFFER)
+                    calloc(1, sizeof(INTERMEDIATE_BUFFER));
+                if (!pkt) continue;
 
-                ip = (PWINDIVERT_IPHDR)pkt;
-                udp = (PWINDIVERT_UDPHDR)(pkt + sizeof(WINDIVERT_IPHDR));
-                payload = pkt + sizeof(WINDIVERT_IPHDR) + sizeof(WINDIVERT_UDPHDR);
+                ether_header_ptr eth = (ether_header_ptr)pkt->m_IBuffer;
+                iphdr_ptr        ip  = (iphdr_ptr)(pkt->m_IBuffer + ETHER_HDR_LEN);
+                udphdr_ptr       udp = (udphdr_ptr)(pkt->m_IBuffer + ETHER_HDR_LEN + 20);
+                uint8_t         *dns_payload = pkt->m_IBuffer + ETHER_HDR_LEN + 20 + 8;
 
-                memset(ip, 0, sizeof(WINDIVERT_IPHDR));
-                ip->Version = 4;
-                ip->HdrLength = sizeof(WINDIVERT_IPHDR) / 4;
-                ip->Length = htons((uint16_t)pkt_len);
-                ip->TTL = 64;
-                ip->Protocol = 17;
-                ip->SrcAddr = orig_dns_ip;
-                ip->DstAddr = client_ip;
+                int ip_len = 20 + 8 + (int)n;
+                int total_len = ETHER_HDR_LEN + ip_len;
 
-                memset(udp, 0, sizeof(WINDIVERT_UDPHDR));
-                udp->SrcPort = htons(orig_dns_port);
-                udp->DstPort = htons(client_src_port);
-                udp->Length = htons((uint16_t)(sizeof(WINDIVERT_UDPHDR) + (size_t)n));
-
-                memcpy(payload, buf, (size_t)n);
-
-                memset(&addr, 0, sizeof(addr));
-                addr.Outbound = 0;
-                addr.Loopback = 0;
-                addr.Network.IfIdx = orig_if_idx;
-                addr.Network.SubIfIdx = orig_sub_if_idx;
-
-                WinDivertHelperCalcChecksums(pkt, (UINT)pkt_len, &addr, 0);
-
-                ip_to_str(client_ip, cli_str, sizeof(cli_str));
-                ip_to_str(orig_dns_ip, orig_str, sizeof(orig_str));
-                if (!WinDivertSend(dh->divert_handle, pkt, (UINT)pkt_len, NULL, &addr)) {
-                    LOG_WARN("DNS fwd: WinDivertSend failed: err=%lu", GetLastError());
-                } else {
-                    LOG_TRACE("DNS fwd: txid=0x%04x restored from 0x%04x to %s:%u (orig dns %s:%u)",
-                        original_txid, fwd_txid, cli_str, client_src_port, orig_str, orig_dns_port);
+                /* Ethernet: destination = adapter MAC of the interface that the
+                 * original DNS query arrived on; source = same MAC.  MSTCP delivery
+                 * requires the destination MAC to match a local interface. */
+                memset(eth->h_dest, 0, 6);
+                memset(eth->h_source, 0, 6);
+                if (orig_adapter_handle && eng->adapter_count > 0) {
+                    /* Find the MAC address for the adapter that carried the
+                     * original query, so MSTCP delivers the response on the
+                     * correct interface. */
+                    int mac_found = 0;
+                    for (DWORD i = 0; i < eng->adapter_count; i++) {
+                        if (eng->adapter_handles[i] == orig_adapter_handle) {
+                            memcpy(eth->h_dest, eng->adapter_mac[i], 6);
+                            memcpy(eth->h_source, eng->adapter_mac[i], 6);
+                            mac_found = 1;
+                            break;
+                        }
+                    }
+                    if (!mac_found) {
+                        memcpy(eth->h_dest, eng->adapter_mac[0], 6);
+                        memcpy(eth->h_source, eng->adapter_mac[0], 6);
+                    }
+                } else if (eng->adapter_count > 0) {
+                    memcpy(eth->h_dest, eng->adapter_mac[0], 6);
+                    memcpy(eth->h_source, eng->adapter_mac[0], 6);
                 }
+                eth->h_proto = htons(ETH_P_IP);
+
+                /* IP header */
+                memset(ip, 0, 20);
+                ip->ip_v = 4;
+                ip->ip_hl = 5;
+                ip->ip_len = htons((uint16_t)ip_len);
+                ip->ip_ttl = 64;
+                ip->ip_p = 17;  /* UDP */
+                ip->ip_src = orig_dns_ip;
+                ip->ip_dst = client_ip;
+
+                /* UDP header */
+                udp->uh_sport = htons(orig_dns_port);
+                udp->uh_dport = htons(client_src_port);
+                udp->uh_ulen = htons((uint16_t)(8 + n));
+                udp->uh_sum = 0;
+
+                /* DNS payload */
+                memcpy(dns_payload, buf, (size_t)n);
+
+                pkt->m_Length = (DWORD)total_len;
+                pkt->m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;
+                pkt->m_hAdapter = orig_adapter_handle;
+                if (!pkt->m_hAdapter && eng->adapter_count > 0) {
+                    pkt->m_hAdapter = eng->adapter_handles[0];
+                }
+
+                /* Recalculate checksums */
+                RecalculateUDPChecksum(pkt);
+                RecalculateIPChecksum(pkt);
+
+                /* Send to MSTCP */
+                {
+                    DWORD sent = 0;
+                    if (SendPacketsToMstcpUnsorted(eng->driver_handle,
+                                                    &pkt, 1, &sent)) {
+                        ip_to_str(client_ip, cli_str, sizeof(cli_str));
+                        ip_to_str(orig_dns_ip, orig_str, sizeof(orig_str));
+                        LOG_DEBUG("DNS fwd: txid=0x%04x sent to MSTCP %s:%u <-- %s:%u",
+                            original_txid, cli_str, client_src_port,
+                            orig_str, orig_dns_port);
+                    } else {
+                        LOG_WARN("DNS fwd: SendPacketsToMstcpUnsorted failed: %lu",
+                                 GetLastError());
+                    }
+                }
+                free(pkt);
             }
         }
     }
@@ -415,10 +460,10 @@ static DWORD WINAPI dns_fwd_thread(LPVOID param) {
     return 0;
 }
 
-error_t dns_hijack_start_forwarder(dns_hijack_t *dh, void *divert_handle) {
+error_t dns_hijack_start_forwarder(dns_hijack_t *dh, void *engine_ctx) {
     if (!dh->use_socket_fwd) return ERR_OK;
 
-    dh->divert_handle = divert_handle;
+    dh->engine_ctx = engine_ctx;
 
     dh->fwd_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (dh->fwd_sock == INVALID_SOCKET) {
@@ -475,7 +520,7 @@ error_t dns_hijack_start_forwarder(dns_hijack_t *dh, void *divert_handle) {
 
 error_t dns_hijack_forward_query(dns_hijack_t *dh, const uint8_t *dns_payload, int dns_len,
                                  uint16_t src_port, uint32_t original_dns_ip, uint16_t original_dns_port,
-                                 uint32_t client_ip, uint32_t if_idx, uint32_t sub_if_idx) {
+                                 uint32_t client_ip, HANDLE adapter_handle) {
     uint8_t fwd_payload[WTP_DNS_FORWARD_BUFFER_SIZE];
     uint16_t original_txid;
     uint16_t fwd_txid;
@@ -506,7 +551,7 @@ error_t dns_hijack_forward_query(dns_hijack_t *dh, const uint8_t *dns_payload, i
         ReleaseSRWLockExclusive(&dh->lock);
         return ERR_MEMORY;
     }
-    dns_nat_fill_entry(e, original_dns_ip, original_dns_port, client_ip, if_idx, sub_if_idx);
+    dns_nat_fill_entry(e, original_dns_ip, original_dns_port, client_ip, adapter_handle);
     ReleaseSRWLockExclusive(&dh->lock);
 
     fwd_payload[0] = (uint8_t)(fwd_txid >> 8);

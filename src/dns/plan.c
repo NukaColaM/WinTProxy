@@ -1,228 +1,159 @@
+/*
+ * DNS plan — UDP/TCP DNS intercept and redirection (full T5).
+ */
 #include "dns/plan.h"
-#include "divert/io.h"
+#include "dns/hijack.h"
+#include "path/classify.h"
+#include "conntrack/conntrack.h"
 #include "app/log.h"
 #include "core/util.h"
 #include <string.h>
 #include <stdio.h>
 #include <winsock2.h>
 
-static const char *dns_qname_or_unknown(const packet_dns_query_summary_t *summary) {
-    return summary->question_valid ? summary->qname : "?";
+static const char *dns_qname_or_unknown(const packet_dns_query_summary_t *s) {
+    return s->question_valid ? s->qname : "?";
 }
 
-static void dns_format_query_fields(const packet_dns_query_summary_t *summary,
+static void dns_format_query_fields(const packet_dns_query_summary_t *s,
                                     char *buf, size_t len) {
     if (!buf || len == 0) return;
-
-    if (!summary || !summary->txid_valid) {
+    if (!s || !s->txid_valid) {
         snprintf(buf, len, "txid=? qname=? qtype=? qclass=?");
-    } else if (summary->question_valid) {
+    } else if (s->question_valid) {
         snprintf(buf, len, "txid=0x%04x qname=%s qtype=%u qclass=%u",
-                 summary->txid, dns_qname_or_unknown(summary),
-                 summary->qtype, summary->qclass);
+                 s->txid, dns_qname_or_unknown(s), s->qtype, s->qclass);
     } else {
-        snprintf(buf, len, "txid=0x%04x qname=? qtype=? qclass=?", summary->txid);
+        snprintf(buf, len, "txid=0x%04x qname=? qtype=? qclass=?", s->txid);
     }
 }
 
 static void log_dns_query(packet_ctx_t *ctx, int tcp_framed,
-                          uint32_t original_dns_ip, uint16_t original_dns_port,
-                          uint32_t target_dns_ip, uint16_t target_dns_port,
+                          uint32_t orig_ip, uint16_t orig_port,
+                          uint32_t target_ip, uint16_t target_port,
                           const char *action, const char *outcome,
                           int log_without_summary) {
-    if (!log_is_enabled(LOG_DEBUG)) return;
-
+    if (!log_is_enabled(LOG_TRACE)) return;
     packet_dns_query_summary_t summary;
-    char client_str[16], orig_str[16], target_str[16], query_fields[384];
-
+    char c[16], o[16], t[16], f[384];
     if (!packet_dns_query_summary(ctx, tcp_framed, &summary)) {
         if (!log_without_summary) return;
         memset(&summary, 0, sizeof(summary));
     }
-
-    ip_to_str(ctx->src_ip, client_str, sizeof(client_str));
-    ip_to_str(original_dns_ip, orig_str, sizeof(orig_str));
-    ip_to_str(target_dns_ip, target_str, sizeof(target_str));
-    dns_format_query_fields(&summary, query_fields, sizeof(query_fields));
-
-    LOG_DEBUG("DNS %s query: client=%s:%u original=%s:%u target=%s:%u %s action=%s outcome=%s",
-              tcp_framed ? "TCP" : "UDP",
-              client_str, ctx->src_port,
-              orig_str, original_dns_port,
-              target_str, target_dns_port,
-              query_fields,
-              action ? action : "?",
-              outcome ? outcome : "?");
+    ip_to_str(ctx->src_ip, c, sizeof(c));
+    ip_to_str(orig_ip, o, sizeof(o));
+    ip_to_str(target_ip, t, sizeof(t));
+    dns_format_query_fields(&summary, f, sizeof(f));
+    LOG_TRACE("DNS %s query: client=%s:%u original=%s:%u target=%s:%u %s "
+              "action=%s outcome=%s", tcp_framed?"TCP":"UDP",
+              c, ctx->src_port, o, orig_port, t, target_port,
+              f, action?action:"?", outcome?outcome:"?");
 }
 
-void dns_plan_udp_response_loopback(divert_engine_t *engine, packet_ctx_t *ctx,
-                                    WINDIVERT_ADDRESS *addr, traffic_action_t *action) {
-    uint32_t orig_dns_ip, cli_ip;
-    uint16_t orig_dns_port;
-    uint32_t orig_if_idx, orig_sub_if_idx;
-    uint16_t dns_txid;
-
-    if (!packet_dns_txid(ctx, &dns_txid)) {
-        LOG_TRACE("DNS response (loopback): malformed payload, passing through");
-        traffic_action_pass(action, ctx, addr, "DNS response loopback malformed");
-        return;
-    }
-
-    if (dns_hijack_rewrite_response(engine->dns_hijack, &orig_dns_ip, &orig_dns_port,
-                                     ctx->dst_port, dns_txid,
-                                     &cli_ip, &orig_if_idx, &orig_sub_if_idx)) {
-        char orig_str[16], cli_str[16], src_str[16];
-        ip_to_str(orig_dns_ip, orig_str, sizeof(orig_str));
-        ip_to_str(cli_ip, cli_str, sizeof(cli_str));
-        ip_to_str(ctx->src_ip, src_str, sizeof(src_str));
-        LOG_TRACE("DNS response (loopback): src %s:%u -> %s:%u, dst -> %s, IfIdx=%lu",
-            src_str, ctx->src_port, orig_str, orig_dns_port, cli_str, (unsigned long)orig_if_idx);
-        ctx->ip_hdr->SrcAddr = orig_dns_ip;
-        ctx->udp_hdr->SrcPort = htons(orig_dns_port);
-        ctx->ip_hdr->DstAddr = cli_ip;
-        addr->Outbound = 0;
-        addr->Loopback = 0;
-        addr->Network.IfIdx = orig_if_idx;
-        addr->Network.SubIfIdx = orig_sub_if_idx;
-        traffic_action_rewrite_send(action, ctx, addr, "DNS response loopback");
-        return;
-    }
-
-    traffic_action_pass(action, ctx, addr, "DNS response loopback");
-}
-
-void dns_plan_inbound_or_response(divert_engine_t *engine, packet_ctx_t *ctx,
-                                  WINDIVERT_ADDRESS *addr, int is_dns_response,
-                                  traffic_action_t *action) {
+void dns_plan_inbound_or_response(ndisapi_engine_t *engine, packet_ctx_t *ctx,
+                                  int is_dns_response, traffic_action_t *action) {
     if (is_dns_response) {
-        uint32_t orig_dns_ip;
-        uint16_t orig_dns_port;
-        uint16_t dns_txid;
-        if (packet_dns_txid(ctx, &dns_txid) &&
-            dns_hijack_rewrite_response(engine->dns_hijack, &orig_dns_ip, &orig_dns_port,
-                                         ctx->dst_port, dns_txid, NULL, NULL, NULL)) {
-            ctx->ip_hdr->SrcAddr = orig_dns_ip;
-            ctx->udp_hdr->SrcPort = htons(orig_dns_port);
-            traffic_action_rewrite_send(action, ctx, addr, "inbound DNS response");
+        uint32_t orig_ip; uint16_t orig_port; uint16_t txid;
+        if (packet_dns_txid(ctx, &txid) &&
+            dns_hijack_rewrite_response(engine->dns_hijack, &orig_ip, &orig_port,
+                                         ctx->dst_port, txid)) {
+            ctx->ip_hdr->ip_src = orig_ip;
+            ctx->udp_hdr->uh_sport = htons(orig_port);
+            ctx->ndis_buf->m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;
+            traffic_action_rewrite_send(action, ctx, ctx->ndis_buf, "dns response");
             return;
         }
     }
-    traffic_action_pass(action, ctx, addr, "inbound");
+    traffic_action_pass(action, ctx, ctx?ctx->ndis_buf:NULL, "inbound");
 }
 
-void dns_plan_tcp_return(divert_engine_t *engine, packet_ctx_t *ctx,
-                         WINDIVERT_ADDRESS *addr, traffic_action_t *action) {
+void dns_plan_tcp_return(ndisapi_engine_t *engine, packet_ctx_t *ctx,
+                         traffic_action_t *action) {
     conntrack_entry_t entry;
-
     if (conntrack_get_full_key(engine->conntrack, ctx->dst_ip, ctx->dst_port,
                                ctx->src_ip, ctx->src_port, 6, &entry) != ERR_OK) {
-        LOG_TRACE("TCP DNS return: no conntrack for dst_port %u", ctx->dst_port);
-        traffic_action_drop(action, ctx, addr, "TCP DNS return missing conntrack");
+        LOG_TRACE("TCP DNS return: no conntrack for port %u", ctx->dst_port);
+        traffic_action_drop(action, ctx, ctx->ndis_buf, "tcp dns return missing");
         return;
     }
-
-    ctx->ip_hdr->SrcAddr = entry.orig_dst_ip;
-    ctx->ip_hdr->DstAddr = entry.src_ip;
-    ctx->tcp_hdr->SrcPort = htons(entry.orig_dst_port);
-    ctx->tcp_hdr->DstPort = htons(entry.client_port);
-
-    if (engine->dns_hijack->redirect_ip == LOOPBACK_ADDR) {
-        divert_set_loopback_route(engine, addr);
-    } else {
-        addr->Outbound = 0;
-        addr->Loopback = 0;
-        addr->Network.IfIdx = entry.if_idx;
-        addr->Network.SubIfIdx = entry.sub_if_idx;
-    }
-
-    traffic_action_rewrite_send(action, ctx, addr, "TCP DNS return");
+    ctx->ip_hdr->ip_src = entry.orig_dst_ip;
+    ctx->ip_hdr->ip_dst = entry.src_ip;
+    ctx->tcp_hdr->th_sport = htons(entry.orig_dst_port);
+    ctx->tcp_hdr->th_dport = htons(entry.client_port);
+    { uint8_t t[6]; memcpy(t,ctx->eth_hdr->h_dest,6);
+      memcpy(ctx->eth_hdr->h_dest,ctx->eth_hdr->h_source,6);
+      memcpy(ctx->eth_hdr->h_source,t,6); }
+    ctx->ndis_buf->m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;
+    traffic_action_rewrite_send(action, ctx, ctx->ndis_buf, "tcp dns return");
 }
 
-void dns_plan_udp_query(divert_engine_t *engine, packet_ctx_t *ctx,
-                        WINDIVERT_ADDRESS *addr, traffic_action_t *action) {
-    const uint8_t *dns_data = NULL;
-    UINT dns_data_len = 0;
-    uint16_t dns_txid = 0;
-
-    packet_payload(ctx, &dns_data, &dns_data_len);
-    if (!dns_data || dns_data_len < 2 || !packet_dns_txid(ctx, &dns_txid)) {
-        log_dns_query(ctx, 0, ctx->dst_ip, ctx->dst_port, ctx->dst_ip, ctx->dst_port,
-                      "pass", "malformed-payload", 1);
-        traffic_action_pass(action, ctx, addr, "DNS malformed pass");
+void dns_plan_udp_query(ndisapi_engine_t *engine, packet_ctx_t *ctx,
+                        traffic_action_t *action) {
+    const uint8_t *d; UINT dl; uint16_t txid=0;
+    packet_payload(ctx, &d, &dl);
+    if (!d || dl<2 || !packet_dns_txid(ctx, &txid)) {
+        log_dns_query(ctx,0,ctx->dst_ip,ctx->dst_port,ctx->dst_ip,ctx->dst_port,
+                      "pass","malformed",1);
+        traffic_action_pass(action,ctx,ctx->ndis_buf,"dns malformed");
         return;
     }
-
     if (engine->dns_hijack->use_socket_fwd) {
-        log_dns_query(ctx, 0, ctx->dst_ip, ctx->dst_port,
-                      engine->dns_hijack->redirect_ip, engine->dns_hijack->redirect_port,
-                      "socket-forward", "queued", 1);
-        traffic_dns_forward_t forward;
-        forward.src_port = ctx->src_port;
-        forward.original_dns_ip = ctx->dst_ip;
-        forward.original_dns_port = ctx->dst_port;
-        forward.client_ip = ctx->src_ip;
-        forward.if_idx = addr->Network.IfIdx;
-        forward.sub_if_idx = addr->Network.SubIfIdx;
-        traffic_action_forward_dns(action, ctx, addr, &forward, "DNS socket forward");
+        log_dns_query(ctx,0,ctx->dst_ip,ctx->dst_port,
+                      engine->dns_hijack->redirect_ip,
+                      engine->dns_hijack->redirect_port,
+                      "socket-forward","queued",1);
+        traffic_dns_forward_t fw;
+        fw.src_port=ctx->src_port; fw.original_dns_ip=ctx->dst_ip;
+        fw.original_dns_port=ctx->dst_port; fw.client_ip=ctx->src_ip;
+        fw.adapter_handle=ctx->ndis_buf->m_hAdapter;
+        traffic_action_forward_dns(action,ctx,ctx->ndis_buf,&fw,"dns fwd");
         return;
     }
-
-    uint32_t new_dst_ip = ctx->dst_ip;
-    uint16_t new_dst_port = ctx->dst_port;
-    if (dns_hijack_rewrite_request(engine->dns_hijack, &new_dst_ip, &new_dst_port,
-                                    ctx->src_port, dns_txid,
-                                    ctx->dst_ip, ctx->dst_port,
-                                    ctx->src_ip, addr->Network.IfIdx, addr->Network.SubIfIdx) == 1) {
-        ctx->ip_hdr->DstAddr = new_dst_ip;
-        ctx->udp_hdr->DstPort = htons(new_dst_port);
-        log_dns_query(ctx, 0, ctx->dst_ip, ctx->dst_port, new_dst_ip, new_dst_port,
-                      "rewrite", "redirected", 1);
-        traffic_action_rewrite_send(action, ctx, addr, "DNS hijack");
+    uint32_t nip=ctx->dst_ip; uint16_t nport=ctx->dst_port;
+    if (dns_hijack_rewrite_request(engine->dns_hijack,&nip,&nport,
+                                    ctx->src_port,txid,ctx->dst_ip,ctx->dst_port,
+                                    ctx->src_ip,ctx->ndis_buf->m_hAdapter)==1) {
+        ctx->ip_hdr->ip_dst=nip; ctx->udp_hdr->uh_dport=htons(nport);
+        log_dns_query(ctx,0,ctx->dst_ip,ctx->dst_port,nip,nport,"rewrite","ok",1);
+        traffic_action_rewrite_send(action,ctx,ctx->ndis_buf,"dns hijack");
     } else {
-        LOG_WARN("DNS hijack: failed to store NAT entry, passing original query");
-        log_dns_query(ctx, 0, ctx->dst_ip, ctx->dst_port, ctx->dst_ip, ctx->dst_port,
-                      "pass", "nat-store-failed", 1);
-        traffic_action_pass(action, ctx, addr, "DNS hijack fallback");
+        LOG_WARN("DNS hijack: NAT store failed");
+        traffic_action_pass(action,ctx,ctx->ndis_buf,"dns fallback");
     }
 }
 
-void dns_plan_tcp_query(divert_engine_t *engine, packet_ctx_t *ctx,
-                        WINDIVERT_ADDRESS *addr, traffic_action_t *action) {
-    char orig_str[16], redir_str[16];
-    uint32_t original_dst_ip = ctx->dst_ip;
-    uint16_t original_dst_port = ctx->dst_port;
-    error_t err;
+void dns_plan_tcp_query(ndisapi_engine_t *engine, packet_ctx_t *ctx,
+                        traffic_action_t *action) {
+    uint32_t odip=ctx->dst_ip, odport=ctx->dst_port, ksi=ctx->src_ip;
+    uint32_t ifi=0; error_t err;
+    if (ctx->ndis_buf) ifi=(uint32_t)(uintptr_t)ctx->ndis_buf->m_hAdapter;
 
-    err = conntrack_add_key_full(engine->conntrack,
-                                 ctx->src_ip, ctx->src_port,
-                                 engine->dns_hijack->redirect_ip, engine->dns_hijack->redirect_port,
+    if (engine->dns_hijack->redirect_ip == LOOPBACK_ADDR)
+        ksi = ctx->dst_ip; /* force response through adapter */
+
+    err = conntrack_add_key_full(engine->conntrack, ksi, ctx->src_port,
+                                 engine->dns_hijack->redirect_ip,
+                                 engine->dns_hijack->redirect_port,
                                  ctx->src_ip, ctx->src_port,
                                  ctx->dst_ip, ctx->dst_port,
-                                 engine->dns_hijack->redirect_ip, engine->dns_hijack->redirect_port,
-                                 6, 0, "",
-                                 addr->Network.IfIdx, addr->Network.SubIfIdx,
-                                 ctx->src_port);
+                                 engine->dns_hijack->redirect_ip,
+                                 engine->dns_hijack->redirect_port,
+                                 6,0,"", ifi,0, ctx->src_port);
     if (err != ERR_OK) {
-        LOG_WARN("TCP DNS hijack: conntrack unavailable, dropping");
-        log_dns_query(ctx, 1, original_dst_ip, original_dst_port,
-                      engine->dns_hijack->redirect_ip, engine->dns_hijack->redirect_port,
-                      "drop", "conntrack-unavailable", 0);
-        traffic_action_drop(action, ctx, addr, "TCP DNS conntrack unavailable");
+        LOG_WARN("TCP DNS: conntrack unavailable");
+        traffic_action_drop(action,ctx,ctx->ndis_buf,"tcp dns conntrack");
         return;
     }
-
-    ctx->ip_hdr->DstAddr = engine->dns_hijack->redirect_ip;
-    ctx->tcp_hdr->DstPort = htons(engine->dns_hijack->redirect_port);
+    ctx->ip_hdr->ip_dst = engine->dns_hijack->redirect_ip;
+    ctx->tcp_hdr->th_dport = htons(engine->dns_hijack->redirect_port);
     if (engine->dns_hijack->redirect_ip == LOOPBACK_ADDR) {
-        divert_set_loopback_route(engine, addr);
+        ctx->ip_hdr->ip_src = odip;
+        { uint8_t t[6]; memcpy(t,ctx->eth_hdr->h_dest,6);
+          memcpy(ctx->eth_hdr->h_dest,ctx->eth_hdr->h_source,6);
+          memcpy(ctx->eth_hdr->h_source,t,6); }
+        ctx->ndis_buf->m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;
     }
-
-    ip_to_str(original_dst_ip, orig_str, sizeof(orig_str));
-    ip_to_str(engine->dns_hijack->redirect_ip, redir_str, sizeof(redir_str));
-    log_dns_query(ctx, 1, original_dst_ip, original_dst_port,
-                  engine->dns_hijack->redirect_ip, engine->dns_hijack->redirect_port,
-                  "rewrite", "redirected", 0);
-    LOG_TRACE("TCP DNS hijack: %s:%u -> %s:%u", orig_str, original_dst_port,
-        redir_str, engine->dns_hijack->redirect_port);
-    traffic_action_rewrite_send(action, ctx, addr, "TCP DNS hijack");
+    log_dns_query(ctx,1,odip,odport,engine->dns_hijack->redirect_ip,
+                  engine->dns_hijack->redirect_port,"rewrite","ok",0);
+    traffic_action_rewrite_send(action,ctx,ctx->ndis_buf,"tcp dns hijack");
 }

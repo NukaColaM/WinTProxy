@@ -1,8 +1,8 @@
 # WinTProxy
 
-> **⚠️ Low-level refactoring in progress — WinDivert is being replaced by WinpkFilter. APIs, config schema, and behavior may change without notice.**
+> **✅ Done — ndisapi (WinpkFilter) migration complete. All tasks (T1–T6) finished. v0.7.0.**
 
-Transparent SOCKS5 proxy for Windows. WinTProxy intercepts IPv4 TCP and UDP traffic with [WinDivert](https://github.com/basil00/WinDivert), plans each packet through explicit DNS, bypass, policy, proxy, return-path, and action-execution stages, then applies a proxy/direct verdict.
+Transparent SOCKS5 proxy for Windows. WinTProxy intercepts IPv4 TCP and UDP traffic with [WinpkFilter](https://github.com/wiresock/ndisapi) (ndisapi), plans each packet through explicit DNS, bypass, policy, proxy, return-path, and action-execution stages, then applies a proxy/direct verdict.
 
 ## Features
 
@@ -24,7 +24,7 @@ cmake -B build -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-toolchain.cmake
 cmake --build build
 ```
 
-Place `WinDivert.dll` and `WinDivert64.sys` next to `WinTProxy.exe`, then run from an elevated Windows shell:
+Place `ndisapi.dll` and `ndisrd.sys` (from [WinpkFilter releases](https://github.com/wiresock/ndisapi/releases)) next to `WinTProxy.exe`. The ndisrd.sys driver must be trusted by Windows — either install the signed driver package or enable test-signing mode (`bcdedit /set testsigning on`). Run from an elevated Windows shell:
 
 ```powershell
 WinTProxy.exe --config config.example.json
@@ -60,5 +60,5 @@ See [config.example.json](config.example.json) for an annotated example.
 
 Third-party components:
 
-- [WinDivert](https://github.com/basil00/WinDivert) - LGPL-3.0
+- [WinpkFilter / ndisapi](https://github.com/wiresock/ndisapi) — driver and user-mode DLL
 - [cJSON](https://github.com/DaveGamble/cJSON) - MIT

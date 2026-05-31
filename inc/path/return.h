@@ -1,7 +1,10 @@
+/*
+ * Return-path planner — restores original tuple for relay return traffic.
+ */
 #ifndef WINTPROXY_PATH_RETURN_H
 #define WINTPROXY_PATH_RETURN_H
 
-#include "divert/adapter.h"
+#include "ndisapi/adapter.h"
 #include "flow/action.h"
 #include "packet/context.h"
 
@@ -9,12 +12,11 @@
 extern "C" {
 #endif
 
-void path_plan_return(divert_engine_t *engine, packet_ctx_t *ctx,
-                      WINDIVERT_ADDRESS *addr, int is_tcp,
-                      traffic_action_t *action);
+void path_plan_return(ndisapi_engine_t *engine, packet_ctx_t *ctx,
+                      int is_tcp, traffic_action_t *action);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif
+#endif /* WINTPROXY_PATH_RETURN_H */
