@@ -430,7 +430,7 @@ error_t ndisapi_start(ndisapi_engine_t *engine, app_config_t *config,
         if (err_code == 2) {
             LOG_ERROR("ndisrd.sys driver not found — install WinpkFilter driver");
         } else if (err_code == 5) {
-            LOG_ERROR("Access denied — run as Administrator");
+            LOG_ERROR("Access denied — is the WinpkFilter driver installed?");
         }
         engine->running = 0;
         return ERR_PERMISSION;

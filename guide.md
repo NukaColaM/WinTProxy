@@ -20,7 +20,6 @@ cmake --build build-release
 ## Runtime Requirements
 
 - Windows 10 or later, 64-bit.
-- Administrator privileges.
 - [WinpkFilter / ndisapi](https://github.com/wiresock/ndisapi/releases) runtime DLL next to `WinTProxy.exe`:
   - `ndisapi.dll`
 - The ndisrd.sys kernel driver must be installed (use the installer from releases — handles signing/test-signing for you).

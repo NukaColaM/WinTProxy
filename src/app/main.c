@@ -114,8 +114,7 @@ static void print_usage(const char *prog) {
         "  %s --config config.json\n"
         "  %s --config config.json -vv\n"
         "\n"
-        "NOTE: Must run as Administrator (ndisapi requires kernel access).\n"
-        "      Install WinpkFilter driver (ndisrd.sys) and place ndisapi.dll\n"
+        "NOTE: Install WinpkFilter driver (ndisrd.sys) and place ndisapi.dll\n"
         "      next to WinTProxy.exe.  See https://github.com/wiresock/ndisapi\n",
         prog, prog, prog);
 }
