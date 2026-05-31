@@ -16,6 +16,10 @@
 #define SOCKS5_ATYP_IPV4   0x01
 #define SOCKS5_RSV          0x00
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #pragma pack(push, 1)
 typedef struct {
     uint16_t rsv;
@@ -34,5 +38,9 @@ int socks5_udp_wrap(uint8_t *buf, int buf_size, uint32_t dst_ip, uint16_t dst_po
                     const uint8_t *payload, int payload_len);
 error_t socks5_udp_unwrap(const uint8_t *buf, int buf_len, uint32_t *src_ip,
                           uint16_t *src_port, const uint8_t **payload, int *payload_len);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

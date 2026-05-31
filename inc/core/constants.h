@@ -4,6 +4,9 @@
 #define WTP_TCP_RELAY_PORT             34010
 #define WTP_UDP_RELAY_PORT             34011
 
+#define WTP_IPPROTO_TCP                6
+#define WTP_IPPROTO_UDP                17
+
 /* ndisapi engine tunables are defined in inc/ndisapi/adapter.h */
 
 #define WTP_DNS_NAT_BUCKETS            256
@@ -27,11 +30,10 @@
 #define WTP_UDP_SESSION_MAX            256
 #define WTP_UDP_SESSION_BUCKETS        512
 #define WTP_UDP_SESSION_TTL_SEC        300
-#define WTP_UDP_RETRY_DELAY_MS         5000
 #define WTP_UDP_BUFFER_SIZE            65536
 
 #define WTP_TCP_RELAY_WORKER_MAX       32
-#define WTP_TCP_RELAY_CONN_MAX         8192
+#define WTP_TCP_RELAY_CONN_MAX         512
 #define WTP_TCP_RELAY_BUFFER_SIZE      32768
 #define WTP_TCP_MSS_CLAMP              1360
 #define WTP_TCP_RELAY_SRC_PORT_MIN     40000

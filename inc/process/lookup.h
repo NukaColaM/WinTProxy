@@ -77,8 +77,6 @@ typedef struct {
     proc_lookup_counters_t counters;
     volatile int       running;
     HANDLE             refresh_thread;
-    HANDLE             flow_handle;
-    HANDLE             flow_thread;
 } proc_lookup_t;
 
 error_t proc_lookup_init(proc_lookup_t *pl);

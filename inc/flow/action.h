@@ -28,6 +28,12 @@ typedef struct {
     HANDLE   adapter_handle;
 } traffic_dns_forward_t;
 
+/*
+ * Action descriptor — produced by planners, consumed by executor.
+ * Deliberately exposes PINTERMEDIATE_BUFFER (ndisapi internals) to avoid
+ * indirection in the hot path.  Callers treat ndis_buf and packet_ctx_t
+ * as opaque handles; only the executor and packet module manipulate them.
+ */
 typedef struct {
     traffic_action_type_t  type;
     packet_ctx_t          *ctx;

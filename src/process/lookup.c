@@ -178,7 +178,7 @@ static void collect_tcp_flows(proc_lookup_t *pl, size_t *count) {
         for (DWORD i = 0; i < table->dwNumEntries; i++) {
             MIB_TCPROW_OWNER_PID *row = &table->table[i];
             uint16_t port = (uint16_t)ntohs((u_short)row->dwLocalPort);
-            append_record(pl, count, row->dwLocalAddr, port, 6, row->dwOwningPid);
+            append_record(pl, count, row->dwLocalAddr, port, WTP_IPPROTO_TCP, row->dwOwningPid);
         }
     }
 
@@ -199,7 +199,7 @@ static void collect_udp_flows(proc_lookup_t *pl, size_t *count) {
         for (DWORD i = 0; i < table->dwNumEntries; i++) {
             MIB_UDPROW_OWNER_PID *row = &table->table[i];
             uint16_t port = (uint16_t)ntohs((u_short)row->dwLocalPort);
-            append_record(pl, count, row->dwLocalAddr, port, 17, row->dwOwningPid);
+            append_record(pl, count, row->dwLocalAddr, port, WTP_IPPROTO_UDP, row->dwOwningPid);
         }
     }
 
@@ -228,32 +228,14 @@ static void flow_insert_locked(proc_lookup_t *pl, const proc_flow_record_t *r) {
     pl->flow_buckets[idx] = e;
 }
 
-static void flow_cache_put(proc_lookup_t *pl, uint32_t ip, uint16_t port,
-                           uint8_t protocol, uint32_t pid, const char *name) {
-    proc_flow_record_t r;
-    unsigned int idx = flow_hash(ip, port, protocol);
-    memset(&r, 0, sizeof(r));
-    r.ip = ip;
-    r.port = port;
-    r.protocol = protocol;
-    r.pid = pid;
-    safe_str_copy(r.name, sizeof(r.name), name && name[0] ? name : "unknown");
-
-    AcquireSRWLockExclusive(&pl->flow_lock);
-    for (proc_flow_entry_t *e = pl->flow_buckets[idx]; e; e = e->next) {
-        if (e->ip == ip && e->port == port && e->protocol == protocol) {
-            e->pid = pid;
-            safe_str_copy(e->name, sizeof(e->name), r.name);
-            ReleaseSRWLockExclusive(&pl->flow_lock);
-            return;
-        }
-    }
-    flow_insert_locked(pl, &r);
-    ReleaseSRWLockExclusive(&pl->flow_lock);
-}
-
 static void proc_lookup_refresh_locked(proc_lookup_t *pl) {
     size_t count = 0;
+
+    /*
+     * Lock ordering: refresh_lock → flow_lock → pid_lock.
+     * Caller holds refresh_lock; this function acquires flow_lock.
+     * proc_name_for_pid may acquire pid_lock internally.
+     */
 
     collect_tcp_flows(pl, &count);
     collect_udp_flows(pl, &count);
@@ -343,11 +325,9 @@ error_t proc_lookup_init(proc_lookup_t *pl) {
     }
     pl->self_pid = GetCurrentProcessId();
     pl->running = 1;
-    pl->flow_handle = INVALID_HANDLE_VALUE;
 
     proc_lookup_refresh(pl);
 
-    pl->flow_handle = INVALID_HANDLE_VALUE;
     LOG_INFO("Process flow watcher not available (ndisapi); owner-table refresh only");
 
     pl->refresh_thread = CreateThread(NULL, 0, refresh_thread_proc, pl, 0, NULL);
@@ -471,19 +451,19 @@ static uint32_t proc_lookup_flow_retry(proc_lookup_t *pl, uint32_t src_ip, uint1
 }
 
 uint32_t proc_lookup_tcp(proc_lookup_t *pl, uint32_t src_ip, uint16_t src_port, char *name_out, int name_len) {
-    return proc_lookup_flow(pl, src_ip, src_port, 6, name_out, name_len);
+    return proc_lookup_flow(pl, src_ip, src_port, WTP_IPPROTO_TCP, name_out, name_len);
 }
 
 uint32_t proc_lookup_udp(proc_lookup_t *pl, uint32_t src_ip, uint16_t src_port, char *name_out, int name_len) {
-    return proc_lookup_flow(pl, src_ip, src_port, 17, name_out, name_len);
+    return proc_lookup_flow(pl, src_ip, src_port, WTP_IPPROTO_UDP, name_out, name_len);
 }
 
 uint32_t proc_lookup_tcp_retry(proc_lookup_t *pl, uint32_t src_ip, uint16_t src_port, char *name_out, int name_len) {
-    return proc_lookup_flow_retry(pl, src_ip, src_port, 6, name_out, name_len);
+    return proc_lookup_flow_retry(pl, src_ip, src_port, WTP_IPPROTO_TCP, name_out, name_len);
 }
 
 uint32_t proc_lookup_udp_retry(proc_lookup_t *pl, uint32_t src_ip, uint16_t src_port, char *name_out, int name_len) {
-    return proc_lookup_flow_retry(pl, src_ip, src_port, 17, name_out, name_len);
+    return proc_lookup_flow_retry(pl, src_ip, src_port, WTP_IPPROTO_UDP, name_out, name_len);
 }
 
 int proc_is_self(proc_lookup_t *pl, uint32_t pid) {

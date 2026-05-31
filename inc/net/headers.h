@@ -26,6 +26,13 @@ typedef struct ether_header {
 
 typedef ether_header_t *ether_header_ptr;
 
+static inline void swap_ether_addrs(ether_header_ptr eth) {
+    uint8_t tmp[ETHER_ADDR_LEN];
+    memcpy(tmp, eth->h_dest, ETHER_ADDR_LEN);
+    memcpy(eth->h_dest, eth->h_source, ETHER_ADDR_LEN);
+    memcpy(eth->h_source, tmp, ETHER_ADDR_LEN);
+}
+
 /* === IPv4 === */
 
 typedef struct iphdr {

@@ -15,6 +15,10 @@
 #define CONNTRACK_CLEANUP_INTERVAL_SEC WTP_CONNTRACK_CLEANUP_SEC
 #define CONNTRACK_POOL_SIZE            WTP_CONNTRACK_POOL_SIZE
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct conntrack_entry_s {
     uint32_t key_src_ip;
     uint32_t key_dst_ip;
@@ -77,6 +81,12 @@ error_t conntrack_add_key_full(conntrack_t *ct, uint32_t key_src_ip, uint16_t ke
                                uint8_t protocol, uint32_t pid, const char *process_name,
                                uint32_t if_idx, uint32_t sub_if_idx,
                                uint16_t relay_src_port);
+/*
+ * Lookup functions return a snapshot copy of the entry under shared lock.
+ * The copy is safe for immediate use but invalid after any conntrack mutation
+ * (add/remove/touch) or after the next cleanup cycle (TTL expiry).
+ * Callers must consume the copy synchronously — do not cache the pointer.
+ */
 error_t conntrack_get(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol,
                       uint32_t *orig_dst_ip, uint16_t *orig_dst_port);
 error_t conntrack_get_full(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol,
@@ -91,5 +101,9 @@ void    conntrack_touch(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uin
 void    conntrack_touch_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_port,
                             uint32_t dst_ip, uint16_t dst_port, uint8_t protocol);
 void    conntrack_snapshot_counters(conntrack_t *ct, conntrack_counters_t *out);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

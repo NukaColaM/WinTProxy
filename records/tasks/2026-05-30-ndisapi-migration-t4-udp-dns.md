@@ -1,6 +1,6 @@
 # UDP proxy path + non-loopback DNS hijack
 
-**Status**: complete
+**Status**: done
 **Serial**: T4
 **Spec**: ../specs/2026-05-30-ndisapi-migration.md
 **Depends on**: T3 (TCP proxy + relay changes must exist — UDP shares conntrack, relay infrastructure, and the ndisapi executor)

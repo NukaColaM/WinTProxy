@@ -1,6 +1,6 @@
 # TCP proxy path (MSTCP revert) + relay adaptation
 
-**Status**: complete
+**Status**: done
 **Serial**: T3
 **Spec**: ../specs/2026-05-30-ndisapi-migration.md
 **Depends on**: T2 (classification must be wired in so POLICY-classified packets reach the proxy path, and return-path classification works)

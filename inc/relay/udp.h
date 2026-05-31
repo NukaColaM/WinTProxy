@@ -15,7 +15,6 @@
 #define UDP_SESSION_MAX     WTP_UDP_SESSION_MAX
 #define UDP_SESSION_BUCKETS WTP_UDP_SESSION_BUCKETS
 #define UDP_SESSION_TTL_SEC WTP_UDP_SESSION_TTL_SEC
-#define UDP_RETRY_DELAY_MS  WTP_UDP_RETRY_DELAY_MS
 
 typedef struct {
     int              active;
@@ -26,7 +25,6 @@ typedef struct {
     SOCKET           relay_sock;
     struct sockaddr_in relay_addr;
     uint64_t         last_activity;
-    uint64_t         last_retry;
     int              active_prev;
     int              active_next;
     int              next_index;

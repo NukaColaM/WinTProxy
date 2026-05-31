@@ -1,6 +1,6 @@
 # Classification + bypass + direction model
 
-**Status**: complete
+**Status**: done
 **Serial**: T2
 **Spec**: ../specs/2026-05-30-ndisapi-migration.md
 **Depends on**: T1 (ndisapi engine, packet parsing, pass-through loop must exist before classification can be wired in)

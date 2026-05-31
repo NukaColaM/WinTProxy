@@ -1,6 +1,6 @@
 # ndisapi adapter integration + basic pass-through
 
-**Status**: complete
+**Status**: done
 **Serial**: T1
 **Spec**: ../specs/2026-05-30-ndisapi-migration.md
 **Depends on**: T0 (none — this task stands alone)

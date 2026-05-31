@@ -106,21 +106,3 @@ traffic_class_t traffic_classify_packet(ndisapi_engine_t *engine,
     /* === Default: policy-based routing === */
     return TRAFFIC_CLASS_POLICY;
 }
-
-const char *traffic_class_name(traffic_class_t cls) {
-    switch (cls) {
-    case TRAFFIC_CLASS_INBOUND:              return "inbound";
-    case TRAFFIC_CLASS_DNS_RESPONSE:         return "dns-response";
-    case TRAFFIC_CLASS_TCP_DNS_RETURN:       return "tcp-dns-return";
-    case TRAFFIC_CLASS_TCP_RETURN:           return "tcp-return";
-    case TRAFFIC_CLASS_UDP_RETURN:           return "udp-return";
-    case TRAFFIC_CLASS_SELF_PROXY:           return "self-proxy";
-    case TRAFFIC_CLASS_SELF_RELAY:           return "self-relay";
-    case TRAFFIC_CLASS_SELF_DNS:             return "self-dns";
-    case TRAFFIC_CLASS_DNS_QUERY_UDP:        return "dns-query-udp";
-    case TRAFFIC_CLASS_DNS_QUERY_TCP:        return "dns-query-tcp";
-    case TRAFFIC_CLASS_NON_PROXYABLE:        return "non-proxyable";
-    case TRAFFIC_CLASS_POLICY:               return "policy";
-    }
-    return "unknown";
-}

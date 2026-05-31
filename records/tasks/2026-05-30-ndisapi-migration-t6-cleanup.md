@@ -1,6 +1,6 @@
 # Cleanup, docs, final removal of WinDivert references
 
-**Status**: complete
+**Status**: done
 **Serial**: T6
 **Spec**: ../specs/2026-05-30-ndisapi-migration.md
 **Depends on**: T5 (all DNS modes must be working before docs describe them as features)

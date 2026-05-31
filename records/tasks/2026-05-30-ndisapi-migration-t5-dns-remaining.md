@@ -1,6 +1,6 @@
 # DNS hijack — loopback UDP + TCP DNS (both resolver types)
 
-**Status**: complete
+**Status**: done
 **Serial**: T5
 **Spec**: ../specs/2026-05-30-ndisapi-migration.md
 **Depends on**: T4 (UDP DNS non-loopback and UDP proxy path — loopback UDP DNS and TCP DNS build on the same DNS plan/forwarder infrastructure)

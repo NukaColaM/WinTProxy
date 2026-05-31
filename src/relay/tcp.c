@@ -92,9 +92,9 @@ static void close_socket_if_valid(SOCKET *sock) {
 
 static void tcp_conn_touch_conntrack(tcp_conn_t *conn) {
     conntrack_touch_key(conn->relay->conntrack, conn->lookup_ip, conn->client_port,
-                        conn->lookup_dst_ip, conn->lookup_dst_port, 6);
+                        conn->lookup_dst_ip, conn->lookup_dst_port, WTP_IPPROTO_TCP);
     conntrack_touch_key(conn->relay->conntrack, conn->client_ip, conn->orig_client_port,
-                        conn->connect_dst_ip, conn->connect_dst_port, 6);
+                        conn->connect_dst_ip, conn->connect_dst_port, WTP_IPPROTO_TCP);
 }
 
 static void tcp_conn_release(tcp_conn_t *conn);
@@ -451,10 +451,10 @@ static void tcp_conn_start(tcp_relay_t *relay, SOCKET client) {
         if (conntrack_get_full_key(relay->conntrack,
                                    conn->client_ip, conn->client_port,
                                    local.sin_addr.s_addr, relay->port,
-                                   6, &entry) == ERR_OK) {
+                                   WTP_IPPROTO_TCP, &entry) == ERR_OK) {
             conn->lookup_ip = entry.key_src_ip;
         } else if (conntrack_get_full(relay->conntrack, conn->client_ip,
-                                       conn->client_port, 6, &entry) == ERR_OK) {
+                                       conn->client_port, WTP_IPPROTO_TCP, &entry) == ERR_OK) {
             conn->lookup_ip = entry.key_src_ip;
         } else {
             LOG_WARN("TCP relay: no conntrack entry for %s:%u",

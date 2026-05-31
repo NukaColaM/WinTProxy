@@ -116,7 +116,7 @@ static int plan_tcp_non_syn_tracked(ndisapi_engine_t *engine, packet_ctx_t *ctx,
     conntrack_entry_t entry;
 
     if (conntrack_get_full_key(engine->conntrack, ctx->src_ip, ctx->src_port,
-                               ctx->dst_ip, ctx->dst_port, 6, &entry) != ERR_OK)
+                               ctx->dst_ip, ctx->dst_port, WTP_IPPROTO_TCP, &entry) != ERR_OK)
         return 0;
 
     /* Swap IPs: client→server becomes server→client */
@@ -126,12 +126,7 @@ static int plan_tcp_non_syn_tracked(ndisapi_engine_t *engine, packet_ctx_t *ctx,
     ctx->tcp_hdr->th_dport = htons(engine->tcp_relay_port);
 
     /* Swap Ethernet addresses */
-    {
-        uint8_t tmp[6];
-        memcpy(tmp, ctx->eth_hdr->h_dest, 6);
-        memcpy(ctx->eth_hdr->h_dest, ctx->eth_hdr->h_source, 6);
-        memcpy(ctx->eth_hdr->h_source, tmp, 6);
-    }
+    swap_ether_addrs(ctx->eth_hdr);
 
     /* Deliver to MSTCP (revert: ON_SEND → up the stack) */
     ctx->ndis_buf->m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;
@@ -237,7 +232,7 @@ void path_plan_policy(ndisapi_engine_t *engine, packet_ctx_t *ctx,
         return;
     }
 
-    uint16_t relay_port = (ctx->protocol == 6) ?
+    uint16_t relay_port = (ctx->protocol == WTP_IPPROTO_TCP) ?
         engine->tcp_relay_port : engine->udp_relay_port;
     LOG_TRACE("PROXY: rule=%s %s [%u] -> %s:%u via relay :%u (%s)",
         rule_str, proc_name[0] ? proc_name : "?", pid,
@@ -271,12 +266,7 @@ void path_plan_policy(ndisapi_engine_t *engine, packet_ctx_t *ctx,
         /* th_sport already set to relay_src_port by add_proxy_conntrack */
 
         /* Swap Ethernet MACs */
-        {
-            uint8_t tmp[6];
-            memcpy(tmp, ctx->eth_hdr->h_dest, 6);
-            memcpy(ctx->eth_hdr->h_dest, ctx->eth_hdr->h_source, 6);
-            memcpy(ctx->eth_hdr->h_source, tmp, 6);
-        }
+        swap_ether_addrs(ctx->eth_hdr);
 
         /* Revert: deliver to MSTCP instead of adapter */
         ctx->ndis_buf->m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;

@@ -252,6 +252,13 @@ static int ensure_session(udp_relay_t *relay, uint32_t client_ip, uint16_t clien
     uint32_t generation = 0;
     int had_session = 0;
 
+    /*
+     * Locking: shared lock for fast path (existing session), exclusive only
+     * on the slow path (new session or ctrl_sock cleanup).  Contention is
+     * low in practice since session creation is infrequent after warm-up.
+     * TODO: session_lock could be split into a read/write lock per bucket
+     * if hot-path contention ever becomes measurable.
+     */
     AcquireSRWLockShared(&relay->session_lock);
     {
         udp_session_t *s = find_session(relay, client_ip, client_port);
@@ -321,7 +328,6 @@ static int ensure_session(udp_relay_t *relay, uint32_t client_ip, uint16_t clien
         s->relay_sock = new_udp;
         s->relay_addr = new_relay_addr;
         s->last_activity = now;
-        s->last_retry = now;
         link_session(relay, s);
         counter_inc(&relay->counters.created_sessions);
         counter_inc(&relay->counters.active_sessions);
@@ -424,7 +430,7 @@ static void handle_client_datagram(udp_relay_t *relay, uint8_t *recv_buf, int n,
     udp_payload = recv_buf + 6;
     udp_payload_len = n - 6;
 
-    if (conntrack_get(relay->conntrack, client_ip, client_port, 17, &orig_dst_ip, &orig_dst_port) != ERR_OK) {
+    if (conntrack_get(relay->conntrack, client_ip, client_port, WTP_IPPROTO_UDP, &orig_dst_ip, &orig_dst_port) != ERR_OK) {
         LOG_TRACE("UDP relay: no conntrack for port %u, dropping", client_port);
         counter_inc(&relay->counters.dropped_datagrams);
         return;
@@ -487,7 +493,7 @@ static void handle_proxy_datagram(udp_relay_t *relay, udp_session_snapshot_t *sn
                 uint32_t orig_ip = 0;
                 uint16_t orig_port = 0;
                 if (conntrack_get(relay->conntrack, snapshot->client_ip,
-                                  snapshot->client_port, 17,
+                                  snapshot->client_port, WTP_IPPROTO_UDP,
                                   &orig_ip, &orig_port) == ERR_OK && orig_ip != 0) {
                     dst_ip = orig_ip;
                 }

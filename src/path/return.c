@@ -14,7 +14,7 @@
 
 void path_plan_return(ndisapi_engine_t *engine, packet_ctx_t *ctx,
                       int is_tcp, traffic_action_t *action) {
-    uint8_t proto_num = is_tcp ? 6 : 17;
+    uint8_t proto_num = is_tcp ? WTP_IPPROTO_TCP : WTP_IPPROTO_UDP;
     conntrack_entry_t entry;
     error_t err;
 
@@ -79,12 +79,7 @@ void path_plan_return(ndisapi_engine_t *engine, packet_ctx_t *ctx,
     }
 
     /* Swap Ethernet MACs for the response */
-    {
-        uint8_t tmp[6];
-        memcpy(tmp, ctx->eth_hdr->h_dest, 6);
-        memcpy(ctx->eth_hdr->h_dest, ctx->eth_hdr->h_source, 6);
-        memcpy(ctx->eth_hdr->h_source, tmp, 6);
-    }
+    swap_ether_addrs(ctx->eth_hdr);
 
     /* Deliver to MSTCP (revert: this was ON_SEND, now send up the stack) */
     ctx->ndis_buf->m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;

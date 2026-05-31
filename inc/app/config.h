@@ -10,6 +10,10 @@
 #define RULE_IP_RANGE_MAX       32
 #define RULE_PORT_RANGE_MAX     32
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef enum {
     RULE_DECISION_PROXY  = 0,
     RULE_DECISION_DIRECT = 1
@@ -107,5 +111,9 @@ void    config_set_defaults(app_config_t *cfg);
 void    config_free(app_config_t *cfg);
 error_t config_apply_cli(app_config_t *cfg, int verbosity);
 void    config_dump(const app_config_t *cfg);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
