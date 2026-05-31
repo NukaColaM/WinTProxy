@@ -24,7 +24,7 @@ cmake -B build -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-toolchain.cmake
 cmake --build build
 ```
 
-Place `ndisapi.dll` and `ndisrd.sys` (from [WinpkFilter releases](https://github.com/wiresock/ndisapi/releases)) next to `WinTProxy.exe`. The ndisrd.sys driver must be trusted by Windows — either install the signed driver package or enable test-signing mode (`bcdedit /set testsigning on`). Run from an elevated Windows shell:
+Install the WinpkFilter driver (ndisrd.sys) using the installer from [WinpkFilter releases](https://github.com/wiresock/ndisapi/releases), then place `ndisapi.dll` next to `WinTProxy.exe`. Run from an elevated Windows shell:
 
 ```powershell
 WinTProxy.exe --config config.example.json

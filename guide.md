@@ -21,9 +21,9 @@ cmake --build build-release
 
 - Windows 10 or later, 64-bit.
 - Administrator privileges.
-- [WinpkFilter / ndisapi](https://github.com/wiresock/ndisapi/releases) runtime files next to `WinTProxy.exe`:
+- [WinpkFilter / ndisapi](https://github.com/wiresock/ndisapi/releases) runtime DLL next to `WinTProxy.exe`:
   - `ndisapi.dll`
-  - `ndisrd.sys` (kernel driver; must be trusted — install the signed driver or enable test-signing: `bcdedit /set testsigning on`)
+- The ndisrd.sys kernel driver must be installed (use the installer from releases — handles signing/test-signing for you).
 - A SOCKS5 proxy reachable by IPv4 address.
 
 ## Running
