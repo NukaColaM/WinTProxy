@@ -12,6 +12,7 @@ endif()
 
 set(SOURCES
     src/app/main.c
+    src/app/lifecycle.c
     src/app/log.c
     src/app/config.c
     src/conntrack/conntrack.c

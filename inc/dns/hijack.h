@@ -14,6 +14,18 @@
 #define DNS_NAT_POOL_SIZE WTP_DNS_NAT_POOL_SIZE
 #define DNS_NAT_TTL_MS  WTP_DNS_NAT_TTL_MS
 
+#ifndef WSAETIMEDOUT
+#define WSAETIMEDOUT 10060
+#endif
+
+#ifndef WSAEINTR
+#define WSAEINTR 10004
+#endif
+
+#ifndef WSAENOTSOCK
+#define WSAENOTSOCK 10038
+#endif
+
 typedef struct dns_nat_entry_s {
     uint16_t src_port;
     uint16_t dns_txid;
@@ -52,6 +64,12 @@ error_t dns_hijack_init(dns_hijack_t *dh, int enabled, uint32_t redirect_ip, uin
 void dns_hijack_shutdown(dns_hijack_t *dh);
 
 int dns_hijack_is_dns_request(uint16_t dst_port);
+
+static inline int dns_hijack_should_log_forward_recv_error(int error_code) {
+    return error_code != WSAETIMEDOUT &&
+           error_code != WSAEINTR &&
+           error_code != WSAENOTSOCK;
+}
 
 int dns_hijack_rewrite_request(dns_hijack_t *dh, uint32_t *dst_ip, uint16_t *dst_port,
                                 uint16_t src_port, uint16_t dns_txid,

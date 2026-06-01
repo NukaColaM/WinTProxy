@@ -17,7 +17,8 @@
 #include <winsock2.h>
 
 static error_t add_proxy_conntrack(ndisapi_engine_t *engine, packet_ctx_t *ctx,
-                                   uint32_t pid, const char *proc_name) {
+                                   uint32_t pid, const char *proc_name,
+                                   uint16_t *relay_src_port_out) {
     conntrack_entry_t existing;
     uint16_t relay_src_port = ctx->src_port;
     uint32_t server_ip  = ctx->dst_ip;
@@ -86,8 +87,7 @@ static error_t add_proxy_conntrack(ndisapi_engine_t *engine, packet_ctx_t *ctx,
             relay_src_port = existing.relay_src_port;
         }
 
-        /* Update the TCP source port in the packet to relay_src_port */
-        ctx->tcp_hdr->th_sport = htons(relay_src_port);
+        if (relay_src_port_out) *relay_src_port_out = relay_src_port;
     } else if (ctx->udp_hdr) {
         err = conntrack_add(engine->conntrack, ctx->src_port, client_ip,
                             server_ip, server_port, ctx->protocol,
@@ -105,6 +105,7 @@ static error_t add_proxy_conntrack(ndisapi_engine_t *engine, packet_ctx_t *ctx,
         }
     }
 
+    if (relay_src_port_out && !ctx->tcp_hdr) *relay_src_port_out = relay_src_port;
     return err;
 }
 
@@ -115,24 +116,30 @@ static int plan_tcp_non_syn_tracked(ndisapi_engine_t *engine, packet_ctx_t *ctx,
                                     traffic_action_t *action) {
     conntrack_entry_t entry;
 
-    if (conntrack_get_full_key(engine->conntrack, ctx->src_ip, ctx->src_port,
-                               ctx->dst_ip, ctx->dst_port, WTP_IPPROTO_TCP, &entry) != ERR_OK)
+    if (conntrack_get_tcp_proxy_outbound(engine->conntrack, ctx->src_ip,
+                                         ctx->src_port, ctx->dst_ip,
+                                         ctx->dst_port, &entry) != ERR_OK) {
         return 0;
+    }
 
-    /* Swap IPs: client→server becomes server→client */
-    ctx->ip_hdr->ip_src  = ctx->dst_ip;    /* server */
-    ctx->ip_hdr->ip_dst  = entry.src_ip;   /* client */
-    ctx->tcp_hdr->th_sport = htons(entry.relay_src_port);
-    ctx->tcp_hdr->th_dport = htons(engine->tcp_relay_port);
-
-    /* Swap Ethernet addresses */
-    swap_ether_addrs(ctx->eth_hdr);
-
-    /* Deliver to MSTCP (revert: ON_SEND → up the stack) */
-    ctx->ndis_buf->m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;
+    if (entry.relay_src_port == 0) {
+        conntrack_touch_key(engine->conntrack, entry.key_src_ip,
+                            entry.src_port, entry.key_dst_ip,
+                            entry.key_dst_port, entry.protocol);
+        traffic_action_pass(action, ctx, ctx->ndis_buf,
+                            "TCP tracked direct");
+        return 1;
+    }
 
     traffic_action_rewrite_send(action, ctx, ctx->ndis_buf,
                                 "TCP tracked non-SYN");
+    traffic_action_rewrite_ip_src(action, ctx->dst_ip);
+    traffic_action_rewrite_ip_dst(action, entry.src_ip);
+    traffic_action_rewrite_tcp_sport(action, entry.relay_src_port);
+    traffic_action_rewrite_tcp_dport(action, engine->tcp_relay_port);
+    traffic_action_rewrite_swap_eth(action);
+    traffic_action_rewrite_clamp_tcp_mss(action, WTP_TCP_MSS_CLAMP);
+    traffic_action_set_send_target(action, TRAFFIC_SEND_TO_MSTCP);
     return 1;
 }
 
@@ -156,7 +163,8 @@ static void plan_tcp_non_syn_untracked(ndisapi_engine_t *engine, packet_ctx_t *c
                                   ctx->protocol, NULL);
 
     if (decision == RULE_DECISION_DIRECT) {
-        traffic_action_pass(action, ctx, ctx->ndis_buf, "TCP non-SYN direct");
+        traffic_action_drop(action, ctx, ctx->ndis_buf,
+                            "preexisting direct tcp");
         return;
     }
 
@@ -171,6 +179,7 @@ void path_plan_policy(ndisapi_engine_t *engine, packet_ctx_t *ctx,
     char rule_str[16];
     uint32_t pid = 0;
     int matched_rule_id = 0;
+    uint16_t relay_src_port = 0;
 
     if (ctx->tcp_hdr) {
         if (ctx->tcp_hdr->th_flags & TH_SYN &&
@@ -224,22 +233,45 @@ void path_plan_policy(ndisapi_engine_t *engine, packet_ctx_t *ctx,
         safe_str_copy(rule_str, sizeof(rule_str), "default");
 
     if (decision == RULE_DECISION_DIRECT) {
-        LOG_TRACE("DIRECT: rule=%s %s [%u] -> %s:%u (%s)",
+        LOG_DEBUG("DIRECT: rule=%s %s [%u] -> %s:%u (%s)",
             rule_str, proc_name[0] ? proc_name : "?", pid,
             dst_str, ctx->dst_port,
             ctx->protocol == 6 ? "TCP" : "UDP");
+        if (ctx->tcp_hdr) {
+            uint32_t if_idx = 0;
+            if (ctx->ndis_buf) {
+                if_idx = (uint32_t)(uintptr_t)ctx->ndis_buf->m_hAdapter;
+            }
+            if (conntrack_add_key_full(engine->conntrack,
+                                       ctx->src_ip, ctx->src_port,
+                                       ctx->dst_ip, ctx->dst_port,
+                                       ctx->src_ip, ctx->src_port,
+                                       ctx->dst_ip, ctx->dst_port,
+                                       ctx->dst_ip, ctx->dst_port,
+                                       ctx->protocol, pid, proc_name,
+                                       if_idx, 0, 0) != ERR_OK) {
+                LOG_WARN("DIRECT: conntrack unavailable for %s [%u] -> %s:%u "
+                         "(%s), dropping",
+                         proc_name[0] ? proc_name : "?", pid,
+                         dst_str, ctx->dst_port,
+                         ctx->protocol == 6 ? "TCP" : "UDP");
+                traffic_action_drop(action, ctx, ctx->ndis_buf,
+                                    "direct conntrack unavailable");
+                return;
+            }
+        }
         traffic_action_pass(action, ctx, ctx->ndis_buf, "direct");
         return;
     }
 
     uint16_t relay_port = (ctx->protocol == WTP_IPPROTO_TCP) ?
         engine->tcp_relay_port : engine->udp_relay_port;
-    LOG_TRACE("PROXY: rule=%s %s [%u] -> %s:%u via relay :%u (%s)",
+    LOG_DEBUG("PROXY: rule=%s %s [%u] -> %s:%u via relay :%u (%s)",
         rule_str, proc_name[0] ? proc_name : "?", pid,
         dst_str, ctx->dst_port, relay_port,
         ctx->protocol == 6 ? "TCP" : "UDP");
 
-    if (add_proxy_conntrack(engine, ctx, pid, proc_name) != ERR_OK) {
+    if (add_proxy_conntrack(engine, ctx, pid, proc_name, &relay_src_port) != ERR_OK) {
         LOG_WARN("PROXY: conntrack unavailable for %s [%u] -> %s:%u (%s), "
                  "dropping",
             proc_name[0] ? proc_name : "?", pid, dst_str, ctx->dst_port,
@@ -257,33 +289,15 @@ void path_plan_policy(ndisapi_engine_t *engine, packet_ctx_t *ctx,
     }
 
     if (ctx->tcp_hdr) {
-        packet_clamp_tcp_mss(ctx, WTP_TCP_MSS_CLAMP);
-
-        /* Swap IP addresses: client→server becomes server→client */
-        ctx->ip_hdr->ip_src = ctx->dst_ip;   /* original server */
-        ctx->ip_hdr->ip_dst = ctx->src_ip;   /* original client */
-        ctx->tcp_hdr->th_dport = htons(relay_port);
-        /* th_sport already set to relay_src_port by add_proxy_conntrack */
-
-        /* Swap Ethernet MACs */
-        swap_ether_addrs(ctx->eth_hdr);
-
-        /* Revert: deliver to MSTCP instead of adapter */
-        ctx->ndis_buf->m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;
-
-        {
-            char sip[16], dip[16];
-            ip_to_str(ctx->ip_hdr->ip_src, sip, sizeof(sip));
-            ip_to_str(ctx->ip_hdr->ip_dst, dip, sizeof(dip));
-            LOG_TRACE("MSTCP inject: %s:%u -> %s:%u SYN=%d ACK=%d",
-                      sip, ntohs(ctx->tcp_hdr->th_sport),
-                      dip, ntohs(ctx->tcp_hdr->th_dport),
-                      (ctx->tcp_hdr->th_flags & TH_SYN) ? 1 : 0,
-                      (ctx->tcp_hdr->th_flags & TH_ACK) ? 1 : 0);
-        }
-
         traffic_action_rewrite_send(action, ctx, ctx->ndis_buf,
                                     "TCP PROXY redirect");
+        traffic_action_rewrite_ip_src(action, ctx->dst_ip);
+        traffic_action_rewrite_ip_dst(action, ctx->src_ip);
+        traffic_action_rewrite_tcp_sport(action, relay_src_port);
+        traffic_action_rewrite_tcp_dport(action, relay_port);
+        traffic_action_rewrite_swap_eth(action);
+        traffic_action_rewrite_clamp_tcp_mss(action, WTP_TCP_MSS_CLAMP);
+        traffic_action_set_send_target(action, TRAFFIC_SEND_TO_MSTCP);
     } else {
         /* UDP: forward to relay (unchanged T4) */
         traffic_action_forward_udp(action, ctx, ctx->ndis_buf,

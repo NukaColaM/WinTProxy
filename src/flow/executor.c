@@ -16,13 +16,50 @@
  *
  * For T1 pass-through, we use the flag directly.
  */
-static int send_buf(ndisapi_engine_t *engine, PINTERMEDIATE_BUFFER buf) {
+static int send_buf(ndisapi_engine_t *engine, PINTERMEDIATE_BUFFER buf,
+                    traffic_send_target_t target) {
     if (!buf) return 0;
+
+    if (target == TRAFFIC_SEND_TO_ADAPTER) {
+        return ndisapi_send_to_adapter(engine, buf);
+    }
+    if (target == TRAFFIC_SEND_TO_MSTCP) {
+        return ndisapi_send_to_mstcp(engine, buf);
+    }
 
     if (buf->m_dwDeviceFlags & PACKET_FLAG_ON_SEND) {
         return ndisapi_send_to_adapter(engine, buf);
-    } else {
-        return ndisapi_send_to_mstcp(engine, buf);
+    }
+    return ndisapi_send_to_mstcp(engine, buf);
+}
+
+static void apply_packet_rewrite(packet_ctx_t *ctx,
+                                 const traffic_packet_rewrite_t *rewrite) {
+    if (!ctx || !rewrite) return;
+
+    if ((rewrite->flags & TRAFFIC_PACKET_REWRITE_IP_SRC) && ctx->ip_hdr) {
+        ctx->ip_hdr->ip_src = rewrite->ip_src;
+    }
+    if ((rewrite->flags & TRAFFIC_PACKET_REWRITE_IP_DST) && ctx->ip_hdr) {
+        ctx->ip_hdr->ip_dst = rewrite->ip_dst;
+    }
+    if ((rewrite->flags & TRAFFIC_PACKET_REWRITE_TCP_SPORT) && ctx->tcp_hdr) {
+        ctx->tcp_hdr->th_sport = htons(rewrite->tcp_sport);
+    }
+    if ((rewrite->flags & TRAFFIC_PACKET_REWRITE_TCP_DPORT) && ctx->tcp_hdr) {
+        ctx->tcp_hdr->th_dport = htons(rewrite->tcp_dport);
+    }
+    if ((rewrite->flags & TRAFFIC_PACKET_REWRITE_UDP_SPORT) && ctx->udp_hdr) {
+        ctx->udp_hdr->uh_sport = htons(rewrite->udp_sport);
+    }
+    if ((rewrite->flags & TRAFFIC_PACKET_REWRITE_UDP_DPORT) && ctx->udp_hdr) {
+        ctx->udp_hdr->uh_dport = htons(rewrite->udp_dport);
+    }
+    if (rewrite->flags & TRAFFIC_PACKET_REWRITE_SWAP_ETH) {
+        swap_ether_addrs(ctx->eth_hdr);
+    }
+    if ((rewrite->flags & TRAFFIC_PACKET_REWRITE_CLAMP_TCP_MSS) && ctx->tcp_hdr) {
+        packet_clamp_tcp_mss(ctx, rewrite->tcp_mss);
     }
 }
 
@@ -32,14 +69,15 @@ void traffic_execute_action(ndisapi_engine_t *engine, traffic_action_t *action) 
     switch (action->type) {
     case TRAFFIC_ACTION_PASS:
         if (action->ndis_buf) {
-            send_buf(engine, action->ndis_buf);
+            send_buf(engine, action->ndis_buf, action->send_target);
         }
         break;
 
     case TRAFFIC_ACTION_REWRITE_SEND:
         if (action->ctx && action->ndis_buf) {
+            apply_packet_rewrite(action->ctx, &action->rewrite);
             packet_recalculate_checksums(action->ctx);
-            send_buf(engine, action->ndis_buf);
+            send_buf(engine, action->ndis_buf, action->send_target);
         }
         break;
 
@@ -110,7 +148,7 @@ void traffic_execute_action(ndisapi_engine_t *engine, traffic_action_t *action) 
                      "passing original query", err);
             /* Fallback: pass the original packet through */
             if (action->ndis_buf) {
-                send_buf(engine, action->ndis_buf);
+                send_buf(engine, action->ndis_buf, action->send_target);
             }
         }
         break;

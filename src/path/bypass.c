@@ -25,7 +25,7 @@ void path_plan_bypass(ndisapi_engine_t *engine, packet_ctx_t *ctx,
         char src_str[16], dst_str[16];
         ip_to_str(ctx->src_ip, src_str, sizeof(src_str));
         ip_to_str(ctx->dst_ip, dst_str, sizeof(dst_str));
-        LOG_TRACE("DIRECT [%s]: reason=%s %s %s:%u -> %s:%u",
+        LOG_DEBUG("DIRECT [%s]: reason=%s %s %s:%u -> %s:%u",
                   adapter_name_for_handle(engine, ctx->adapter_handle),
                   reason ? reason : "bypass",
                   ctx->tcp_hdr ? "TCP" : "UDP",
@@ -33,25 +33,14 @@ void path_plan_bypass(ndisapi_engine_t *engine, packet_ctx_t *ctx,
                   dst_str, ctx->dst_port);
     }
 
-    /*
-     * Self-traffic with a loopback destination originates from MSTCP and
-     * must be delivered back to MSTCP for local processing.  If we leave
-     * the ON_SEND flag set, send_buf() routes the packet to the physical
-     * adapter, which silently drops loopback destinations.
-     *
-     * Only flip the direction for packets destined to loopback addresses
-     * (127.0.0.0/8).  Other self-traffic (e.g. proxy on a LAN IP) and
-     * all NON_PROXYABLE traffic should keep their original direction so
-     * they reach the physical adapter.
-     */
-    if (ctx && ctx->ndis_buf &&
-        (ctx->ndis_buf->m_dwDeviceFlags & PACKET_FLAG_ON_SEND) &&
-        (ctx->dst_ip & 0x0000007FU) == 0x0000007FU) {
-        /* 0x7F in the low byte (little-endian network order) = 127.x.x.x */
-        ctx->ndis_buf->m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;
-    }
-
     traffic_action_pass(action, ctx,
                         ctx ? ctx->ndis_buf : NULL,
                         reason ? reason : "bypass");
+
+    if (ctx && ctx->ndis_buf &&
+        (ctx->dst_ip & 0x000000FFU) == 0x0000007FU) {
+        traffic_action_set_send_target(action, TRAFFIC_SEND_TO_MSTCP);
+    } else {
+        traffic_action_set_send_target(action, TRAFFIC_SEND_DEFAULT);
+    }
 }

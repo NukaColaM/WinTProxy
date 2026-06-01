@@ -306,6 +306,40 @@ error_t conntrack_get_full_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_po
     return ERR_NOT_FOUND;
 }
 
+error_t conntrack_get_tcp_proxy_outbound(conntrack_t *ct, uint32_t client_ip,
+                                         uint16_t client_port,
+                                         uint32_t server_ip,
+                                         uint16_t server_port,
+                                         conntrack_entry_t *out) {
+    return conntrack_get_full_key(ct, client_ip, client_port,
+                                  server_ip, server_port,
+                                  WTP_IPPROTO_TCP, out);
+}
+
+error_t conntrack_get_tcp_proxy_return(conntrack_t *ct, uint32_t relay_src_ip,
+                                       uint16_t relay_src_port,
+                                       uint32_t relay_dst_ip,
+                                       uint16_t relay_dst_port,
+                                       conntrack_entry_t *out) {
+    return conntrack_get_full_key(ct, relay_src_ip, relay_src_port,
+                                  relay_dst_ip, relay_dst_port,
+                                  WTP_IPPROTO_TCP, out);
+}
+
+error_t conntrack_get_udp_proxy_outbound(conntrack_t *ct, uint32_t client_ip,
+                                         uint16_t client_port,
+                                         conntrack_entry_t *out) {
+    return conntrack_get_full(ct, client_ip, client_port,
+                              WTP_IPPROTO_UDP, out);
+}
+
+error_t conntrack_get_udp_proxy_return(conntrack_t *ct, uint32_t server_ip,
+                                       uint16_t client_port,
+                                       conntrack_entry_t *out) {
+    return conntrack_get_full(ct, server_ip, client_port,
+                              WTP_IPPROTO_UDP, out);
+}
+
 void conntrack_remove(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol) {
     conntrack_remove_key(ct, src_ip, src_port, 0, 0, protocol);
 }
@@ -352,6 +386,36 @@ void conntrack_touch_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_port,
     }
 
     ReleaseSRWLockExclusive(&ct->locks[idx]);
+}
+
+void conntrack_touch_tcp_proxy_outbound(conntrack_t *ct,
+                                        const conntrack_entry_t *entry) {
+    if (!ct || !entry) return;
+    conntrack_touch_key(ct, entry->src_ip, entry->client_port,
+                        entry->orig_dst_ip, entry->orig_dst_port,
+                        WTP_IPPROTO_TCP);
+}
+
+void conntrack_touch_tcp_proxy_return(conntrack_t *ct,
+                                      const conntrack_entry_t *entry) {
+    if (!ct || !entry) return;
+    conntrack_touch_key(ct, entry->key_src_ip, entry->src_port,
+                        entry->key_dst_ip, entry->key_dst_port,
+                        WTP_IPPROTO_TCP);
+}
+
+void conntrack_touch_udp_proxy_outbound(conntrack_t *ct,
+                                        const conntrack_entry_t *entry) {
+    if (!ct || !entry) return;
+    conntrack_touch(ct, entry->src_ip, entry->client_port,
+                    WTP_IPPROTO_UDP);
+}
+
+void conntrack_touch_udp_proxy_return(conntrack_t *ct,
+                                      const conntrack_entry_t *entry) {
+    if (!ct || !entry) return;
+    conntrack_touch(ct, entry->key_src_ip, entry->src_port,
+                    WTP_IPPROTO_UDP);
 }
 
 void conntrack_snapshot_counters(conntrack_t *ct, conntrack_counters_t *out) {

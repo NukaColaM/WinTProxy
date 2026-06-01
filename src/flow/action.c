@@ -11,6 +11,7 @@ static void traffic_action_init(traffic_action_t *action,
                                 const char *context) {
     memset(action, 0, sizeof(*action));
     action->type    = type;
+    action->send_target = TRAFFIC_SEND_DEFAULT;
     action->ctx     = ctx;
     action->packet  = ctx ? ctx->packet : NULL;
     action->packet_len = ctx ? ctx->packet_len : 0;
@@ -29,10 +30,64 @@ void traffic_action_pass_raw(traffic_action_t *action, uint8_t *packet,
                              const char *context) {
     memset(action, 0, sizeof(*action));
     action->type       = TRAFFIC_ACTION_PASS;
+    action->send_target = TRAFFIC_SEND_DEFAULT;
     action->packet     = packet;
     action->packet_len = packet_len;
     action->ndis_buf   = ndis_buf;
     action->context    = context;
+}
+
+void traffic_action_set_send_target(traffic_action_t *action,
+                                    traffic_send_target_t target) {
+    if (!action) return;
+    action->send_target = target;
+}
+
+void traffic_action_rewrite_ip_src(traffic_action_t *action, uint32_t ip) {
+    if (!action) return;
+    action->rewrite.flags |= TRAFFIC_PACKET_REWRITE_IP_SRC;
+    action->rewrite.ip_src = ip;
+}
+
+void traffic_action_rewrite_ip_dst(traffic_action_t *action, uint32_t ip) {
+    if (!action) return;
+    action->rewrite.flags |= TRAFFIC_PACKET_REWRITE_IP_DST;
+    action->rewrite.ip_dst = ip;
+}
+
+void traffic_action_rewrite_tcp_sport(traffic_action_t *action, uint16_t port) {
+    if (!action) return;
+    action->rewrite.flags |= TRAFFIC_PACKET_REWRITE_TCP_SPORT;
+    action->rewrite.tcp_sport = port;
+}
+
+void traffic_action_rewrite_tcp_dport(traffic_action_t *action, uint16_t port) {
+    if (!action) return;
+    action->rewrite.flags |= TRAFFIC_PACKET_REWRITE_TCP_DPORT;
+    action->rewrite.tcp_dport = port;
+}
+
+void traffic_action_rewrite_udp_sport(traffic_action_t *action, uint16_t port) {
+    if (!action) return;
+    action->rewrite.flags |= TRAFFIC_PACKET_REWRITE_UDP_SPORT;
+    action->rewrite.udp_sport = port;
+}
+
+void traffic_action_rewrite_udp_dport(traffic_action_t *action, uint16_t port) {
+    if (!action) return;
+    action->rewrite.flags |= TRAFFIC_PACKET_REWRITE_UDP_DPORT;
+    action->rewrite.udp_dport = port;
+}
+
+void traffic_action_rewrite_swap_eth(traffic_action_t *action) {
+    if (!action) return;
+    action->rewrite.flags |= TRAFFIC_PACKET_REWRITE_SWAP_ETH;
+}
+
+void traffic_action_rewrite_clamp_tcp_mss(traffic_action_t *action, uint16_t mss) {
+    if (!action) return;
+    action->rewrite.flags |= TRAFFIC_PACKET_REWRITE_CLAMP_TCP_MSS;
+    action->rewrite.tcp_mss = mss;
 }
 
 void traffic_action_rewrite_send(traffic_action_t *action, packet_ctx_t *ctx,

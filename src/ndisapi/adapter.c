@@ -237,10 +237,7 @@ static DWORD WINAPI ndisapi_worker_proc(LPVOID param) {
     DWORD offset = (DWORD)my_idx * batch;
 
     PINTERMEDIATE_BUFFER *read_ptrs  = engine->worker_read_ptrs + offset;
-    PINTERMEDIATE_BUFFER *to_adapter = engine->worker_to_adapter + offset;
-    PINTERMEDIATE_BUFFER *to_mstcp   = engine->worker_to_mstcp + offset;
-    DWORD to_adapter_count, to_mstcp_count;
-    DWORD packets_read, packets_sent, j;
+    DWORD packets_read, j;
 
     while (engine->running) {
         /* Wait for packets */
@@ -262,10 +259,6 @@ static DWORD WINAPI ndisapi_worker_proc(LPVOID param) {
             InterlockedAdd64(&engine->counters.packets_recv, inc);
         }
 
-        /* Separate by direction */
-        to_adapter_count = 0;
-        to_mstcp_count   = 0;
-
         for (j = 0; j < packets_read; j++) {
             PINTERMEDIATE_BUFFER buf = read_ptrs[j];
             if (!buf || buf->m_Length < ETHER_HDR_LEN) continue;
@@ -275,62 +268,13 @@ static DWORD WINAPI ndisapi_worker_proc(LPVOID param) {
                 traffic_action_t action;
                 traffic_plan_packet(engine, &ctx, &action);
 
-                /* Batch by action type */
-                switch (action.type) {
-                case TRAFFIC_ACTION_REWRITE_SEND:
-                    packet_recalculate_checksums(action.ctx);
-                    /* fallthrough */
-                case TRAFFIC_ACTION_PASS:
-                    if (action.ndis_buf->m_dwDeviceFlags & PACKET_FLAG_ON_SEND)
-                        to_adapter[to_adapter_count++] = action.ndis_buf;
-                    else
-                        to_mstcp[to_mstcp_count++] = action.ndis_buf;
-                    break;
-                case TRAFFIC_ACTION_DROP:
-                    ndisapi_count_drop(engine);
-                    break;
-                default:
-                    /* FORWARD actions: execute inline (UDP relay, DNS forward) */
-                    traffic_execute_action(engine, &action);
-                    break;
-                }
+                traffic_execute_action(engine, &action);
             } else {
                 /* Unparseable packet — pass through */
-                if (buf->m_dwDeviceFlags & PACKET_FLAG_ON_SEND) {
-                    to_adapter[to_adapter_count++] = buf;
-                } else {
-                    to_mstcp[to_mstcp_count++] = buf;
-                }
-            }
-        }
-
-        /* Send to adapter (outbound packets) */
-        if (to_adapter_count > 0) {
-            if (SendPacketsToAdaptersUnsorted(engine->driver_handle,
-                                               to_adapter, to_adapter_count,
-                                               &packets_sent)) {
-                InterlockedAdd64(&engine->counters.packets_sent,
-                                 (LONG64)packets_sent);
-            } else {
-                LOG_WARN("SendPacketsToAdaptersUnsorted failed: err=%lu",
-                         GetLastError());
-                ndisapi_counter_inc(&engine->counters.send_failures);
-            }
-        }
-
-        /* Send to MSTCP (inbound / reverted packets) */
-        if (to_mstcp_count > 0) {
-            packets_sent = 0;
-            LOG_TRACE("Sending %lu packets to MSTCP", (unsigned long)to_mstcp_count);
-            if (SendPacketsToMstcpUnsorted(engine->driver_handle,
-                                            to_mstcp, to_mstcp_count,
-                                            &packets_sent)) {
-                InterlockedAdd64(&engine->counters.packets_sent,
-                                 (LONG64)packets_sent);
-            } else {
-                LOG_WARN("SendPacketsToMstcpUnsorted failed: err=%lu",
-                         GetLastError());
-                ndisapi_counter_inc(&engine->counters.send_failures);
+                traffic_action_t action;
+                traffic_action_pass_raw(&action, buf->m_IBuffer, buf->m_Length,
+                                        buf, "unparseable");
+                traffic_execute_action(engine, &action);
             }
         }
     }

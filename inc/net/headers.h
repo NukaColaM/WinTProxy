@@ -7,6 +7,7 @@
 #define WINTPROXY_NET_HEADERS_H
 
 #include <stdint.h>
+#include <string.h>
 
 #ifdef _WIN32
 #include <windows.h>

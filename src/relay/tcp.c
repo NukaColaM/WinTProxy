@@ -54,6 +54,7 @@ struct tcp_conn_s {
     uint16_t          orig_dst_port;
     uint32_t          connect_dst_ip;
     uint16_t          connect_dst_port;
+    conntrack_entry_t conntrack_entry;
     tcp_conn_state_t  state;
     LONG              closing;
     LONG              refs;
@@ -91,10 +92,10 @@ static void close_socket_if_valid(SOCKET *sock) {
 }
 
 static void tcp_conn_touch_conntrack(tcp_conn_t *conn) {
-    conntrack_touch_key(conn->relay->conntrack, conn->lookup_ip, conn->client_port,
-                        conn->lookup_dst_ip, conn->lookup_dst_port, WTP_IPPROTO_TCP);
-    conntrack_touch_key(conn->relay->conntrack, conn->client_ip, conn->orig_client_port,
-                        conn->connect_dst_ip, conn->connect_dst_port, WTP_IPPROTO_TCP);
+    conntrack_touch_tcp_proxy_return(conn->relay->conntrack,
+                                     &conn->conntrack_entry);
+    conntrack_touch_tcp_proxy_outbound(conn->relay->conntrack,
+                                       &conn->conntrack_entry);
 }
 
 static void tcp_conn_release(tcp_conn_t *conn);
@@ -448,15 +449,10 @@ static void tcp_conn_start(tcp_relay_t *relay, SOCKET client) {
          *   conn->client_port = relay_src_port
          *   local.sin_addr    = client_ip  (from getsockname)
          *   relay->port       = relay_port */
-        if (conntrack_get_full_key(relay->conntrack,
-                                   conn->client_ip, conn->client_port,
-                                   local.sin_addr.s_addr, relay->port,
-                                   WTP_IPPROTO_TCP, &entry) == ERR_OK) {
-            conn->lookup_ip = entry.key_src_ip;
-        } else if (conntrack_get_full(relay->conntrack, conn->client_ip,
-                                       conn->client_port, WTP_IPPROTO_TCP, &entry) == ERR_OK) {
-            conn->lookup_ip = entry.key_src_ip;
-        } else {
+        if (conntrack_get_tcp_proxy_return(relay->conntrack,
+                                           conn->client_ip, conn->client_port,
+                                           local.sin_addr.s_addr, relay->port,
+                                           &entry) != ERR_OK) {
             LOG_WARN("TCP relay: no conntrack entry for %s:%u",
                      inet_ntoa(peer.sin_addr), conn->client_port);
             counter_inc(&relay->counters.rejected_connections);
@@ -471,6 +467,7 @@ static void tcp_conn_start(tcp_relay_t *relay, SOCKET client) {
         conn->orig_dst_port = entry.orig_dst_port;
         conn->connect_dst_ip = entry.connect_dst_ip;
         conn->connect_dst_port = entry.connect_dst_port;
+        conn->conntrack_entry = entry;
     }
 
     ip_to_str(conn->connect_dst_ip, conn->dst_str, sizeof(conn->dst_str));
@@ -864,6 +861,14 @@ void tcp_relay_stop(tcp_relay_t *relay) {
     relay->running = 0;
     close_socket_if_valid(&relay->listen_sock);
 
+    tcp_close_active(relay);
+    {
+        int drained = tcp_wait_for_drain(relay);
+        if (!drained) {
+            LOG_WARN("TCP relay: timed out draining active IOCP connections; leaking pool until process exit");
+        }
+    }
+
     if (relay->refresh_thread) {
         WaitForSingleObject(relay->refresh_thread, TCP_CONNTRACK_REFRESH_MS + 1000U);
         CloseHandle(relay->refresh_thread);
@@ -874,14 +879,6 @@ void tcp_relay_stop(tcp_relay_t *relay) {
         WaitForSingleObject(relay->thread, 5000);
         CloseHandle(relay->thread);
         relay->thread = NULL;
-    }
-
-    tcp_close_active(relay);
-    {
-        int drained = tcp_wait_for_drain(relay);
-        if (!drained) {
-            LOG_WARN("TCP relay: timed out draining active IOCP connections; leaking pool until process exit");
-        }
     }
 
     if (relay->iocp) {

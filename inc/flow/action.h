@@ -20,6 +20,34 @@ typedef enum {
     TRAFFIC_ACTION_FORWARD_DNS_TO_RESOLVER
 } traffic_action_type_t;
 
+typedef enum {
+    TRAFFIC_SEND_DEFAULT = 0,
+    TRAFFIC_SEND_TO_ADAPTER,
+    TRAFFIC_SEND_TO_MSTCP
+} traffic_send_target_t;
+
+typedef enum {
+    TRAFFIC_PACKET_REWRITE_IP_SRC         = 1U << 0,
+    TRAFFIC_PACKET_REWRITE_IP_DST         = 1U << 1,
+    TRAFFIC_PACKET_REWRITE_TCP_SPORT      = 1U << 2,
+    TRAFFIC_PACKET_REWRITE_TCP_DPORT      = 1U << 3,
+    TRAFFIC_PACKET_REWRITE_UDP_SPORT      = 1U << 4,
+    TRAFFIC_PACKET_REWRITE_UDP_DPORT      = 1U << 5,
+    TRAFFIC_PACKET_REWRITE_SWAP_ETH       = 1U << 6,
+    TRAFFIC_PACKET_REWRITE_CLAMP_TCP_MSS   = 1U << 7
+} traffic_packet_rewrite_flag_t;
+
+typedef struct {
+    uint32_t flags;
+    uint32_t ip_src;
+    uint32_t ip_dst;
+    uint16_t tcp_sport;
+    uint16_t tcp_dport;
+    uint16_t udp_sport;
+    uint16_t udp_dport;
+    uint16_t tcp_mss;
+} traffic_packet_rewrite_t;
+
 typedef struct {
     uint16_t src_port;
     uint32_t original_dns_ip;
@@ -36,6 +64,8 @@ typedef struct {
  */
 typedef struct {
     traffic_action_type_t  type;
+    traffic_send_target_t  send_target;
+    traffic_packet_rewrite_t rewrite;
     packet_ctx_t          *ctx;
     uint8_t               *packet;
     UINT                   packet_len;
@@ -63,6 +93,16 @@ void traffic_action_forward_dns(traffic_action_t *action, packet_ctx_t *ctx,
                                 PINTERMEDIATE_BUFFER ndis_buf,
                                 const traffic_dns_forward_t *forward,
                                 const char *context);
+void traffic_action_set_send_target(traffic_action_t *action,
+                                    traffic_send_target_t target);
+void traffic_action_rewrite_ip_src(traffic_action_t *action, uint32_t ip);
+void traffic_action_rewrite_ip_dst(traffic_action_t *action, uint32_t ip);
+void traffic_action_rewrite_tcp_sport(traffic_action_t *action, uint16_t port);
+void traffic_action_rewrite_tcp_dport(traffic_action_t *action, uint16_t port);
+void traffic_action_rewrite_udp_sport(traffic_action_t *action, uint16_t port);
+void traffic_action_rewrite_udp_dport(traffic_action_t *action, uint16_t port);
+void traffic_action_rewrite_swap_eth(traffic_action_t *action);
+void traffic_action_rewrite_clamp_tcp_mss(traffic_action_t *action, uint16_t mss);
 
 #ifdef __cplusplus
 }

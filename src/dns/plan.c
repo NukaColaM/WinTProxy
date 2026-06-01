@@ -63,10 +63,10 @@ void dns_plan_inbound_or_response(ndisapi_engine_t *engine, packet_ctx_t *ctx,
         if (packet_dns_txid(ctx, &txid) &&
             dns_hijack_rewrite_response(engine->dns_hijack, &orig_ip, &orig_port,
                                          ctx->dst_port, txid)) {
-            ctx->ip_hdr->ip_src = orig_ip;
-            ctx->udp_hdr->uh_sport = htons(orig_port);
-            ctx->ndis_buf->m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;
             traffic_action_rewrite_send(action, ctx, ctx->ndis_buf, "dns response");
+            traffic_action_rewrite_ip_src(action, orig_ip);
+            traffic_action_rewrite_udp_sport(action, orig_port);
+            traffic_action_set_send_target(action, TRAFFIC_SEND_TO_MSTCP);
             return;
         }
     }
@@ -84,13 +84,14 @@ void dns_plan_tcp_return(ndisapi_engine_t *engine, packet_ctx_t *ctx,
         traffic_action_drop(action, ctx, ctx->ndis_buf, "tcp dns return missing");
         return;
     }
-    ctx->ip_hdr->ip_src = entry.orig_dst_ip;
-    ctx->ip_hdr->ip_dst = entry.src_ip;
-    ctx->tcp_hdr->th_sport = htons(entry.orig_dst_port);
-    ctx->tcp_hdr->th_dport = htons(entry.client_port);
-    swap_ether_addrs(ctx->eth_hdr);
-    ctx->ndis_buf->m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;
     traffic_action_rewrite_send(action, ctx, ctx->ndis_buf, "tcp dns return");
+    traffic_action_rewrite_ip_src(action, entry.orig_dst_ip);
+    traffic_action_rewrite_ip_dst(action, entry.src_ip);
+    traffic_action_rewrite_tcp_sport(action, entry.orig_dst_port);
+    traffic_action_rewrite_tcp_dport(action, entry.client_port);
+    traffic_action_rewrite_swap_eth(action);
+    traffic_action_rewrite_clamp_tcp_mss(action, WTP_TCP_MSS_CLAMP);
+    traffic_action_set_send_target(action, TRAFFIC_SEND_TO_MSTCP);
 }
 
 void dns_plan_udp_query(ndisapi_engine_t *engine, packet_ctx_t *ctx,
@@ -133,12 +134,12 @@ void dns_plan_udp_query(ndisapi_engine_t *engine, packet_ctx_t *ctx,
                                         ctx->dst_ip, ctx->dst_port,
                                         ctx->src_ip,
                                         ctx->ndis_buf->m_hAdapter) == 1) {
-            ctx->ip_hdr->ip_dst = nip;
-            ctx->udp_hdr->uh_dport = htons(nport);
             log_dns_query(ctx, 0, ctx->dst_ip, ctx->dst_port, nip, nport,
                           "rewrite", "ok", 1);
             traffic_action_rewrite_send(action, ctx, ctx->ndis_buf,
                                         "dns hijack");
+            traffic_action_rewrite_ip_dst(action, nip);
+            traffic_action_rewrite_udp_dport(action, nport);
         } else {
             LOG_WARN("DNS hijack: NAT store failed");
             traffic_action_pass(action, ctx, ctx->ndis_buf, "dns fallback");
@@ -178,18 +179,17 @@ void dns_plan_tcp_query(ndisapi_engine_t *engine, packet_ctx_t *ctx,
         return;
     }
 
-    ctx->ip_hdr->ip_dst = engine->dns_hijack->redirect_ip;
-    ctx->tcp_hdr->th_dport = htons(engine->dns_hijack->redirect_port);
-
+    traffic_action_rewrite_send(action, ctx, ctx->ndis_buf, "tcp dns hijack");
+    traffic_action_rewrite_ip_dst(action, engine->dns_hijack->redirect_ip);
+    traffic_action_rewrite_tcp_dport(action, engine->dns_hijack->redirect_port);
     if (engine->dns_hijack->redirect_ip == LOOPBACK_ADDR) {
-        ctx->ip_hdr->ip_src = odip;
-        swap_ether_addrs(ctx->eth_hdr);
-        ctx->ndis_buf->m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;
+        traffic_action_rewrite_ip_src(action, odip);
+        traffic_action_rewrite_swap_eth(action);
+        traffic_action_set_send_target(action, TRAFFIC_SEND_TO_MSTCP);
     }
 
     log_dns_query(ctx, 1, odip, odport,
                   engine->dns_hijack->redirect_ip,
                   engine->dns_hijack->redirect_port,
                   "rewrite", "ok", 0);
-    traffic_action_rewrite_send(action, ctx, ctx->ndis_buf, "tcp dns hijack");
 }

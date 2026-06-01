@@ -9,6 +9,7 @@
 #include "core/common.h"
 #include "app/log.h"
 #include "app/config.h"
+#include "app/lifecycle.h"
 #include "conntrack/conntrack.h"
 #include "process/lookup.h"
 #include "policy/rules.h"
@@ -270,12 +271,23 @@ cleanup:
         g_metrics_thread = NULL;
     }
 
-    if (ndisapi_ok)  ndisapi_stop(&g_ndisapi);
-    if (udp_ok)     udp_relay_stop(&g_udp_relay);
-    if (tcp_ok)     tcp_relay_stop(&g_tcp_relay);
-    if (dns_ok)     dns_hijack_shutdown(&g_dns_hijack);
-    if (proc_lookup_ok) proc_lookup_shutdown(&g_proc_lookup);
-    if (conntrack_ok)   conntrack_shutdown(&g_conntrack);
+    {
+        app_lifecycle_services_t services;
+        memset(&services, 0, sizeof(services));
+        services.ndisapi_ok = ndisapi_ok;
+        services.ndisapi = &g_ndisapi;
+        services.tcp_ok = tcp_ok;
+        services.tcp_relay = &g_tcp_relay;
+        services.udp_ok = udp_ok;
+        services.udp_relay = &g_udp_relay;
+        services.dns_ok = dns_ok;
+        services.dns_hijack = &g_dns_hijack;
+        services.proc_lookup_ok = proc_lookup_ok;
+        services.proc_lookup = &g_proc_lookup;
+        services.conntrack_ok = conntrack_ok;
+        services.conntrack = &g_conntrack;
+        app_stop_services(&services);
+    }
     config_free(&config);
     WSACleanup();
 

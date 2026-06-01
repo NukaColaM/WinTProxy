@@ -94,12 +94,36 @@ error_t conntrack_get_full(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, 
 error_t conntrack_get_full_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_port,
                                uint32_t dst_ip, uint16_t dst_port, uint8_t protocol,
                                conntrack_entry_t *out);
+error_t conntrack_get_tcp_proxy_outbound(conntrack_t *ct, uint32_t client_ip,
+                                         uint16_t client_port,
+                                         uint32_t server_ip,
+                                         uint16_t server_port,
+                                         conntrack_entry_t *out);
+error_t conntrack_get_tcp_proxy_return(conntrack_t *ct, uint32_t relay_src_ip,
+                                       uint16_t relay_src_port,
+                                       uint32_t relay_dst_ip,
+                                       uint16_t relay_dst_port,
+                                       conntrack_entry_t *out);
+error_t conntrack_get_udp_proxy_outbound(conntrack_t *ct, uint32_t client_ip,
+                                         uint16_t client_port,
+                                         conntrack_entry_t *out);
+error_t conntrack_get_udp_proxy_return(conntrack_t *ct, uint32_t server_ip,
+                                       uint16_t client_port,
+                                       conntrack_entry_t *out);
 void    conntrack_remove(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol);
 void    conntrack_remove_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_port,
                              uint32_t dst_ip, uint16_t dst_port, uint8_t protocol);
 void    conntrack_touch(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol);
 void    conntrack_touch_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_port,
                             uint32_t dst_ip, uint16_t dst_port, uint8_t protocol);
+void    conntrack_touch_tcp_proxy_outbound(conntrack_t *ct,
+                                           const conntrack_entry_t *entry);
+void    conntrack_touch_tcp_proxy_return(conntrack_t *ct,
+                                         const conntrack_entry_t *entry);
+void    conntrack_touch_udp_proxy_outbound(conntrack_t *ct,
+                                           const conntrack_entry_t *entry);
+void    conntrack_touch_udp_proxy_return(conntrack_t *ct,
+                                         const conntrack_entry_t *entry);
 void    conntrack_snapshot_counters(conntrack_t *ct, conntrack_counters_t *out);
 
 #ifdef __cplusplus

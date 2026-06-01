@@ -413,8 +413,7 @@ static void handle_client_datagram(udp_relay_t *relay, uint8_t *recv_buf, int n,
     uint16_t client_port;
     uint8_t *udp_payload;
     int udp_payload_len;
-    uint32_t orig_dst_ip;
-    uint16_t orig_dst_port;
+    conntrack_entry_t entry;
     udp_session_snapshot_t snapshot;
 
     memset(&snapshot, 0, sizeof(snapshot));
@@ -430,7 +429,8 @@ static void handle_client_datagram(udp_relay_t *relay, uint8_t *recv_buf, int n,
     udp_payload = recv_buf + 6;
     udp_payload_len = n - 6;
 
-    if (conntrack_get(relay->conntrack, client_ip, client_port, WTP_IPPROTO_UDP, &orig_dst_ip, &orig_dst_port) != ERR_OK) {
+    if (conntrack_get_udp_proxy_outbound(relay->conntrack, client_ip,
+                                         client_port, &entry) != ERR_OK) {
         LOG_TRACE("UDP relay: no conntrack for port %u, dropping", client_port);
         counter_inc(&relay->counters.dropped_datagrams);
         return;
@@ -445,7 +445,7 @@ static void handle_client_datagram(udp_relay_t *relay, uint8_t *recv_buf, int n,
 
     {
         int wrapped = socks5_udp_wrap(send_buf, send_buf_len,
-            orig_dst_ip, orig_dst_port, udp_payload, udp_payload_len);
+            entry.orig_dst_ip, entry.orig_dst_port, udp_payload, udp_payload_len);
         if (wrapped > 0) {
             int sent;
 
@@ -454,10 +454,12 @@ static void handle_client_datagram(udp_relay_t *relay, uint8_t *recv_buf, int n,
             if (sent != SOCKET_ERROR) {
                 char dst_str[16];
                 update_session_activity(relay, &snapshot);
+                conntrack_touch_udp_proxy_outbound(relay->conntrack, &entry);
+                conntrack_touch_udp_proxy_return(relay->conntrack, &entry);
                 counter_add(&relay->counters.bytes_up, udp_payload_len);
-                ip_to_str(orig_dst_ip, dst_str, sizeof(dst_str));
+                ip_to_str(entry.orig_dst_ip, dst_str, sizeof(dst_str));
                 LOG_TRACE("UDP relay: forwarded %d bytes from :%u to %s:%u",
-                    udp_payload_len, client_port, dst_str, orig_dst_port);
+                    udp_payload_len, client_port, dst_str, entry.orig_dst_port);
             } else {
                 close_failed_snapshot(relay, &snapshot);
                 counter_inc(&relay->counters.dropped_datagrams);
@@ -490,12 +492,17 @@ static void handle_proxy_datagram(udp_relay_t *relay, udp_session_snapshot_t *sn
              * where NDIS catches it for return-path rewrite.  Keep the relay
              * bound to INADDR_LOOPBACK for receiving client data. */
             {
-                uint32_t orig_ip = 0;
-                uint16_t orig_port = 0;
-                if (conntrack_get(relay->conntrack, snapshot->client_ip,
-                                  snapshot->client_port, WTP_IPPROTO_UDP,
-                                  &orig_ip, &orig_port) == ERR_OK && orig_ip != 0) {
-                    dst_ip = orig_ip;
+                conntrack_entry_t entry;
+                if (conntrack_get_udp_proxy_outbound(relay->conntrack,
+                                                     snapshot->client_ip,
+                                                     snapshot->client_port,
+                                                     &entry) == ERR_OK &&
+                    entry.orig_dst_ip != 0) {
+                    dst_ip = entry.orig_dst_ip;
+                    conntrack_touch_udp_proxy_outbound(relay->conntrack,
+                                                       &entry);
+                    conntrack_touch_udp_proxy_return(relay->conntrack,
+                                                     &entry);
                 }
             }
 

@@ -315,7 +315,10 @@ static DWORD WINAPI dns_fwd_thread(LPVOID param) {
                          (struct sockaddr *)&from, &from_len);
         if (n <= 0) {
             if (n < 0) {
-                LOG_TRACE("DNS fwd: recvfrom error: %d", WSAGetLastError());
+                int err = WSAGetLastError();
+                if (dns_hijack_should_log_forward_recv_error(err)) {
+                    LOG_TRACE("DNS fwd: recvfrom error: %d", err);
+                }
             }
             if (!dh->fwd_running) break;
             continue;
