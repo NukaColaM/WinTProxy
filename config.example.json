@@ -1,5 +1,5 @@
 {
-    "_comment": "WinTProxy traffic-stage configuration. Top-level sections mirror the runtime flow: dns -> bypass -> policy -> proxy -> logging.",
+    "_comment": "WinTProxy traffic-stage configuration. See docs/config.md and docs/architecture.md for the flow model and section meanings.",
     "dns": {
         "_comment": "DNS is a first-class stage before bypass/policy. Matching TCP/UDP port 53 traffic is redirected when enabled.",
         "enabled": true,
@@ -56,7 +56,7 @@
         "port": 7890
     },
     "logging": {
-        "_comment": "level is one of: error, warn, info, debug, trace. info is lifecycle/config only; debug adds flow decisions, DNS query summaries, and grouped performance snapshots; trace adds packet/protocol internals. file is optional; empty means stderr only.",
+        "_comment": "level is one of: error, warn, info, debug, trace. See docs/config.md for the level map. file is optional; empty means stderr only.",
         "level": "info",
         "file": ""
     }

@@ -1,22 +1,19 @@
 # WinTProxy
 
-> **✅ Done — ndisapi (WinpkFilter) migration complete. All tasks (T1–T6) finished. v0.7.0.**
+Transparent SOCKS5 proxy for Windows. WinTProxy intercepts IPv4 TCP and UDP
+traffic with [WinpkFilter](https://github.com/wiresock/ndisapi), plans each
+packet through explicit DNS, bypass, policy, proxy, return-path, and
+execution stages, then applies a proxy/direct verdict.
 
-Transparent SOCKS5 proxy for Windows. WinTProxy intercepts IPv4 TCP and UDP traffic with [WinpkFilter](https://github.com/wiresock/ndisapi) (ndisapi), plans each packet through explicit DNS, bypass, policy, proxy, return-path, and action-execution stages, then applies a proxy/direct verdict.
+## What It Does
 
-## Features
-
-- Explicit verdict/action traffic engine with centralized pass, drop, rewrite/send, DNS-forward, and UDP-relay actions.
-- Traffic-stage JSON config: `dns`, `bypass`, `policy`, `proxy`, and `logging`.
-- Ordered first-match proxy/direct policy rules by process name, IP range, port, and protocol.
-- TCP forwarding through SOCKS5 CONNECT.
-- UDP forwarding through SOCKS5 UDP ASSOCIATE.
-- DNS hijacking for both UDP and TCP DNS before normal policy decisions.
-- Fixed-size hot-path tables for connection tracking, DNS NAT, process lookup, and relay state.
+- SOCKS5 TCP CONNECT and UDP ASSOCIATE forwarding
+- DNS hijacking before normal policy decisions
+- Ordered proxy/direct policy rules
+- Fixed-size hot-path state for conntrack, DNS NAT, process lookup, and relays
+- Explicit plan/execute flow with centralized send routing
 
 ## Quick Start
-
-Cross-compile with MinGW from WSL2 or Linux:
 
 ```bash
 sudo apt install gcc-mingw-w64-x86-64
@@ -24,37 +21,20 @@ cmake -B build -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-toolchain.cmake
 cmake --build build
 ```
 
-Install the WinpkFilter driver (ndisrd.sys) using the installer from [WinpkFilter releases](https://github.com/wiresock/ndisapi/releases), then place `ndisapi.dll` next to `WinTProxy.exe`. Run from an elevated Windows shell:
+Install WinpkFilter, place `ndisapi.dll` next to `WinTProxy.exe`, then run:
 
 ```powershell
 WinTProxy.exe --config config.example.json
 ```
 
-## Usage
+## Docs
 
-```text
-WinTProxy.exe [options]
-
-Options:
-  --config <path>     Path to JSON config file
-  --log <path>        Override logging.file from config
-  -v, --verbose       Override logging.level (-v=info, -vv=debug, -vvv=trace; extra -v clamps to trace)
-  --version           Show version
-  -h, --help          Show help
-```
-
-Traffic behavior belongs in the config file. CLI flags are intentionally limited to bootstrap/logging/help/version. The five public log levels are `error`, `warn`, `info`, `debug`, and `trace`; `debug` is the normal troubleshooting view with flow decisions, DNS query summaries, and grouped performance snapshots, while `trace` is reserved for packet/protocol detail. Extra verbosity such as `-vvvv` clamps to `trace`.
-
-## Configuration
-
-WinTProxy now uses a traffic-stage schema. Policy decisions are `proxy` or `direct` only; the previous policy-level `block` action has been removed from the traffic model.
-
-See [config.example.json](config.example.json) for an annotated example.
-
-## Documentation
-
-- [Guide](guide.md) — build, configuration, and architecture
-- [config.example.json](config.example.json) — annotated traffic-stage config
+- [Guide](guide.md)
+- [Build](docs/build.md)
+- [Run](docs/run.md)
+- [Configuration](docs/config.md)
+- [Architecture](docs/architecture.md)
+- [config.example.json](config.example.json)
 
 ## License
 
