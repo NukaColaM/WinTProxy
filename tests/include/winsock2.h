@@ -29,5 +29,14 @@ static inline int closesocket(SOCKET s) {
     return close(s);
 }
 
+static inline int wintproxy_test_getsockname(SOCKET s, struct sockaddr *addr,
+                                             int *addrlen) {
+    socklen_t len = addrlen ? (socklen_t)*addrlen : 0;
+    int rc = getsockname(s, addr, addrlen ? &len : NULL);
+    if (addrlen) *addrlen = (int)len;
+    return rc;
+}
+
+#define getsockname wintproxy_test_getsockname
 
 #endif

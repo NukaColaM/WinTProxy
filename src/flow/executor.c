@@ -26,38 +26,44 @@ static traffic_send_target_t resolve_send_target(PINTERMEDIATE_BUFFER buf,
 
 static void flush_driver_sends(ndisapi_engine_t *engine,
                                traffic_send_target_t target,
-                               PINTERMEDIATE_BUFFER *bufs,
+                               ndisapi_send_item_t *items,
                                size_t *count) {
-    if (!engine || !bufs || !count || *count == 0) return;
+    if (!engine || !items || !count || *count == 0) return;
 
     if (target == TRAFFIC_SEND_TO_ADAPTER) {
-        ndisapi_send_batch_to_adapter(engine, bufs, (DWORD)*count);
+        ndisapi_enqueue_send_batch_to_adapter(engine, items, (DWORD)*count);
     } else if (target == TRAFFIC_SEND_TO_MSTCP) {
-        ndisapi_send_batch_to_mstcp(engine, bufs, (DWORD)*count);
+        ndisapi_enqueue_send_batch_to_mstcp(engine, items, (DWORD)*count);
     }
     *count = 0;
 }
 
 static void queue_driver_send(ndisapi_engine_t *engine,
-                              PINTERMEDIATE_BUFFER buf,
+                              traffic_action_t *action,
                               traffic_send_target_t target,
-                              PINTERMEDIATE_BUFFER *to_adapter,
+                              ndisapi_send_item_t *to_adapter,
                               size_t *adapter_count,
-                              PINTERMEDIATE_BUFFER *to_mstcp,
+                              ndisapi_send_item_t *to_mstcp,
                               size_t *mstcp_count) {
     traffic_send_target_t resolved;
+    PINTERMEDIATE_BUFFER buf = action ? action->ndis_buf : NULL;
+    ndisapi_send_item_t item;
 
     if (!buf) return;
 
+    memset(&item, 0, sizeof(item));
+    item.buf = buf;
+    item.block = action ? action->owner_block : NULL;
+
     resolved = resolve_send_target(buf, target);
     if (resolved == TRAFFIC_SEND_TO_ADAPTER) {
-        to_adapter[(*adapter_count)++] = buf;
+        to_adapter[(*adapter_count)++] = item;
         if (*adapter_count == NDISAPI_BATCH_SIZE) {
             flush_driver_sends(engine, TRAFFIC_SEND_TO_ADAPTER,
                                to_adapter, adapter_count);
         }
     } else {
-        to_mstcp[(*mstcp_count)++] = buf;
+        to_mstcp[(*mstcp_count)++] = item;
         if (*mstcp_count == NDISAPI_BATCH_SIZE) {
             flush_driver_sends(engine, TRAFFIC_SEND_TO_MSTCP,
                                to_mstcp, mstcp_count);
@@ -246,14 +252,19 @@ static void execute_dns_response_injection(ndisapi_engine_t *engine,
     RecalculateUDPChecksum(pkt);
     RecalculateIPChecksum(pkt);
 
-    ndisapi_send_batch_to_mstcp(engine, &pkt, 1);
-    free(pkt);
+    {
+        ndisapi_send_item_t item;
+        memset(&item, 0, sizeof(item));
+        item.buf = pkt;
+        item.free_after_send = 1;
+        ndisapi_enqueue_send_batch_to_mstcp(engine, &item, 1);
+    }
 }
 
 void traffic_execute_actions(ndisapi_engine_t *engine, traffic_action_t *actions,
                              size_t action_count) {
-    PINTERMEDIATE_BUFFER to_adapter[NDISAPI_BATCH_SIZE];
-    PINTERMEDIATE_BUFFER to_mstcp[NDISAPI_BATCH_SIZE];
+    ndisapi_send_item_t to_adapter[NDISAPI_BATCH_SIZE];
+    ndisapi_send_item_t to_mstcp[NDISAPI_BATCH_SIZE];
     size_t adapter_count = 0;
     size_t mstcp_count = 0;
     size_t i;
@@ -265,7 +276,7 @@ void traffic_execute_actions(ndisapi_engine_t *engine, traffic_action_t *actions
 
         switch (action->type) {
         case TRAFFIC_ACTION_PASS:
-            queue_driver_send(engine, action->ndis_buf, action->send_target,
+            queue_driver_send(engine, action, action->send_target,
                               to_adapter, &adapter_count, to_mstcp, &mstcp_count);
             break;
 
@@ -273,7 +284,7 @@ void traffic_execute_actions(ndisapi_engine_t *engine, traffic_action_t *actions
             if (action->ctx && action->ndis_buf) {
                 apply_packet_rewrite(action->ctx, &action->rewrite);
                 packet_recalculate_checksums(action->ctx);
-                queue_driver_send(engine, action->ndis_buf, action->send_target,
+                queue_driver_send(engine, action, action->send_target,
                                   to_adapter, &adapter_count,
                                   to_mstcp, &mstcp_count);
             }

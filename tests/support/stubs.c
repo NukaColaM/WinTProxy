@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "app/log.h"
 #include "conntrack/conntrack.h"
@@ -122,6 +123,51 @@ int ndisapi_send_batch_to_mstcp(ndisapi_engine_t *engine,
         if (bufs && bufs[count - 1]) {
             g_test_last_mstcp_packet = *bufs[count - 1];
             g_test_last_mstcp_packet_valid = 1;
+        }
+    }
+    return 1;
+}
+
+int ndisapi_enqueue_send_batch_to_adapter(ndisapi_engine_t *engine,
+                                          ndisapi_send_item_t *items,
+                                          DWORD count) {
+    (void)engine;
+    if (count > 0) {
+        g_test_adapter_send_call_count++;
+        g_test_adapter_send_count += (int)count;
+        for (DWORD i = 0; i < count; i++) {
+            if (items && items[i].free_after_send && items[i].buf) {
+                free(items[i].buf);
+            }
+        }
+    }
+    return 1;
+}
+
+int ndisapi_enqueue_send_batch_to_mstcp(ndisapi_engine_t *engine,
+                                        ndisapi_send_item_t *items,
+                                        DWORD count) {
+    (void)engine;
+    if (count > 0) {
+        g_test_mstcp_send_call_count++;
+        if (g_test_mstcp_send_error) {
+            g_test_send_failure_count += (int)count;
+            for (DWORD i = 0; i < count; i++) {
+                if (items && items[i].free_after_send && items[i].buf) {
+                    free(items[i].buf);
+                }
+            }
+            return 0;
+        }
+        g_test_mstcp_send_count += (int)count;
+        if (items && items[count - 1].buf) {
+            g_test_last_mstcp_packet = *items[count - 1].buf;
+            g_test_last_mstcp_packet_valid = 1;
+        }
+        for (DWORD i = 0; i < count; i++) {
+            if (items && items[i].free_after_send && items[i].buf) {
+                free(items[i].buf);
+            }
         }
     }
     return 1;

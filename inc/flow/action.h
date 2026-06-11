@@ -12,6 +12,8 @@
 extern "C" {
 #endif
 
+struct ndisapi_packet_block_s;
+
 typedef enum {
     TRAFFIC_ACTION_PASS = 0,
     TRAFFIC_ACTION_DROP,
@@ -82,6 +84,7 @@ typedef struct {
     uint8_t               *packet;
     UINT                   packet_len;
     PINTERMEDIATE_BUFFER   ndis_buf;     /* carries direction + adapter handle */
+    struct ndisapi_packet_block_s *owner_block;
     const char            *context;
     traffic_dns_forward_t  dns_forward;
     traffic_dns_response_t dns_response;

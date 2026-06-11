@@ -59,6 +59,24 @@ typedef struct _SYSTEMTIME {
     WORD wSecond;
     WORD wMilliseconds;
 } SYSTEMTIME;
+typedef struct _SYSTEM_INFO {
+    union {
+        DWORD dwOemId;
+        struct {
+            WORD wProcessorArchitecture;
+            WORD wReserved;
+        };
+    };
+    DWORD dwPageSize;
+    LPVOID lpMinimumApplicationAddress;
+    LPVOID lpMaximumApplicationAddress;
+    DWORD_PTR dwActiveProcessorMask;
+    DWORD dwNumberOfProcessors;
+    DWORD dwProcessorType;
+    DWORD dwAllocationGranularity;
+    WORD wProcessorLevel;
+    WORD wProcessorRevision;
+} SYSTEM_INFO;
 typedef struct _TIME_ZONE_INFORMATION {
     LONG Bias;
     wchar_t StandardName[32];
@@ -146,6 +164,13 @@ static inline void GetLocalTime(SYSTEMTIME *st) {
     if (st) memset(st, 0, sizeof(*st));
 }
 
+static inline void GetSystemInfo(SYSTEM_INFO *info) {
+    if (info) {
+        memset(info, 0, sizeof(*info));
+        info->dwNumberOfProcessors = 4;
+    }
+}
+
 static inline HANDLE GetStdHandle(DWORD nStdHandle) {
     (void)nStdHandle;
     return INVALID_HANDLE_VALUE;
@@ -185,6 +210,16 @@ static inline int GetConsoleOutputCP(void) {
     return 65001;
 }
 
+typedef DWORD (WINAPI *LPTHREAD_START_ROUTINE)(LPVOID);
+
+#ifdef WINTPROXY_TEST_HOOKS
+extern int g_test_windows_create_thread_count;
+extern LPTHREAD_START_ROUTINE g_test_windows_thread_procs[64];
+extern LPVOID g_test_windows_thread_params[64];
+extern int g_test_windows_set_event_count;
+extern HANDLE g_test_windows_set_event_handles[128];
+#endif
+
 static inline BOOL CloseHandle(HANDLE hObject) {
     (void)hObject;
     return TRUE;
@@ -197,14 +232,29 @@ static inline DWORD WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds) {
 }
 
 static inline BOOL SetEvent(HANDLE hEvent) {
+#ifdef WINTPROXY_TEST_HOOKS
+    if (g_test_windows_set_event_count < 128) {
+        g_test_windows_set_event_handles[g_test_windows_set_event_count] = hEvent;
+    }
+    g_test_windows_set_event_count++;
+#else
+    (void)hEvent;
+#endif
+    return TRUE;
+}
+
+static inline BOOL ResetEvent(HANDLE hEvent) {
     (void)hEvent;
     return TRUE;
 }
 
 static inline HANDLE CreateEventA(LPSECURITY_ATTRIBUTES lpEventAttributes, BOOL bManualReset,
                                   BOOL bInitialState, LPCSTR lpName) {
+    static uintptr_t next_event = 0x1000;
+
     (void)lpEventAttributes; (void)bManualReset; (void)bInitialState; (void)lpName;
-    return (HANDLE)1;
+    next_event += 0x10;
+    return (HANDLE)next_event;
 }
 
 #ifndef CreateEvent
@@ -216,6 +266,15 @@ static inline HANDLE CreateThread(LPSECURITY_ATTRIBUTES lpThreadAttributes, size
                                   DWORD dwCreationFlags, DWORD *lpThreadId) {
     (void)lpThreadAttributes; (void)dwStackSize; (void)lpStartAddress;
     (void)lpParameter; (void)dwCreationFlags;
+#ifdef WINTPROXY_TEST_HOOKS
+    if (g_test_windows_create_thread_count < 64) {
+        g_test_windows_thread_procs[g_test_windows_create_thread_count] =
+            (LPTHREAD_START_ROUTINE)lpStartAddress;
+        g_test_windows_thread_params[g_test_windows_create_thread_count] =
+            lpParameter;
+    }
+    g_test_windows_create_thread_count++;
+#endif
     if (lpThreadId) *lpThreadId = 1;
     return (HANDLE)1;
 }

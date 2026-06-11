@@ -48,12 +48,17 @@ static DWORD WINAPI metrics_thread_proc(LPVOID param) {
         udp_relay_snapshot_counters(&g_udp_relay, &udp_counters);
 
         LOG_DEBUG("performance snapshot (cumulative)");
-        LOG_DEBUG("  capture: packets recv=%llu sent=%llu dropped=%llu send_fail=%llu udp_to_relay=%llu",
+        LOG_DEBUG("  capture: packets recv=%llu sent=%llu dropped=%llu send_fail=%llu udp_to_relay=%llu pool_exhausted=%llu queue_flush=%llu overload=%llu enqueue_timeout=%llu restart_required=%llu",
                   (unsigned long long)ndisapi_counters.packets_recv,
                   (unsigned long long)ndisapi_counters.packets_sent,
                   (unsigned long long)ndisapi_counters.packets_dropped,
                   (unsigned long long)ndisapi_counters.send_failures,
-                  (unsigned long long)ndisapi_counters.udp_forwarded);
+                  (unsigned long long)ndisapi_counters.udp_forwarded,
+                  (unsigned long long)ndisapi_counters.pool_exhausted,
+                  (unsigned long long)ndisapi_counters.adapter_queue_flushes,
+                  (unsigned long long)ndisapi_counters.overload_drops,
+                  (unsigned long long)ndisapi_counters.enqueue_timeouts,
+                  (unsigned long long)ndisapi_counters.adapter_restart_required);
         LOG_DEBUG("  conntrack: add=%llu update=%llu remove=%llu miss=%llu exhausted=%llu stale_removed=%llu",
                   (unsigned long long)conntrack_counters.adds,
                   (unsigned long long)conntrack_counters.updates,
