@@ -6,31 +6,63 @@
 #include "dns/hijack.h"
 #include "app/log.h"
 #include "core/constants.h"
+#include <stdlib.h>
 #include <string.h>
 
-/*
- * Determine the correct ndisapi send direction for a given buffer.
- * - PACKET_FLAG_ON_SEND + no rewrite: send to adapter (outbound)
- * - PACKET_FLAG_ON_RECEIVE + no rewrite: send to MSTCP (inbound)
- * - Rewrite actions may override (handled in T3+).
- *
- * For T1 pass-through, we use the flag directly.
- */
-static int send_buf(ndisapi_engine_t *engine, PINTERMEDIATE_BUFFER buf,
-                    traffic_send_target_t target) {
-    if (!buf) return 0;
-
+static traffic_send_target_t resolve_send_target(PINTERMEDIATE_BUFFER buf,
+                                                 traffic_send_target_t target) {
     if (target == TRAFFIC_SEND_TO_ADAPTER) {
-        return ndisapi_send_to_adapter(engine, buf);
+        return TRAFFIC_SEND_TO_ADAPTER;
     }
     if (target == TRAFFIC_SEND_TO_MSTCP) {
-        return ndisapi_send_to_mstcp(engine, buf);
+        return TRAFFIC_SEND_TO_MSTCP;
     }
 
-    if (buf->m_dwDeviceFlags & PACKET_FLAG_ON_SEND) {
-        return ndisapi_send_to_adapter(engine, buf);
+    if (buf && (buf->m_dwDeviceFlags & PACKET_FLAG_ON_SEND)) {
+        return TRAFFIC_SEND_TO_ADAPTER;
     }
-    return ndisapi_send_to_mstcp(engine, buf);
+    return TRAFFIC_SEND_TO_MSTCP;
+}
+
+static void flush_driver_sends(ndisapi_engine_t *engine,
+                               traffic_send_target_t target,
+                               PINTERMEDIATE_BUFFER *bufs,
+                               size_t *count) {
+    if (!engine || !bufs || !count || *count == 0) return;
+
+    if (target == TRAFFIC_SEND_TO_ADAPTER) {
+        ndisapi_send_batch_to_adapter(engine, bufs, (DWORD)*count);
+    } else if (target == TRAFFIC_SEND_TO_MSTCP) {
+        ndisapi_send_batch_to_mstcp(engine, bufs, (DWORD)*count);
+    }
+    *count = 0;
+}
+
+static void queue_driver_send(ndisapi_engine_t *engine,
+                              PINTERMEDIATE_BUFFER buf,
+                              traffic_send_target_t target,
+                              PINTERMEDIATE_BUFFER *to_adapter,
+                              size_t *adapter_count,
+                              PINTERMEDIATE_BUFFER *to_mstcp,
+                              size_t *mstcp_count) {
+    traffic_send_target_t resolved;
+
+    if (!buf) return;
+
+    resolved = resolve_send_target(buf, target);
+    if (resolved == TRAFFIC_SEND_TO_ADAPTER) {
+        to_adapter[(*adapter_count)++] = buf;
+        if (*adapter_count == NDISAPI_BATCH_SIZE) {
+            flush_driver_sends(engine, TRAFFIC_SEND_TO_ADAPTER,
+                               to_adapter, adapter_count);
+        }
+    } else {
+        to_mstcp[(*mstcp_count)++] = buf;
+        if (*mstcp_count == NDISAPI_BATCH_SIZE) {
+            flush_driver_sends(engine, TRAFFIC_SEND_TO_MSTCP,
+                               to_mstcp, mstcp_count);
+        }
+    }
 }
 
 static void apply_packet_rewrite(packet_ctx_t *ctx,
@@ -63,95 +95,219 @@ static void apply_packet_rewrite(packet_ctx_t *ctx,
     }
 }
 
-void traffic_execute_action(ndisapi_engine_t *engine, traffic_action_t *action) {
-    if (!engine || !action) return;
+static void execute_udp_forward(ndisapi_engine_t *engine,
+                                traffic_action_t *action) {
+    const uint8_t *udp_data = NULL;
+    UINT udp_data_len = 0;
+    packet_ctx_t *ctx = action ? action->ctx : NULL;
 
-    switch (action->type) {
-    case TRAFFIC_ACTION_PASS:
-        if (action->ndis_buf) {
-            send_buf(engine, action->ndis_buf, action->send_target);
-        }
-        break;
-
-    case TRAFFIC_ACTION_REWRITE_SEND:
-        if (action->ctx && action->ndis_buf) {
-            apply_packet_rewrite(action->ctx, &action->rewrite);
-            packet_recalculate_checksums(action->ctx);
-            send_buf(engine, action->ndis_buf, action->send_target);
-        }
-        break;
-
-    case TRAFFIC_ACTION_DROP:
-        ndisapi_count_drop(engine);
-        break;
-
-    case TRAFFIC_ACTION_FORWARD_UDP_TO_RELAY: {
-        const uint8_t *udp_data = NULL;
-        UINT udp_data_len = 0;
-        packet_ctx_t *ctx = action->ctx;
-        if (!ctx || !packet_payload(ctx, &udp_data, &udp_data_len) ||
-            !udp_data || udp_data_len == 0) {
-            LOG_WARN("UDP PROXY: failed to extract payload");
-            break;
-        }
-
-        if (udp_data_len > WTP_UDP_BUFFER_SIZE) {
-            LOG_WARN("UDP PROXY: payload too large: %u", udp_data_len);
-            break;
-        }
-
-        uint8_t framed[6 + WTP_UDP_BUFFER_SIZE];
-        int framed_len = (int)(6U + udp_data_len);
-        memcpy(framed, &ctx->src_ip, 4);
-        framed[4] = (uint8_t)(ctx->src_port >> 8);
-        framed[5] = (uint8_t)(ctx->src_port & 0xFF);
-        memcpy(framed + 6, udp_data, udp_data_len);
-
-        struct sockaddr_in relay_dest;
-        memset(&relay_dest, 0, sizeof(relay_dest));
-        relay_dest.sin_family = AF_INET;
-        relay_dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        relay_dest.sin_port = htons(engine->udp_relay_port);
-
-        int fwd = sendto(engine->udp_fwd_sock, (const char *)framed,
-                         framed_len, 0,
-                         (struct sockaddr *)&relay_dest, sizeof(relay_dest));
-        if (fwd == SOCKET_ERROR) {
-            LOG_WARN("UDP fwd sendto failed: %d", WSAGetLastError());
-        } else {
-            ndisapi_count_udp_forwarded(engine);
-            LOG_TRACE("UDP fwd: sent %u bytes (port %u) to relay",
-                      udp_data_len, ctx->src_port);
-        }
-        break;
+    if (!ctx || !packet_payload(ctx, &udp_data, &udp_data_len) ||
+        !udp_data || udp_data_len == 0) {
+        LOG_WARN("UDP PROXY: failed to extract payload");
+        return;
     }
 
-    case TRAFFIC_ACTION_FORWARD_DNS_TO_RESOLVER: {
-        const uint8_t *dns_data = NULL;
-        UINT dns_data_len = 0;
-        packet_ctx_t *ctx = action->ctx;
-        if (!ctx || !packet_payload(ctx, &dns_data, &dns_data_len) ||
-            !dns_data || dns_data_len < 2) {
-            LOG_WARN("DNS hijack: malformed DNS payload for forward action");
-            break;
-        }
+    if (udp_data_len > WTP_UDP_BUFFER_SIZE) {
+        LOG_WARN("UDP PROXY: payload too large: %u", udp_data_len);
+        return;
+    }
 
-        error_t err = dns_hijack_forward_query(engine->dns_hijack,
-            dns_data, (int)dns_data_len,
-            action->dns_forward.src_port,
-            action->dns_forward.original_dns_ip,
-            action->dns_forward.original_dns_port,
-            action->dns_forward.client_ip,
-            action->dns_forward.adapter_handle);
-        if (err != ERR_OK) {
-            LOG_WARN("DNS hijack: loopback forward failed (%d), "
-                     "passing original query", err);
-            /* Fallback: pass the original packet through */
-            if (action->ndis_buf) {
-                send_buf(engine, action->ndis_buf, action->send_target);
+    uint8_t framed[6 + WTP_UDP_BUFFER_SIZE];
+    int framed_len = (int)(6U + udp_data_len);
+    memcpy(framed, &ctx->src_ip, 4);
+    framed[4] = (uint8_t)(ctx->src_port >> 8);
+    framed[5] = (uint8_t)(ctx->src_port & 0xFF);
+    memcpy(framed + 6, udp_data, udp_data_len);
+
+    struct sockaddr_in relay_dest;
+    memset(&relay_dest, 0, sizeof(relay_dest));
+    relay_dest.sin_family = AF_INET;
+    relay_dest.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    relay_dest.sin_port = htons(engine->udp_relay_port);
+
+    int fwd = sendto(engine->udp_fwd_sock, (const char *)framed,
+                     framed_len, 0,
+                     (struct sockaddr *)&relay_dest, sizeof(relay_dest));
+    if (fwd == SOCKET_ERROR) {
+        LOG_WARN("UDP fwd sendto failed: %d", WSAGetLastError());
+    } else {
+        ndisapi_count_udp_forwarded(engine);
+        LOG_TRACE("UDP fwd: sent %u bytes (port %u) to relay",
+                  udp_data_len, ctx->src_port);
+    }
+}
+
+static error_t execute_dns_forward(ndisapi_engine_t *engine,
+                                   traffic_action_t *action) {
+    const uint8_t *dns_data = NULL;
+    UINT dns_data_len = 0;
+    packet_ctx_t *ctx = action ? action->ctx : NULL;
+
+    if (!ctx || !packet_payload(ctx, &dns_data, &dns_data_len) ||
+        !dns_data || dns_data_len < 2) {
+        LOG_WARN("DNS hijack: malformed DNS payload for forward action");
+        return ERR_PARAM;
+    }
+
+    return dns_hijack_forward_query(engine->dns_hijack,
+        dns_data, (int)dns_data_len,
+        action->dns_forward.src_port,
+        action->dns_forward.original_dns_ip,
+        action->dns_forward.original_dns_port,
+        action->dns_forward.client_ip,
+        action->dns_forward.adapter_handle);
+}
+
+static void fill_adapter_ethernet(ndisapi_engine_t *engine,
+                                  HANDLE adapter_handle,
+                                  ether_header_ptr eth) {
+    if (!engine || !eth) return;
+
+    memset(eth->h_dest, 0, 6);
+    memset(eth->h_source, 0, 6);
+    if (adapter_handle && engine->adapter_count > 0) {
+        for (DWORD i = 0; i < engine->adapter_count; i++) {
+            if (engine->adapter_handles[i] == adapter_handle) {
+                memcpy(eth->h_dest, engine->adapter_mac[i], 6);
+                memcpy(eth->h_source, engine->adapter_mac[i], 6);
+                return;
             }
         }
-        break;
     }
+    if (engine->adapter_count > 0) {
+        memcpy(eth->h_dest, engine->adapter_mac[0], 6);
+        memcpy(eth->h_source, engine->adapter_mac[0], 6);
     }
+}
+
+static void execute_dns_response_injection(ndisapi_engine_t *engine,
+                                           traffic_action_t *action) {
+    const traffic_dns_response_t *response;
+    PINTERMEDIATE_BUFFER pkt;
+    ether_header_ptr eth;
+    iphdr_ptr ip;
+    udphdr_ptr udp;
+    uint8_t *dns_payload;
+    int ip_len;
+    int total_len;
+
+    if (!engine || !action) return;
+    response = &action->dns_response;
+    if (!response->dns_payload || response->dns_len < 2 ||
+        response->dns_len > WTP_DNS_FORWARD_BUFFER_SIZE) {
+        LOG_WARN("DNS fwd: malformed synthetic response");
+        ndisapi_count_drop(engine);
+        return;
+    }
+
+    pkt = (PINTERMEDIATE_BUFFER)calloc(1, sizeof(INTERMEDIATE_BUFFER));
+    if (!pkt) {
+        LOG_WARN("DNS fwd: response packet allocation failed");
+        ndisapi_count_drop(engine);
+        return;
+    }
+
+    eth = (ether_header_ptr)pkt->m_IBuffer;
+    ip  = (iphdr_ptr)(pkt->m_IBuffer + ETHER_HDR_LEN);
+    udp = (udphdr_ptr)(pkt->m_IBuffer + ETHER_HDR_LEN + 20);
+    dns_payload = pkt->m_IBuffer + ETHER_HDR_LEN + 20 + 8;
+
+    ip_len = 20 + 8 + response->dns_len;
+    total_len = ETHER_HDR_LEN + ip_len;
+
+    fill_adapter_ethernet(engine, response->adapter_handle, eth);
+    eth->h_proto = htons(ETH_P_IP);
+
+    memset(ip, 0, 20);
+    ip->ip_v = 4;
+    ip->ip_hl = 5;
+    ip->ip_len = htons((uint16_t)ip_len);
+    ip->ip_ttl = 64;
+    ip->ip_p = WTP_IPPROTO_UDP;
+    ip->ip_src = response->original_dns_ip;
+    ip->ip_dst = response->client_ip;
+
+    udp->uh_sport = htons(response->original_dns_port);
+    udp->uh_dport = htons(response->client_port);
+    udp->uh_ulen = htons((uint16_t)(8 + response->dns_len));
+    udp->uh_sum = 0;
+
+    memcpy(dns_payload, response->dns_payload, (size_t)response->dns_len);
+    dns_payload[0] = (uint8_t)(response->dns_txid >> 8);
+    dns_payload[1] = (uint8_t)(response->dns_txid & 0xFF);
+
+    pkt->m_Length = (DWORD)total_len;
+    pkt->m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;
+    pkt->m_hAdapter = response->adapter_handle;
+    if (!pkt->m_hAdapter && engine->adapter_count > 0) {
+        pkt->m_hAdapter = engine->adapter_handles[0];
+    }
+
+    RecalculateUDPChecksum(pkt);
+    RecalculateIPChecksum(pkt);
+
+    ndisapi_send_batch_to_mstcp(engine, &pkt, 1);
+    free(pkt);
+}
+
+void traffic_execute_actions(ndisapi_engine_t *engine, traffic_action_t *actions,
+                             size_t action_count) {
+    PINTERMEDIATE_BUFFER to_adapter[NDISAPI_BATCH_SIZE];
+    PINTERMEDIATE_BUFFER to_mstcp[NDISAPI_BATCH_SIZE];
+    size_t adapter_count = 0;
+    size_t mstcp_count = 0;
+    size_t i;
+
+    if (!engine || !actions || action_count == 0) return;
+
+    for (i = 0; i < action_count; i++) {
+        traffic_action_t *action = &actions[i];
+
+        switch (action->type) {
+        case TRAFFIC_ACTION_PASS:
+            queue_driver_send(engine, action->ndis_buf, action->send_target,
+                              to_adapter, &adapter_count, to_mstcp, &mstcp_count);
+            break;
+
+        case TRAFFIC_ACTION_REWRITE_SEND:
+            if (action->ctx && action->ndis_buf) {
+                apply_packet_rewrite(action->ctx, &action->rewrite);
+                packet_recalculate_checksums(action->ctx);
+                queue_driver_send(engine, action->ndis_buf, action->send_target,
+                                  to_adapter, &adapter_count,
+                                  to_mstcp, &mstcp_count);
+            }
+            break;
+
+        case TRAFFIC_ACTION_DROP:
+            ndisapi_count_drop(engine);
+            break;
+
+        case TRAFFIC_ACTION_FORWARD_UDP_TO_RELAY:
+            execute_udp_forward(engine, action);
+            break;
+
+        case TRAFFIC_ACTION_FORWARD_DNS_TO_RESOLVER: {
+            error_t err = execute_dns_forward(engine, action);
+            if (err != ERR_OK) {
+                LOG_WARN("DNS hijack: loopback forward failed (%d), dropping", err);
+                ndisapi_count_drop(engine);
+            }
+            break;
+        }
+
+        case TRAFFIC_ACTION_INJECT_DNS_RESPONSE:
+            execute_dns_response_injection(engine, action);
+            break;
+        }
+    }
+
+    flush_driver_sends(engine, TRAFFIC_SEND_TO_ADAPTER,
+                       to_adapter, &adapter_count);
+    flush_driver_sends(engine, TRAFFIC_SEND_TO_MSTCP,
+                       to_mstcp, &mstcp_count);
+}
+
+void traffic_execute_action(ndisapi_engine_t *engine, traffic_action_t *action) {
+    traffic_execute_actions(engine, action, action ? 1U : 0U);
 }

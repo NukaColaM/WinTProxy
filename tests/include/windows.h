@@ -207,6 +207,10 @@ static inline HANDLE CreateEventA(LPSECURITY_ATTRIBUTES lpEventAttributes, BOOL 
     return (HANDLE)1;
 }
 
+#ifndef CreateEvent
+#define CreateEvent CreateEventA
+#endif
+
 static inline HANDLE CreateThread(LPSECURITY_ATTRIBUTES lpThreadAttributes, size_t dwStackSize,
                                   LPVOID lpStartAddress, LPVOID lpParameter,
                                   DWORD dwCreationFlags, DWORD *lpThreadId) {

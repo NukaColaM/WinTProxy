@@ -12,7 +12,8 @@
 extern "C" {
 #endif
 
-void path_plan_policy(ndisapi_engine_t *engine, packet_ctx_t *ctx,
+void path_plan_policy(ndisapi_engine_t *engine,
+                      const packet_observation_t *obs,
                       traffic_action_t *action);
 
 #ifdef __cplusplus

@@ -17,7 +17,8 @@ typedef enum {
     TRAFFIC_ACTION_DROP,
     TRAFFIC_ACTION_REWRITE_SEND,
     TRAFFIC_ACTION_FORWARD_UDP_TO_RELAY,
-    TRAFFIC_ACTION_FORWARD_DNS_TO_RESOLVER
+    TRAFFIC_ACTION_FORWARD_DNS_TO_RESOLVER,
+    TRAFFIC_ACTION_INJECT_DNS_RESPONSE
 } traffic_action_type_t;
 
 typedef enum {
@@ -56,6 +57,17 @@ typedef struct {
     HANDLE   adapter_handle;
 } traffic_dns_forward_t;
 
+typedef struct {
+    const uint8_t *dns_payload;
+    int           dns_len;
+    uint16_t      dns_txid;
+    uint32_t      original_dns_ip;
+    uint16_t      original_dns_port;
+    uint32_t      client_ip;
+    uint16_t      client_port;
+    HANDLE        adapter_handle;
+} traffic_dns_response_t;
+
 /*
  * Action descriptor — produced by planners, consumed by executor.
  * Deliberately exposes PINTERMEDIATE_BUFFER (ndisapi internals) to avoid
@@ -72,11 +84,15 @@ typedef struct {
     PINTERMEDIATE_BUFFER   ndis_buf;     /* carries direction + adapter handle */
     const char            *context;
     traffic_dns_forward_t  dns_forward;
+    traffic_dns_response_t dns_response;
 } traffic_action_t;
 
 /* === Action constructors === */
 void traffic_action_pass(traffic_action_t *action, packet_ctx_t *ctx,
                          PINTERMEDIATE_BUFFER ndis_buf, const char *context);
+void traffic_action_pass_observed(traffic_action_t *action,
+                                  const packet_observation_t *obs,
+                                  const char *context);
 void traffic_action_pass_raw(traffic_action_t *action, uint8_t *packet,
                              UINT packet_len,
                              PINTERMEDIATE_BUFFER ndis_buf,
@@ -84,15 +100,38 @@ void traffic_action_pass_raw(traffic_action_t *action, uint8_t *packet,
 void traffic_action_rewrite_send(traffic_action_t *action, packet_ctx_t *ctx,
                                  PINTERMEDIATE_BUFFER ndis_buf,
                                  const char *context);
+void traffic_action_rewrite_send_observed(traffic_action_t *action,
+                                          const packet_observation_t *obs,
+                                          const char *context);
 void traffic_action_drop(traffic_action_t *action, packet_ctx_t *ctx,
                          PINTERMEDIATE_BUFFER ndis_buf, const char *context);
+void traffic_action_drop_observed(traffic_action_t *action,
+                                  const packet_observation_t *obs,
+                                  const char *context);
 void traffic_action_forward_udp(traffic_action_t *action, packet_ctx_t *ctx,
                                 PINTERMEDIATE_BUFFER ndis_buf,
                                 const char *context);
+void traffic_action_forward_udp_observed(traffic_action_t *action,
+                                         const packet_observation_t *obs,
+                                         const char *context);
 void traffic_action_forward_dns(traffic_action_t *action, packet_ctx_t *ctx,
                                 PINTERMEDIATE_BUFFER ndis_buf,
                                 const traffic_dns_forward_t *forward,
                                 const char *context);
+void traffic_action_forward_dns_observed(traffic_action_t *action,
+                                         const packet_observation_t *obs,
+                                         const traffic_dns_forward_t *forward,
+                                         const char *context);
+void traffic_action_inject_dns_response(traffic_action_t *action,
+                                        const uint8_t *dns_payload,
+                                        int dns_len,
+                                        uint16_t dns_txid,
+                                        uint32_t original_dns_ip,
+                                        uint16_t original_dns_port,
+                                        uint32_t client_ip,
+                                        uint16_t client_port,
+                                        HANDLE adapter_handle,
+                                        const char *context);
 void traffic_action_set_send_target(traffic_action_t *action,
                                     traffic_send_target_t target);
 void traffic_action_rewrite_ip_src(traffic_action_t *action, uint32_t ip);

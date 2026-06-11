@@ -32,75 +32,75 @@ static int is_multicast_ip(uint32_t ip) {
 }
 
 traffic_class_t traffic_classify_packet(ndisapi_engine_t *engine,
-                                        packet_ctx_t *ctx) {
+                                        const packet_observation_t *obs) {
     int outbound;
 
-    if (!ctx || !ctx->ndis_buf) return TRAFFIC_CLASS_INBOUND;
+    if (!obs || !obs->ndis_buf) return TRAFFIC_CLASS_INBOUND;
 
-    outbound = (ctx->ndis_buf->m_dwDeviceFlags & PACKET_FLAG_ON_SEND) != 0;
+    outbound = obs->outbound;
 
     /* === TCP DNS return: inbound from redirect DNS over TCP === */
-    if (ctx->tcp_hdr && engine->dns_hijack->enabled &&
+    if (obs->has_tcp && engine->dns_hijack->enabled &&
         !outbound &&
-        ctx->src_ip == engine->dns_hijack->redirect_ip &&
-        ctx->src_port == engine->dns_hijack->redirect_port)
+        obs->src_ip == engine->dns_hijack->redirect_ip &&
+        obs->src_port == engine->dns_hijack->redirect_port)
         return TRAFFIC_CLASS_TCP_DNS_RETURN;
 
     /* === Inbound (non-DNS) or DNS response === */
     if (!outbound) {
-        if (ctx->udp_hdr && engine->dns_hijack->enabled &&
-            ctx->src_ip == engine->dns_hijack->redirect_ip &&
-            ctx->src_port == engine->dns_hijack->redirect_port)
+        if (obs->has_udp && engine->dns_hijack->enabled &&
+            obs->src_ip == engine->dns_hijack->redirect_ip &&
+            obs->src_port == engine->dns_hijack->redirect_port)
             return TRAFFIC_CLASS_DNS_RESPONSE;
         return TRAFFIC_CLASS_INBOUND;
     }
 
     /* === Outbound: return paths === */
-    if (ctx->tcp_hdr && ctx->src_port == engine->tcp_relay_port)
+    if (obs->has_tcp && obs->src_port == engine->tcp_relay_port)
         return TRAFFIC_CLASS_TCP_RETURN;
-    if (ctx->udp_hdr && ctx->src_port == engine->udp_relay_port)
+    if (obs->has_udp && obs->src_port == engine->udp_relay_port)
         return TRAFFIC_CLASS_UDP_RETURN;
 
     /* === Self/loop protection === */
-    if (ctx->dst_ip == engine->config->proxy.ip_addr &&
-        ctx->dst_port == engine->config->proxy.port)
+    if (obs->dst_ip == engine->config->proxy.ip_addr &&
+        obs->dst_port == engine->config->proxy.port)
         return TRAFFIC_CLASS_SELF_PROXY;
 
-    if (ctx->dst_port == engine->tcp_relay_port ||
-        ctx->dst_port == engine->udp_relay_port)
+    if (obs->dst_port == engine->tcp_relay_port ||
+        obs->dst_port == engine->udp_relay_port)
         return TRAFFIC_CLASS_SELF_RELAY;
 
     if (engine->dns_hijack->enabled &&
-        ctx->dst_ip == engine->dns_hijack->redirect_ip &&
-        ctx->dst_port == engine->dns_hijack->redirect_port)
+        obs->dst_ip == engine->dns_hijack->redirect_ip &&
+        obs->dst_port == engine->dns_hijack->redirect_port)
         return TRAFFIC_CLASS_SELF_DNS;
 
     /* Outbound DNS response from the redirect server (e.g. mihomo
      * sending its reply back to the forwarder socket on loopback).
      * Without this, the response would be classified as POLICY and
      * proxied through SOCKS5, destroying the DNS reply. */
-    if (outbound && ctx->udp_hdr && engine->dns_hijack->enabled &&
-        ctx->src_ip == engine->dns_hijack->redirect_ip &&
-        ctx->src_port == engine->dns_hijack->redirect_port)
+    if (outbound && obs->has_udp && engine->dns_hijack->enabled &&
+        obs->src_ip == engine->dns_hijack->redirect_ip &&
+        obs->src_port == engine->dns_hijack->redirect_port)
         return TRAFFIC_CLASS_SELF_DNS;
 
     /* === DNS queries === */
-    if (ctx->udp_hdr && dns_hijack_is_dns_request(ctx->dst_port) &&
+    if (obs->has_udp && dns_hijack_is_dns_request(obs->dst_port) &&
         engine->dns_hijack->enabled)
         return TRAFFIC_CLASS_DNS_QUERY_UDP;
 
-    if (ctx->tcp_hdr && dns_hijack_is_dns_request(ctx->dst_port) &&
+    if (obs->has_tcp && dns_hijack_is_dns_request(obs->dst_port) &&
         engine->dns_hijack->enabled)
         return TRAFFIC_CLASS_DNS_QUERY_TCP;
 
     /* === Non-proxyable destinations === */
-    if (engine->config->bypass.broadcast && ctx->dst_ip == 0xFFFFFFFF)
+    if (engine->config->bypass.broadcast && obs->dst_ip == 0xFFFFFFFF)
         return TRAFFIC_CLASS_NON_PROXYABLE;
 
-    if (engine->config->bypass.multicast && is_multicast_ip(ctx->dst_ip))
+    if (engine->config->bypass.multicast && is_multicast_ip(obs->dst_ip))
         return TRAFFIC_CLASS_NON_PROXYABLE;
 
-    if (engine->config->bypass.private_ips && path_is_private_ip(ctx->dst_ip))
+    if (engine->config->bypass.private_ips && path_is_private_ip(obs->dst_ip))
         return TRAFFIC_CLASS_NON_PROXYABLE;
 
     /* === Default: policy-based routing === */

@@ -2,7 +2,7 @@
 
 **Status**: done
 **Serial**: T8
-**Spec**: ../specs/2026-05-31-full-data-flow-refactor.md
+**Spec**: ../spec.md
 **Depends on**: T7
 
 > The data-flow refactor is only operable if normal debug logs show routing

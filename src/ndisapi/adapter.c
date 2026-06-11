@@ -49,28 +49,62 @@ uint16_t ndisapi_next_tcp_relay_src_port(ndisapi_engine_t *engine) {
     return (uint16_t)((LONG)WTP_TCP_RELAY_SRC_PORT_MIN + offset);
 }
 
-/* Single-packet send helpers.  The batch API is used in the worker loop;
- * these are convenience wrappers for the executor and DNS forwarder. */
-int ndisapi_send_to_mstcp(ndisapi_engine_t *engine, PINTERMEDIATE_BUFFER buf) {
-    DWORD sent = 0;
-    if (SendPacketsToMstcpUnsorted(engine->driver_handle, &buf, 1, &sent)) {
-        ndisapi_counter_inc(&engine->counters.packets_sent);
-        return 1;
+static void ndisapi_counter_add(volatile LONG64 *counter, LONG64 value) {
+    if (value > 0) {
+        InterlockedAdd64(counter, value);
     }
-    ndisapi_counter_inc(&engine->counters.send_failures);
+}
+
+int ndisapi_send_batch_to_mstcp(ndisapi_engine_t *engine,
+                                PINTERMEDIATE_BUFFER *bufs,
+                                DWORD count) {
+    DWORD sent = 0;
+    if (!engine || !bufs || count == 0) return 1;
+
+    if (SendPacketsToMstcpUnsorted(engine->driver_handle, bufs, count, &sent)) {
+        ndisapi_counter_add(&engine->counters.packets_sent, (LONG64)sent);
+        if (sent == count) {
+            return 1;
+        }
+        ndisapi_counter_add(&engine->counters.send_failures,
+                            (LONG64)(count - sent));
+        LOG_WARN("SendPacketsToMstcpUnsorted partial send: %lu/%lu",
+                 (unsigned long)sent, (unsigned long)count);
+        return 0;
+    }
+    ndisapi_counter_add(&engine->counters.send_failures, (LONG64)count);
     LOG_WARN("SendPacketsToMstcpUnsorted failed: err=%lu", GetLastError());
     return 0;
 }
 
-int ndisapi_send_to_adapter(ndisapi_engine_t *engine, PINTERMEDIATE_BUFFER buf) {
+int ndisapi_send_batch_to_adapter(ndisapi_engine_t *engine,
+                                  PINTERMEDIATE_BUFFER *bufs,
+                                  DWORD count) {
     DWORD sent = 0;
-    if (SendPacketsToAdaptersUnsorted(engine->driver_handle, &buf, 1, &sent)) {
-        ndisapi_counter_inc(&engine->counters.packets_sent);
-        return 1;
+    if (!engine || !bufs || count == 0) return 1;
+
+    if (SendPacketsToAdaptersUnsorted(engine->driver_handle, bufs, count, &sent)) {
+        ndisapi_counter_add(&engine->counters.packets_sent, (LONG64)sent);
+        if (sent == count) {
+            return 1;
+        }
+        ndisapi_counter_add(&engine->counters.send_failures,
+                            (LONG64)(count - sent));
+        LOG_WARN("SendPacketsToAdaptersUnsorted partial send: %lu/%lu",
+                 (unsigned long)sent, (unsigned long)count);
+        return 0;
     }
-    ndisapi_counter_inc(&engine->counters.send_failures);
+    ndisapi_counter_add(&engine->counters.send_failures, (LONG64)count);
     LOG_WARN("SendPacketsToAdaptersUnsorted failed: err=%lu", GetLastError());
     return 0;
+}
+
+int ndisapi_send_to_mstcp(ndisapi_engine_t *engine, PINTERMEDIATE_BUFFER buf) {
+    return ndisapi_send_batch_to_mstcp(engine, &buf, 1);
+}
+
+int ndisapi_send_to_adapter(ndisapi_engine_t *engine, PINTERMEDIATE_BUFFER buf) {
+    return ndisapi_send_batch_to_adapter(engine, &buf, 1);
 }
 
 /* ------------------------------------------------------------------ */
@@ -259,24 +293,29 @@ static DWORD WINAPI ndisapi_worker_proc(LPVOID param) {
             InterlockedAdd64(&engine->counters.packets_recv, inc);
         }
 
-        for (j = 0; j < packets_read; j++) {
+        packet_ctx_t contexts[NDISAPI_BATCH_SIZE];
+        traffic_action_t actions[NDISAPI_BATCH_SIZE];
+        size_t action_count = 0;
+
+        for (j = 0; j < packets_read && action_count < NDISAPI_BATCH_SIZE; j++) {
             PINTERMEDIATE_BUFFER buf = read_ptrs[j];
             if (!buf || buf->m_Length < ETHER_HDR_LEN) continue;
 
-            packet_ctx_t ctx;
-            if (packet_parse(&ctx, buf)) {
-                traffic_action_t action;
-                traffic_plan_packet(engine, &ctx, &action);
-
-                traffic_execute_action(engine, &action);
+            if (packet_parse(&contexts[action_count], buf)) {
+                traffic_plan_packet(engine,
+                                    packet_observe(&contexts[action_count]),
+                                    &actions[action_count]);
+                action_count++;
             } else {
                 /* Unparseable packet — pass through */
-                traffic_action_t action;
-                traffic_action_pass_raw(&action, buf->m_IBuffer, buf->m_Length,
+                traffic_action_pass_raw(&actions[action_count],
+                                        buf->m_IBuffer, buf->m_Length,
                                         buf, "unparseable");
-                traffic_execute_action(engine, &action);
+                action_count++;
             }
         }
+
+        traffic_execute_actions(engine, actions, action_count);
     }
 
     return 0;

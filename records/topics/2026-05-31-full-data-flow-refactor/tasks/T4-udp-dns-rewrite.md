@@ -2,7 +2,7 @@
 
 **Status**: done
 **Serial**: T4 (sequential within this spec -- T1, T2, T3...)
-**Spec**: ../specs/2026-05-31-full-data-flow-refactor.md
+**Spec**: ../spec.md
 **Depends on**: T3 (the UDP flow contract and execution path must already exist before DNS can reuse them safely)
 
 > Normal DNS is the first special-case path that has to fit the new model without bypassing it.

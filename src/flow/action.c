@@ -24,6 +24,14 @@ void traffic_action_pass(traffic_action_t *action, packet_ctx_t *ctx,
     traffic_action_init(action, TRAFFIC_ACTION_PASS, ctx, ndis_buf, context);
 }
 
+void traffic_action_pass_observed(traffic_action_t *action,
+                                  const packet_observation_t *obs,
+                                  const char *context) {
+    traffic_action_init(action, TRAFFIC_ACTION_PASS,
+                        packet_observation_context(obs),
+                        obs ? obs->ndis_buf : NULL, context);
+}
+
 void traffic_action_pass_raw(traffic_action_t *action, uint8_t *packet,
                              UINT packet_len,
                              PINTERMEDIATE_BUFFER ndis_buf,
@@ -96,9 +104,25 @@ void traffic_action_rewrite_send(traffic_action_t *action, packet_ctx_t *ctx,
     traffic_action_init(action, TRAFFIC_ACTION_REWRITE_SEND, ctx, ndis_buf, context);
 }
 
+void traffic_action_rewrite_send_observed(traffic_action_t *action,
+                                          const packet_observation_t *obs,
+                                          const char *context) {
+    traffic_action_init(action, TRAFFIC_ACTION_REWRITE_SEND,
+                        packet_observation_context(obs),
+                        obs ? obs->ndis_buf : NULL, context);
+}
+
 void traffic_action_drop(traffic_action_t *action, packet_ctx_t *ctx,
                          PINTERMEDIATE_BUFFER ndis_buf, const char *context) {
     traffic_action_init(action, TRAFFIC_ACTION_DROP, ctx, ndis_buf, context);
+}
+
+void traffic_action_drop_observed(traffic_action_t *action,
+                                  const packet_observation_t *obs,
+                                  const char *context) {
+    traffic_action_init(action, TRAFFIC_ACTION_DROP,
+                        packet_observation_context(obs),
+                        obs ? obs->ndis_buf : NULL, context);
 }
 
 void traffic_action_forward_udp(traffic_action_t *action, packet_ctx_t *ctx,
@@ -108,6 +132,14 @@ void traffic_action_forward_udp(traffic_action_t *action, packet_ctx_t *ctx,
                         ctx, ndis_buf, context);
 }
 
+void traffic_action_forward_udp_observed(traffic_action_t *action,
+                                         const packet_observation_t *obs,
+                                         const char *context) {
+    traffic_action_init(action, TRAFFIC_ACTION_FORWARD_UDP_TO_RELAY,
+                        packet_observation_context(obs),
+                        obs ? obs->ndis_buf : NULL, context);
+}
+
 void traffic_action_forward_dns(traffic_action_t *action, packet_ctx_t *ctx,
                                 PINTERMEDIATE_BUFFER ndis_buf,
                                 const traffic_dns_forward_t *forward,
@@ -115,4 +147,37 @@ void traffic_action_forward_dns(traffic_action_t *action, packet_ctx_t *ctx,
     traffic_action_init(action, TRAFFIC_ACTION_FORWARD_DNS_TO_RESOLVER,
                         ctx, ndis_buf, context);
     if (forward) action->dns_forward = *forward;
+}
+
+void traffic_action_forward_dns_observed(traffic_action_t *action,
+                                         const packet_observation_t *obs,
+                                         const traffic_dns_forward_t *forward,
+                                         const char *context) {
+    traffic_action_init(action, TRAFFIC_ACTION_FORWARD_DNS_TO_RESOLVER,
+                        packet_observation_context(obs),
+                        obs ? obs->ndis_buf : NULL, context);
+    if (forward) action->dns_forward = *forward;
+}
+
+void traffic_action_inject_dns_response(traffic_action_t *action,
+                                        const uint8_t *dns_payload,
+                                        int dns_len,
+                                        uint16_t dns_txid,
+                                        uint32_t original_dns_ip,
+                                        uint16_t original_dns_port,
+                                        uint32_t client_ip,
+                                        uint16_t client_port,
+                                        HANDLE adapter_handle,
+                                        const char *context) {
+    memset(action, 0, sizeof(*action));
+    action->type = TRAFFIC_ACTION_INJECT_DNS_RESPONSE;
+    action->context = context;
+    action->dns_response.dns_payload = dns_payload;
+    action->dns_response.dns_len = dns_len;
+    action->dns_response.dns_txid = dns_txid;
+    action->dns_response.original_dns_ip = original_dns_ip;
+    action->dns_response.original_dns_port = original_dns_port;
+    action->dns_response.client_ip = client_ip;
+    action->dns_response.client_port = client_port;
+    action->dns_response.adapter_handle = adapter_handle;
 }

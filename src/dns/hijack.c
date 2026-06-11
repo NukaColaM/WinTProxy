@@ -1,13 +1,12 @@
 #include "dns/hijack.h"
 #include "app/log.h"
 #include "core/util.h"
+#include "flow/action.h"
+#include "flow/executor.h"
 #include <stdlib.h>
 #include <string.h>
 
-#include "net/headers.h"
-
 #include "ndisapi/adapter.h"
-#include "ndisapi/ndisapi.h"
 
 #include <winsock2.h>
 
@@ -359,103 +358,19 @@ static DWORD WINAPI dns_fwd_thread(LPVOID param) {
                 continue;
             }
 
-            buf[0] = (uint8_t)(original_txid >> 8);
-            buf[1] = (uint8_t)(original_txid & 0xFF);
-
-            /* Build full Ethernet+IP+UDP+DNS packet and inject via MSTCP */
             {
                 ndisapi_engine_t *eng = (ndisapi_engine_t *)dh->engine_ctx;
-                char cli_str[16], orig_str[16];
+                traffic_action_t action;
 
-                /* Allocate an INTERMEDIATE_BUFFER on the heap — the driver
-                 * handle is opened with FILE_FLAG_OVERLAPPED; heap memory
-                 * avoids potential issues with stack-allocated buffers. */
-                PINTERMEDIATE_BUFFER pkt = (PINTERMEDIATE_BUFFER)
-                    calloc(1, sizeof(INTERMEDIATE_BUFFER));
-                if (!pkt) continue;
-
-                ether_header_ptr eth = (ether_header_ptr)pkt->m_IBuffer;
-                iphdr_ptr        ip  = (iphdr_ptr)(pkt->m_IBuffer + ETHER_HDR_LEN);
-                udphdr_ptr       udp = (udphdr_ptr)(pkt->m_IBuffer + ETHER_HDR_LEN + 20);
-                uint8_t         *dns_payload = pkt->m_IBuffer + ETHER_HDR_LEN + 20 + 8;
-
-                int ip_len = 20 + 8 + (int)n;
-                int total_len = ETHER_HDR_LEN + ip_len;
-
-                /* Ethernet: destination = adapter MAC of the interface that the
-                 * original DNS query arrived on; source = same MAC.  MSTCP delivery
-                 * requires the destination MAC to match a local interface. */
-                memset(eth->h_dest, 0, 6);
-                memset(eth->h_source, 0, 6);
-                if (orig_adapter_handle && eng->adapter_count > 0) {
-                    /* Find the MAC address for the adapter that carried the
-                     * original query, so MSTCP delivers the response on the
-                     * correct interface. */
-                    int mac_found = 0;
-                    for (DWORD i = 0; i < eng->adapter_count; i++) {
-                        if (eng->adapter_handles[i] == orig_adapter_handle) {
-                            memcpy(eth->h_dest, eng->adapter_mac[i], 6);
-                            memcpy(eth->h_source, eng->adapter_mac[i], 6);
-                            mac_found = 1;
-                            break;
-                        }
-                    }
-                    if (!mac_found) {
-                        memcpy(eth->h_dest, eng->adapter_mac[0], 6);
-                        memcpy(eth->h_source, eng->adapter_mac[0], 6);
-                    }
-                } else if (eng->adapter_count > 0) {
-                    memcpy(eth->h_dest, eng->adapter_mac[0], 6);
-                    memcpy(eth->h_source, eng->adapter_mac[0], 6);
-                }
-                eth->h_proto = htons(ETH_P_IP);
-
-                /* IP header */
-                memset(ip, 0, 20);
-                ip->ip_v = 4;
-                ip->ip_hl = 5;
-                ip->ip_len = htons((uint16_t)ip_len);
-                ip->ip_ttl = 64;
-                ip->ip_p = 17;  /* UDP */
-                ip->ip_src = orig_dns_ip;
-                ip->ip_dst = client_ip;
-
-                /* UDP header */
-                udp->uh_sport = htons(orig_dns_port);
-                udp->uh_dport = htons(client_src_port);
-                udp->uh_ulen = htons((uint16_t)(8 + n));
-                udp->uh_sum = 0;
-
-                /* DNS payload */
-                memcpy(dns_payload, buf, (size_t)n);
-
-                pkt->m_Length = (DWORD)total_len;
-                pkt->m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;
-                pkt->m_hAdapter = orig_adapter_handle;
-                if (!pkt->m_hAdapter && eng->adapter_count > 0) {
-                    pkt->m_hAdapter = eng->adapter_handles[0];
-                }
-
-                /* Recalculate checksums */
-                RecalculateUDPChecksum(pkt);
-                RecalculateIPChecksum(pkt);
-
-                /* Send to MSTCP */
-                {
-                    DWORD sent = 0;
-                    if (SendPacketsToMstcpUnsorted(eng->driver_handle,
-                                                    &pkt, 1, &sent)) {
-                        ip_to_str(client_ip, cli_str, sizeof(cli_str));
-                        ip_to_str(orig_dns_ip, orig_str, sizeof(orig_str));
-                        LOG_DEBUG("DNS fwd: txid=0x%04x sent to MSTCP %s:%u <-- %s:%u",
-                            original_txid, cli_str, client_src_port,
-                            orig_str, orig_dns_port);
-                    } else {
-                        LOG_WARN("DNS fwd: SendPacketsToMstcpUnsorted failed: %lu",
-                                 GetLastError());
-                    }
-                }
-                free(pkt);
+                traffic_action_inject_dns_response(&action, buf, n,
+                                                   original_txid,
+                                                   orig_dns_ip,
+                                                   orig_dns_port,
+                                                   client_ip,
+                                                   client_src_port,
+                                                   orig_adapter_handle,
+                                                   "dns fwd response");
+                traffic_execute_action(eng, &action);
             }
         }
     }

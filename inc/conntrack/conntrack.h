@@ -63,8 +63,64 @@ typedef struct {
     HANDLE             stop_event;
 } conntrack_t;
 
+typedef struct {
+    uint32_t client_ip;
+    uint16_t client_port;
+    uint32_t server_ip;
+    uint16_t server_port;
+    uint32_t pid;
+    const char *process_name;
+    uint32_t if_idx;
+    uint32_t sub_if_idx;
+} conntrack_direct_tcp_flow_t;
+
+typedef struct {
+    uint32_t client_ip;
+    uint16_t client_port;
+    uint32_t server_ip;
+    uint16_t server_port;
+    uint16_t relay_port;
+    uint16_t proposed_relay_src_port;
+    uint32_t pid;
+    const char *process_name;
+    uint32_t if_idx;
+    uint32_t sub_if_idx;
+} conntrack_tcp_proxy_flow_t;
+
+typedef struct {
+    uint32_t client_ip;
+    uint16_t client_port;
+    uint32_t server_ip;
+    uint16_t server_port;
+    uint32_t pid;
+    const char *process_name;
+    uint32_t if_idx;
+    uint32_t sub_if_idx;
+} conntrack_udp_proxy_flow_t;
+
+typedef struct {
+    uint32_t client_ip;
+    uint16_t client_port;
+    uint32_t original_dns_ip;
+    uint16_t original_dns_port;
+    uint32_t redirect_ip;
+    uint16_t redirect_port;
+    int      loopback_redirect;
+    uint32_t if_idx;
+    uint32_t sub_if_idx;
+} conntrack_tcp_dns_flow_t;
+
 error_t conntrack_init(conntrack_t *ct);
 void    conntrack_shutdown(conntrack_t *ct);
+error_t conntrack_track_direct_tcp(conntrack_t *ct,
+                                   const conntrack_direct_tcp_flow_t *flow);
+error_t conntrack_track_tcp_proxy(conntrack_t *ct,
+                                  const conntrack_tcp_proxy_flow_t *flow,
+                                  uint16_t *relay_src_port_out);
+error_t conntrack_track_udp_proxy(conntrack_t *ct,
+                                  const conntrack_udp_proxy_flow_t *flow);
+error_t conntrack_track_tcp_dns(conntrack_t *ct,
+                                const conntrack_tcp_dns_flow_t *flow);
 error_t conntrack_add(conntrack_t *ct, uint16_t src_port, uint32_t src_ip,
                       uint32_t orig_dst_ip, uint16_t orig_dst_port, uint8_t protocol,
                       uint32_t pid, const char *process_name,
@@ -110,12 +166,19 @@ error_t conntrack_get_udp_proxy_outbound(conntrack_t *ct, uint32_t client_ip,
 error_t conntrack_get_udp_proxy_return(conntrack_t *ct, uint32_t server_ip,
                                        uint16_t client_port,
                                        conntrack_entry_t *out);
+error_t conntrack_get_tcp_dns_return(conntrack_t *ct, uint32_t response_src_ip,
+                                     uint16_t response_src_port,
+                                     uint32_t response_dst_ip,
+                                     uint16_t response_dst_port,
+                                     conntrack_entry_t *out);
 void    conntrack_remove(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol);
 void    conntrack_remove_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_port,
                              uint32_t dst_ip, uint16_t dst_port, uint8_t protocol);
 void    conntrack_touch(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol);
 void    conntrack_touch_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_port,
                             uint32_t dst_ip, uint16_t dst_port, uint8_t protocol);
+void    conntrack_touch_direct_tcp(conntrack_t *ct,
+                                   const conntrack_entry_t *entry);
 void    conntrack_touch_tcp_proxy_outbound(conntrack_t *ct,
                                            const conntrack_entry_t *entry);
 void    conntrack_touch_tcp_proxy_return(conntrack_t *ct,

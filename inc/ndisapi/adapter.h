@@ -89,7 +89,13 @@ uint16_t ndisapi_next_tcp_relay_src_port(ndisapi_engine_t *engine);
 void     ndisapi_count_drop(ndisapi_engine_t *engine);
 void     ndisapi_count_udp_forwarded(ndisapi_engine_t *engine);
 
-/* === Packet send — used by executor and DNS forwarder === */
+/* === Packet send — executor-owned send boundary === */
+int      ndisapi_send_batch_to_mstcp(ndisapi_engine_t *engine,
+                                     PINTERMEDIATE_BUFFER *bufs,
+                                     DWORD count);
+int      ndisapi_send_batch_to_adapter(ndisapi_engine_t *engine,
+                                       PINTERMEDIATE_BUFFER *bufs,
+                                       DWORD count);
 int      ndisapi_send_to_mstcp(ndisapi_engine_t *engine, PINTERMEDIATE_BUFFER buf);
 int      ndisapi_send_to_adapter(ndisapi_engine_t *engine, PINTERMEDIATE_BUFFER buf);
 

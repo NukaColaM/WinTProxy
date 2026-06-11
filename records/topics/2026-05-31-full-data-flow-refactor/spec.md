@@ -13,11 +13,11 @@ Refactor the packet path into a clearer end-to-end flow with one explicit plan s
 The refactor should preserve the existing external behavior that operators rely on: config and CLI shape, proxy/direct policy semantics, DNS-before-policy ordering, self/loop protection, and TCP/UDP return-path behavior. Direct traffic should still be allowed as an explicit policy result for newly observed flows, while preexisting external connections at startup should be discarded so they cannot bypass WinTProxy.
 
 ## User stories
-1. As a maintainer, I want to redesign the entire packet data flow around one end-to-end pipeline, so that the migrated framework is stabilized instead of patched in place.  ← Q1, Q3
-2. As a maintainer, I want planning to produce an explicit flow plan before any packet mutation, so that rewrite logic and send routing happen in one audited step.  ← Q2
-3. As an operator, I want the refactor to preserve config, policy, DNS ordering, self/loop protection, and return-path semantics, so that the external behavior stays predictable.  ← Q4
-4. As a maintainer, I want undecided packets to fail closed whenever they could leak or corrupt state, so that unsafe flow transitions never bypass WinTProxy.  ← Q5
-5. As an operator, I want preexisting external connections discarded at startup while still allowing new direct decisions for observed flows, so that traffic established before WinTProxy cannot escape interception.  ← Q6, Q7
+1. As a maintainer, I want to redesign the entire packet data flow around one end-to-end pipeline, so that the migrated framework is stabilized instead of patched in place. (Q1, Q3)
+2. As a maintainer, I want planning to produce an explicit flow plan before any packet mutation, so that rewrite logic and send routing happen in one audited step. (Q2)
+3. As an operator, I want the refactor to preserve config, policy, DNS ordering, self/loop protection, and return-path semantics, so that the external behavior stays predictable. (Q4)
+4. As a maintainer, I want undecided packets to fail closed whenever they could leak or corrupt state, so that unsafe flow transitions never bypass WinTProxy. (Q5)
+5. As an operator, I want preexisting external connections discarded at startup while still allowing new direct decisions for observed flows, so that traffic established before WinTProxy cannot escape interception. (Q6, Q7)
 
 ## Technical decisions
 - Modify the packet context and packet parsing modules so the observed packet facts and rewrite state are no longer treated as one thing.

@@ -2,7 +2,7 @@
 
 **Status**: done
 **Serial**: T3 (sequential within this spec -- T1, T2, T3...)
-**Spec**: ../specs/2026-05-31-full-data-flow-refactor.md
+**Spec**: ../spec.md
 **Depends on**: T2 (the conntrack role model and TCP proxy return path must exist before UDP can reuse the same flow contract)
 
 > UDP proxying proves the same flow model works for datagrams, not just TCP streams.

@@ -268,6 +268,144 @@ error_t conntrack_add(conntrack_t *ct, uint16_t src_port, uint32_t src_ip,
                                   if_idx, sub_if_idx, src_port);
 }
 
+error_t conntrack_track_direct_tcp(conntrack_t *ct,
+                                   const conntrack_direct_tcp_flow_t *flow) {
+    if (!ct || !flow) return ERR_PARAM;
+
+    return conntrack_add_key_full(ct,
+                                  flow->client_ip, flow->client_port,
+                                  flow->server_ip, flow->server_port,
+                                  flow->client_ip, flow->client_port,
+                                  flow->server_ip, flow->server_port,
+                                  flow->server_ip, flow->server_port,
+                                  WTP_IPPROTO_TCP,
+                                  flow->pid, flow->process_name,
+                                  flow->if_idx, flow->sub_if_idx, 0);
+}
+
+error_t conntrack_track_tcp_proxy(conntrack_t *ct,
+                                  const conntrack_tcp_proxy_flow_t *flow,
+                                  uint16_t *relay_src_port_out) {
+    conntrack_entry_t existing;
+    uint16_t relay_src_port;
+    error_t err;
+
+    if (!ct || !flow || flow->relay_port == 0) return ERR_PARAM;
+
+    relay_src_port = flow->proposed_relay_src_port;
+    if (conntrack_get_tcp_proxy_outbound(ct, flow->client_ip,
+                                         flow->client_port,
+                                         flow->server_ip,
+                                         flow->server_port,
+                                         &existing) == ERR_OK &&
+        existing.relay_src_port != 0) {
+        relay_src_port = existing.relay_src_port;
+    }
+    if (relay_src_port == 0) return ERR_PARAM;
+
+    err = conntrack_add_key_full(ct,
+                                 flow->client_ip, flow->client_port,
+                                 flow->server_ip, flow->server_port,
+                                 flow->client_ip, flow->client_port,
+                                 flow->server_ip, flow->server_port,
+                                 flow->server_ip, flow->server_port,
+                                 WTP_IPPROTO_TCP,
+                                 flow->pid, flow->process_name,
+                                 flow->if_idx, flow->sub_if_idx,
+                                 relay_src_port);
+    if (err != ERR_OK) return err;
+
+    err = conntrack_add_key_full(ct,
+                                 flow->server_ip, relay_src_port,
+                                 flow->client_ip, flow->relay_port,
+                                 flow->client_ip, flow->client_port,
+                                 flow->server_ip, flow->server_port,
+                                 flow->server_ip, flow->server_port,
+                                 WTP_IPPROTO_TCP,
+                                 flow->pid, flow->process_name,
+                                 flow->if_idx, flow->sub_if_idx,
+                                 relay_src_port);
+    if (err != ERR_OK) {
+        conntrack_remove_key(ct, flow->client_ip, flow->client_port,
+                             flow->server_ip, flow->server_port,
+                             WTP_IPPROTO_TCP);
+        return err;
+    }
+
+    if (conntrack_get_tcp_proxy_outbound(ct, flow->client_ip,
+                                         flow->client_port,
+                                         flow->server_ip,
+                                         flow->server_port,
+                                         &existing) == ERR_OK &&
+        existing.relay_src_port != 0 &&
+        existing.relay_src_port != relay_src_port) {
+        conntrack_remove_key(ct, flow->server_ip, relay_src_port,
+                             flow->client_ip, flow->relay_port,
+                             WTP_IPPROTO_TCP);
+        relay_src_port = existing.relay_src_port;
+    }
+
+    if (relay_src_port_out) *relay_src_port_out = relay_src_port;
+    return ERR_OK;
+}
+
+error_t conntrack_track_udp_proxy(conntrack_t *ct,
+                                  const conntrack_udp_proxy_flow_t *flow) {
+    error_t err;
+
+    if (!ct || !flow) return ERR_PARAM;
+
+    err = conntrack_add_key_full(ct,
+                                 flow->client_ip, flow->client_port,
+                                 0, 0,
+                                 flow->client_ip, flow->client_port,
+                                 flow->server_ip, flow->server_port,
+                                 flow->server_ip, flow->server_port,
+                                 WTP_IPPROTO_UDP,
+                                 flow->pid, flow->process_name,
+                                 flow->if_idx, flow->sub_if_idx,
+                                 flow->client_port);
+    if (err != ERR_OK) return err;
+
+    err = conntrack_add_key_full(ct,
+                                 flow->server_ip, flow->client_port,
+                                 0, 0,
+                                 flow->client_ip, flow->client_port,
+                                 flow->server_ip, flow->server_port,
+                                 flow->server_ip, flow->server_port,
+                                 WTP_IPPROTO_UDP,
+                                 flow->pid, flow->process_name,
+                                 flow->if_idx, flow->sub_if_idx,
+                                 flow->client_port);
+    if (err != ERR_OK) {
+        conntrack_remove(ct, flow->client_ip, flow->client_port,
+                         WTP_IPPROTO_UDP);
+        return err;
+    }
+    return ERR_OK;
+}
+
+error_t conntrack_track_tcp_dns(conntrack_t *ct,
+                                const conntrack_tcp_dns_flow_t *flow) {
+    uint32_t key_src_ip;
+
+    if (!ct || !flow) return ERR_PARAM;
+
+    key_src_ip = flow->loopback_redirect ?
+        flow->original_dns_ip : flow->client_ip;
+
+    return conntrack_add_key_full(ct,
+                                  key_src_ip, flow->client_port,
+                                  flow->redirect_ip, flow->redirect_port,
+                                  flow->client_ip, flow->client_port,
+                                  flow->original_dns_ip,
+                                  flow->original_dns_port,
+                                  flow->redirect_ip, flow->redirect_port,
+                                  WTP_IPPROTO_TCP, 0, "",
+                                  flow->if_idx, flow->sub_if_idx,
+                                  flow->client_port);
+}
+
 error_t conntrack_get(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol,
                       uint32_t *orig_dst_ip, uint16_t *orig_dst_port) {
     conntrack_entry_t entry;
@@ -340,6 +478,16 @@ error_t conntrack_get_udp_proxy_return(conntrack_t *ct, uint32_t server_ip,
                               WTP_IPPROTO_UDP, out);
 }
 
+error_t conntrack_get_tcp_dns_return(conntrack_t *ct, uint32_t response_src_ip,
+                                     uint16_t response_src_port,
+                                     uint32_t response_dst_ip,
+                                     uint16_t response_dst_port,
+                                     conntrack_entry_t *out) {
+    return conntrack_get_full_key(ct, response_dst_ip, response_dst_port,
+                                  response_src_ip, response_src_port,
+                                  WTP_IPPROTO_TCP, out);
+}
+
 void conntrack_remove(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol) {
     conntrack_remove_key(ct, src_ip, src_port, 0, 0, protocol);
 }
@@ -386,6 +534,14 @@ void conntrack_touch_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_port,
     }
 
     ReleaseSRWLockExclusive(&ct->locks[idx]);
+}
+
+void conntrack_touch_direct_tcp(conntrack_t *ct,
+                                const conntrack_entry_t *entry) {
+    if (!ct || !entry) return;
+    conntrack_touch_key(ct, entry->src_ip, entry->client_port,
+                        entry->orig_dst_ip, entry->orig_dst_port,
+                        WTP_IPPROTO_TCP);
 }
 
 void conntrack_touch_tcp_proxy_outbound(conntrack_t *ct,

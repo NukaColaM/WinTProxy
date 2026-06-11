@@ -2,7 +2,7 @@
 
 **Status**: done
 **Serial**: T2 (sequential within this spec -- T1, T2, T3...)
-**Spec**: ../specs/2026-05-31-full-data-flow-refactor.md
+**Spec**: ../spec.md
 **Depends on**: T1 (the flow-plan boundary and single execution owner must exist before TCP proxying can move onto it)
 
 > TCP proxying is the first full stateful flow to prove that the new plan/execution split and conntrack contract still preserve the original behavior.

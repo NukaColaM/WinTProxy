@@ -2,7 +2,7 @@
 
 **Status**: done
 **Serial**: T5 (sequential within this spec -- T1, T2, T3...)
-**Spec**: ../specs/2026-05-31-full-data-flow-refactor.md
+**Spec**: ../spec.md
 **Depends on**: T4 (the normal DNS rewrite path must exist before the loopback and TCP DNS variants can layer on their special handling)
 
 > The loopback DNS path is the tricky one: it has its own forwarding and response injection behavior, and TCP DNS has its own conntrack return path.

@@ -2,7 +2,7 @@
 
 **Status**: done
 **Serial**: T7
-**Spec**: ../specs/2026-05-31-full-data-flow-refactor.md
+**Spec**: ../spec.md
 **Depends on**: T6
 
 > Shutdown is part of the data-flow boundary: packet interception must stay up

@@ -14,8 +14,8 @@
 | Q7 | After startup, should direct traffic still be permitted by policy, or should WinTProxy proxy or drop everything new and treat “direct” only as a pre-startup exception cleanup mode? | Direct traffic remains permitted by policy after startup, but only for flows WinTProxy observes and classifies as direct; preexisting external flows are ignored or discarded. |
 
 ## Stories
-1. As a maintainer, I want to redesign the entire packet data flow around one end-to-end pipeline, so that the migrated framework is stabilized instead of patched in place. ← Q1, Q3
-2. As a maintainer, I want planning to produce an explicit flow plan before any packet mutation, so that rewrite logic and send routing happen in one audited step. ← Q2
-3. As an operator, I want the refactor to preserve config, policy, DNS ordering, self/loop protection, and return-path semantics, so that the external behavior stays predictable. ← Q4
-4. As a maintainer, I want undecided packets to fail closed whenever they could leak or corrupt state, so that unsafe flow transitions never bypass WinTProxy. ← Q5
-5. As an operator, I want preexisting external connections discarded at startup while still allowing new direct decisions for observed flows, so that traffic established before WinTProxy cannot escape interception. ← Q6, Q7
+1. As a maintainer, I want to redesign the entire packet data flow around one end-to-end pipeline, so that the migrated framework is stabilized instead of patched in place. (Q1, Q3)
+2. As a maintainer, I want planning to produce an explicit flow plan before any packet mutation, so that rewrite logic and send routing happen in one audited step. (Q2)
+3. As an operator, I want the refactor to preserve config, policy, DNS ordering, self/loop protection, and return-path semantics, so that the external behavior stays predictable. (Q4)
+4. As a maintainer, I want undecided packets to fail closed whenever they could leak or corrupt state, so that unsafe flow transitions never bypass WinTProxy. (Q5)
+5. As an operator, I want preexisting external connections discarded at startup while still allowing new direct decisions for observed flows, so that traffic established before WinTProxy cannot escape interception. (Q6, Q7)

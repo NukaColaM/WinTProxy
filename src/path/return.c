@@ -12,7 +12,8 @@
 #include "core/util.h"
 #include <winsock2.h>
 
-void path_plan_return(ndisapi_engine_t *engine, packet_ctx_t *ctx,
+void path_plan_return(ndisapi_engine_t *engine,
+                      const packet_observation_t *obs,
                       int is_tcp, traffic_action_t *action) {
     conntrack_entry_t entry;
     error_t err;
@@ -24,26 +25,26 @@ void path_plan_return(ndisapi_engine_t *engine, packet_ctx_t *ctx,
      *   src = client_ip:relay_port  (relay bound to INADDR_ANY)
      *   dst = server_ip:relay_src_port
      * Entry B key: (server_ip, relay_src_port, client_ip, relay_port, TCP)
-     * So we look up (ctx->dst_ip, ctx->dst_port, ctx->src_ip, ctx->src_port).
+     * So we look up (obs->dst_ip, obs->dst_port, obs->src_ip, obs->src_port).
      */
     if (is_tcp) {
         err = conntrack_get_tcp_proxy_return(engine->conntrack,
-                                             ctx->dst_ip, ctx->dst_port,
-                                             ctx->src_ip, ctx->src_port,
+                                             obs->dst_ip, obs->dst_port,
+                                             obs->src_ip, obs->src_port,
                                              &entry);
     } else {
         err = conntrack_get_udp_proxy_return(engine->conntrack,
-                                             ctx->dst_ip, ctx->dst_port,
+                                             obs->dst_ip, obs->dst_port,
                                              &entry);
     }
     if (err != ERR_OK) {
         LOG_WARN("%s return: no conntrack for dst %s:%u",
                  is_tcp ? "TCP" : "UDP",
                  is_tcp ? "?" : "",
-                 ctx->dst_port);
-        traffic_action_drop(action, ctx, ctx->ndis_buf,
-                            is_tcp ? "TCP return missing conntrack"
-                                   : "UDP return missing conntrack");
+                 obs ? obs->dst_port : 0);
+        traffic_action_drop_observed(action, obs,
+                                     is_tcp ? "TCP return missing conntrack"
+                                            : "UDP return missing conntrack");
         return;
     }
 
@@ -65,8 +66,8 @@ void path_plan_return(ndisapi_engine_t *engine, packet_ctx_t *ctx,
             orig_src_str, entry.client_port);
     }
 
-    traffic_action_rewrite_send(action, ctx, ctx->ndis_buf,
-                                is_tcp ? "TCP return" : "UDP return");
+    traffic_action_rewrite_send_observed(action, obs,
+                                         is_tcp ? "TCP return" : "UDP return");
     traffic_action_rewrite_ip_src(action, entry.orig_dst_ip);
     traffic_action_rewrite_ip_dst(action, entry.src_ip);
     if (is_tcp) {

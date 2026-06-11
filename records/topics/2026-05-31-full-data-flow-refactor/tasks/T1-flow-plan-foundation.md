@@ -2,7 +2,7 @@
 
 **Status**: done
 **Serial**: T1 (sequential within this spec -- T1, T2, T3...)
-**Spec**: ../specs/2026-05-31-full-data-flow-refactor.md
+**Spec**: ../spec.md
 **Depends on**: T0 (none -- this task stands alone)
 
 > The packet-plan seam and single execution path need to exist before any proxy, DNS, or startup quarantine work can be trusted in the new model.

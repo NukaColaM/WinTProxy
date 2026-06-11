@@ -102,7 +102,7 @@ static void test_policy_route_decision_is_debug_visible(void) {
                     htonl(0x0A000002U), 12345,
                     htonl(0x08080808U), 443);
 
-    path_plan_policy(&engine, &ctx, &action);
+    path_plan_policy(&engine, packet_observe(&ctx), &action);
 
     check_int("policy route logged once at debug",
               g_test_log_write_count, 1);
@@ -126,7 +126,7 @@ static void test_bypass_decision_is_debug_visible(void) {
                     htonl(0x0A000002U), 12345,
                     htonl(0xE00000FBU), 5353);
 
-    path_plan_bypass(&engine, &ctx, &action, "multicast");
+    path_plan_bypass(&engine, packet_observe(&ctx), &action, "multicast");
 
     check_int("bypass route logged once at debug",
               g_test_log_write_count, 1);

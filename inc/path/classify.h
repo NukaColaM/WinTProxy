@@ -27,11 +27,10 @@ typedef enum {
 } traffic_class_t;
 
 /*
- * Direction is read from ctx->ndis_buf->m_dwDeviceFlags (PACKET_FLAG_ON_SEND/
- * PACKET_FLAG_ON_RECEIVE).
+ * Direction is read from the packet observation.
  */
 traffic_class_t traffic_classify_packet(ndisapi_engine_t *engine,
-                                        packet_ctx_t *ctx);
+                                        const packet_observation_t *obs);
 const char *adapter_name_for_handle(ndisapi_engine_t *engine, HANDLE h);
 int path_is_private_ip(uint32_t ip);
 

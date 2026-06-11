@@ -17,6 +17,94 @@
 
 /* === Packet parsing === */
 
+static int packet_payload_bounds(packet_ctx_t *ctx, const uint8_t **payload,
+                                 UINT *payload_len) {
+    UINT ip_hdr_len;
+    UINT transp_off;
+    UINT transp_hdr_len;
+    const uint8_t *data;
+    UINT len;
+
+    if (!ctx || !ctx->ip_hdr) return 0;
+
+    ip_hdr_len = (UINT)ctx->ip_hdr->ip_hl * 4U;
+    transp_off = ETHER_HDR_LEN + ip_hdr_len;
+
+    if (ctx->tcp_hdr) {
+        transp_hdr_len = (UINT)ctx->tcp_hdr->th_off * 4U;
+    } else if (ctx->udp_hdr) {
+        transp_hdr_len = 8U;
+    } else {
+        return 0;
+    }
+
+    if (transp_off + transp_hdr_len > ctx->packet_len) return 0;
+
+    data = ctx->packet + transp_off + transp_hdr_len;
+    len = ctx->packet_len - (transp_off + transp_hdr_len);
+
+    if (payload) *payload = data;
+    if (payload_len) *payload_len = len;
+    return data && len > 0;
+}
+
+void packet_refresh_observation(packet_ctx_t *ctx) {
+    packet_observation_t *obs;
+    const uint8_t *payload = NULL;
+    UINT payload_len = 0;
+
+    if (!ctx) return;
+
+    obs = &ctx->observation;
+    memset(obs, 0, sizeof(*obs));
+    obs->ctx = ctx;
+    obs->ndis_buf = ctx->ndis_buf;
+    obs->adapter_handle = ctx->adapter_handle;
+    obs->src_ip = ctx->src_ip;
+    obs->dst_ip = ctx->dst_ip;
+    obs->src_port = ctx->src_port;
+    obs->dst_port = ctx->dst_port;
+    obs->protocol = ctx->protocol;
+    obs->has_tcp = ctx->tcp_hdr != NULL;
+    obs->has_udp = ctx->udp_hdr != NULL;
+    obs->tcp_flags = ctx->tcp_hdr ? ctx->tcp_hdr->th_flags : 0;
+    obs->outbound = ctx->ndis_buf &&
+        ((ctx->ndis_buf->m_dwDeviceFlags & PACKET_FLAG_ON_SEND) != 0);
+    obs->inbound = ctx->ndis_buf &&
+        ((ctx->ndis_buf->m_dwDeviceFlags & PACKET_FLAG_ON_RECEIVE) != 0);
+
+    if (ctx->payload_valid) {
+        payload = ctx->payload_data;
+        payload_len = ctx->payload_len;
+    } else if (!packet_payload_bounds(ctx, &payload, &payload_len)) {
+        payload = NULL;
+        payload_len = 0;
+    }
+
+    obs->payload_data = payload;
+    obs->payload_len = payload_len;
+    obs->payload_valid = payload && payload_len > 0;
+
+    if (ctx->dns_txid_valid) {
+        obs->dns_txid = ctx->dns_txid;
+        obs->dns_txid_valid = 1;
+    } else if (obs->payload_valid && obs->payload_len >= 2U) {
+        obs->dns_txid = (uint16_t)(((uint16_t)obs->payload_data[0] << 8) |
+                                   (uint16_t)obs->payload_data[1]);
+        obs->dns_txid_valid = 1;
+    }
+}
+
+const packet_observation_t *packet_observe(packet_ctx_t *ctx) {
+    if (!ctx) return NULL;
+    packet_refresh_observation(ctx);
+    return &ctx->observation;
+}
+
+packet_ctx_t *packet_observation_context(const packet_observation_t *obs) {
+    return obs ? obs->ctx : NULL;
+}
+
 int packet_parse(packet_ctx_t *ctx, PINTERMEDIATE_BUFFER buf) {
     ether_header_ptr eth;
     iphdr_ptr        ip;
@@ -76,6 +164,7 @@ int packet_parse(packet_ctx_t *ctx, PINTERMEDIATE_BUFFER buf) {
         return 0;  /* not TCP or UDP */
     }
 
+    packet_refresh_observation(ctx);
     return 1;
 }
 
@@ -85,31 +174,15 @@ int packet_payload(packet_ctx_t *ctx, const uint8_t **payload, UINT *payload_len
     if (!ctx) return 0;
 
     if (!ctx->payload_valid) {
-        UINT ip_hdr_len  = (UINT)ctx->ip_hdr->ip_hl * 4U;
-        UINT transp_off;
-        UINT transp_hdr_len;
-        const uint8_t *data;
-        UINT len;
+        const uint8_t *data = NULL;
+        UINT len = 0;
 
-        transp_off = ETHER_HDR_LEN + ip_hdr_len;
-
-        if (ctx->tcp_hdr) {
-            transp_hdr_len = (UINT)ctx->tcp_hdr->th_off * 4U;
-        } else if (ctx->udp_hdr) {
-            transp_hdr_len = 8U;
-        } else {
-            return 0;
-        }
-
-        if (transp_off + transp_hdr_len > ctx->packet_len) return 0;
-
-        data = ctx->packet + transp_off + transp_hdr_len;
-        len  = ctx->packet_len - (transp_off + transp_hdr_len);
-
+        if (!packet_payload_bounds(ctx, &data, &len)) return 0;
         ctx->payload_data  = data;
         ctx->payload_len   = len;
         ctx->payload_valid = 1;
         ctx->dns_txid_valid = 0;
+        packet_refresh_observation(ctx);
     }
 
     if (payload)      *payload      = ctx->payload_data;
@@ -117,18 +190,37 @@ int packet_payload(packet_ctx_t *ctx, const uint8_t **payload, UINT *payload_len
     return ctx->payload_data && ctx->payload_len > 0;
 }
 
+int packet_payload_observed(const packet_observation_t *obs,
+                            const uint8_t **payload, UINT *payload_len) {
+    if (!obs || !obs->payload_valid) {
+        if (payload) *payload = NULL;
+        if (payload_len) *payload_len = 0;
+        return 0;
+    }
+    if (payload) *payload = obs->payload_data;
+    if (payload_len) *payload_len = obs->payload_len;
+    return obs->payload_data && obs->payload_len > 0;
+}
+
 /* === DNS TXID === */
 
 int packet_dns_txid(packet_ctx_t *ctx, uint16_t *txid) {
-    if (!packet_payload(ctx, NULL, NULL)) return 0;
-    if (!ctx->payload_data || ctx->payload_len < 2) return 0;
+    const packet_observation_t *obs;
 
-    if (!ctx->dns_txid_valid) {
-        const uint8_t *p = ctx->payload_data;
-        ctx->dns_txid = (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
-        ctx->dns_txid_valid = 1;
+    if (!packet_payload(ctx, NULL, NULL)) return 0;
+    obs = packet_observe(ctx);
+    if (!packet_dns_txid_observed(obs, txid)) return 0;
+
+    ctx->dns_txid = obs->dns_txid;
+    ctx->dns_txid_valid = 1;
+    return 1;
+}
+
+int packet_dns_txid_observed(const packet_observation_t *obs, uint16_t *txid) {
+    if (!obs || !obs->dns_txid_valid) {
+        return 0;
     }
-    if (txid) *txid = ctx->dns_txid;
+    if (txid) *txid = obs->dns_txid;
     return 1;
 }
 
@@ -200,6 +292,13 @@ static int dns_parse_query_summary_payload(const uint8_t *dns, UINT dns_len,
 
 int packet_dns_query_summary(packet_ctx_t *ctx, int tcp_framed,
                              packet_dns_query_summary_t *summary) {
+    return packet_dns_query_summary_observed(packet_observe(ctx),
+                                             tcp_framed, summary);
+}
+
+int packet_dns_query_summary_observed(const packet_observation_t *obs,
+                                      int tcp_framed,
+                                      packet_dns_query_summary_t *summary) {
     const uint8_t *payload = NULL;
     UINT payload_len = 0;
     const uint8_t *dns;
@@ -208,7 +307,7 @@ int packet_dns_query_summary(packet_ctx_t *ctx, int tcp_framed,
     if (!summary) return 0;
     memset(summary, 0, sizeof(*summary));
 
-    if (!packet_payload(ctx, &payload, &payload_len) || !payload) return 0;
+    if (!packet_payload_observed(obs, &payload, &payload_len) || !payload) return 0;
 
     dns = payload;
     dns_len = payload_len;

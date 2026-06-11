@@ -13,9 +13,11 @@ extern "C" {
 #endif
 
 /*
- * ndis_buf carries per-packet direction and adapter info.
+ * Observations carry stable packet facts. Actions carry the mutable frame
+ * handle for execution.
  */
-void traffic_plan_packet(ndisapi_engine_t *engine, packet_ctx_t *ctx,
+void traffic_plan_packet(ndisapi_engine_t *engine,
+                         const packet_observation_t *obs,
                          traffic_action_t *action);
 
 #ifdef __cplusplus

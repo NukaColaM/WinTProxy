@@ -2,7 +2,7 @@
 
 **Status**: done
 **Serial**: T6 (sequential within this spec -- T1, T2, T3...)
-**Spec**: ../specs/2026-05-31-full-data-flow-refactor.md
+**Spec**: ../spec.md
 **Depends on**: T5 (the startup sweep should be evaluated against the final packet-flow model, not an intermediate one)
 
 > Startup behavior is the last safety boundary: preexisting external connections must not survive as a bypass channel once WinTProxy comes up.

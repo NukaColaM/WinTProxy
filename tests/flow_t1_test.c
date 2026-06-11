@@ -16,7 +16,16 @@
 
 extern int g_test_adapter_send_count;
 extern int g_test_mstcp_send_count;
+extern int g_test_adapter_send_call_count;
+extern int g_test_mstcp_send_call_count;
+extern INTERMEDIATE_BUFFER g_test_last_mstcp_packet;
+extern int g_test_last_mstcp_packet_valid;
+extern int g_test_mstcp_send_error;
+extern int g_test_send_failure_count;
 extern int g_test_drop_count;
+extern int g_test_udp_forwarded_count;
+extern int g_test_dns_forwarded_count;
+extern int g_test_dns_forward_error;
 extern int g_test_conntrack_get_full_key_hit;
 extern int g_test_conntrack_tcp_proxy_outbound_hit;
 extern int g_test_conntrack_tcp_proxy_return_hit;
@@ -26,6 +35,11 @@ extern int g_test_conntrack_udp_proxy_outbound_hit;
 extern int g_test_conntrack_udp_proxy_return_hit;
 extern int g_test_conntrack_udp_proxy_outbound_touch_count;
 extern int g_test_conntrack_udp_proxy_return_touch_count;
+extern int g_test_conntrack_raw_full_key_add_count;
+extern int g_test_conntrack_direct_tcp_track_count;
+extern int g_test_conntrack_tcp_proxy_track_count;
+extern int g_test_conntrack_udp_proxy_track_count;
+extern int g_test_conntrack_tcp_dns_track_count;
 extern int g_test_dns_rewrite_request_hit;
 extern uint32_t g_test_dns_rewrite_request_ip;
 extern uint16_t g_test_dns_rewrite_request_port;
@@ -40,7 +54,16 @@ static int failures = 0;
 static void reset_counters(void) {
     g_test_adapter_send_count = 0;
     g_test_mstcp_send_count = 0;
+    g_test_adapter_send_call_count = 0;
+    g_test_mstcp_send_call_count = 0;
+    memset(&g_test_last_mstcp_packet, 0, sizeof(g_test_last_mstcp_packet));
+    g_test_last_mstcp_packet_valid = 0;
+    g_test_mstcp_send_error = 0;
+    g_test_send_failure_count = 0;
     g_test_drop_count = 0;
+    g_test_udp_forwarded_count = 0;
+    g_test_dns_forwarded_count = 0;
+    g_test_dns_forward_error = 0;
     g_test_conntrack_get_full_key_hit = 0;
     g_test_conntrack_tcp_proxy_outbound_hit = 0;
     g_test_conntrack_tcp_proxy_return_hit = 0;
@@ -50,6 +73,11 @@ static void reset_counters(void) {
     g_test_conntrack_udp_proxy_return_hit = 0;
     g_test_conntrack_udp_proxy_outbound_touch_count = 0;
     g_test_conntrack_udp_proxy_return_touch_count = 0;
+    g_test_conntrack_raw_full_key_add_count = 0;
+    g_test_conntrack_direct_tcp_track_count = 0;
+    g_test_conntrack_tcp_proxy_track_count = 0;
+    g_test_conntrack_udp_proxy_track_count = 0;
+    g_test_conntrack_tcp_dns_track_count = 0;
     g_test_dns_rewrite_request_hit = 0;
     g_test_dns_rewrite_request_ip = 0;
     g_test_dns_rewrite_request_port = 0;
@@ -76,6 +104,86 @@ static void check_int(const char *name, long got, long want) {
     }
 }
 
+typedef struct {
+    uint32_t src_ip;
+    uint32_t dst_ip;
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint8_t protocol;
+    int has_tcp;
+    int has_udp;
+    uint8_t tcp_flags;
+    int outbound;
+    int inbound;
+    const uint8_t *payload_data;
+    UINT payload_len;
+    int payload_valid;
+    uint16_t dns_txid;
+    int dns_txid_valid;
+} observation_snapshot_t;
+
+static observation_snapshot_t snapshot_observation(const packet_observation_t *obs) {
+    observation_snapshot_t snap;
+
+    memset(&snap, 0, sizeof(snap));
+    if (!obs) return snap;
+
+    snap.src_ip = obs->src_ip;
+    snap.dst_ip = obs->dst_ip;
+    snap.src_port = obs->src_port;
+    snap.dst_port = obs->dst_port;
+    snap.protocol = obs->protocol;
+    snap.has_tcp = obs->has_tcp;
+    snap.has_udp = obs->has_udp;
+    snap.tcp_flags = obs->tcp_flags;
+    snap.outbound = obs->outbound;
+    snap.inbound = obs->inbound;
+    snap.payload_data = obs->payload_data;
+    snap.payload_len = obs->payload_len;
+    snap.payload_valid = obs->payload_valid;
+    snap.dns_txid = obs->dns_txid;
+    snap.dns_txid_valid = obs->dns_txid_valid;
+    return snap;
+}
+
+static void check_observation_snapshot(const char *label,
+                                       const packet_observation_t *obs,
+                                       const observation_snapshot_t *want) {
+    char name[128];
+
+    snprintf(name, sizeof(name), "%s src ip", label);
+    check_int(name, (long)obs->src_ip, (long)want->src_ip);
+    snprintf(name, sizeof(name), "%s dst ip", label);
+    check_int(name, (long)obs->dst_ip, (long)want->dst_ip);
+    snprintf(name, sizeof(name), "%s src port", label);
+    check_int(name, obs->src_port, want->src_port);
+    snprintf(name, sizeof(name), "%s dst port", label);
+    check_int(name, obs->dst_port, want->dst_port);
+    snprintf(name, sizeof(name), "%s protocol", label);
+    check_int(name, obs->protocol, want->protocol);
+    snprintf(name, sizeof(name), "%s has tcp", label);
+    check_int(name, obs->has_tcp, want->has_tcp);
+    snprintf(name, sizeof(name), "%s has udp", label);
+    check_int(name, obs->has_udp, want->has_udp);
+    snprintf(name, sizeof(name), "%s tcp flags", label);
+    check_int(name, obs->tcp_flags, want->tcp_flags);
+    snprintf(name, sizeof(name), "%s outbound", label);
+    check_int(name, obs->outbound, want->outbound);
+    snprintf(name, sizeof(name), "%s inbound", label);
+    check_int(name, obs->inbound, want->inbound);
+    snprintf(name, sizeof(name), "%s payload valid", label);
+    check_int(name, obs->payload_valid, want->payload_valid);
+    snprintf(name, sizeof(name), "%s payload len", label);
+    check_int(name, (long)obs->payload_len, (long)want->payload_len);
+    snprintf(name, sizeof(name), "%s payload ptr", label);
+    check_int(name, (long)(uintptr_t)obs->payload_data,
+              (long)(uintptr_t)want->payload_data);
+    snprintf(name, sizeof(name), "%s dns txid valid", label);
+    check_int(name, obs->dns_txid_valid, want->dns_txid_valid);
+    snprintf(name, sizeof(name), "%s dns txid", label);
+    check_int(name, obs->dns_txid, want->dns_txid);
+}
+
 static void test_loopback_plan_does_not_mutate_flag_before_execution(void) {
     app_config_t cfg;
     ndisapi_engine_t engine;
@@ -99,7 +207,7 @@ static void test_loopback_plan_does_not_mutate_flag_before_execution(void) {
     ctx.src_port = 12345;
 
     traffic_action_pass(&action, &ctx, &buf, "self-proxy direct");
-    path_plan_bypass(&engine, &ctx, &action, "self-proxy direct");
+    path_plan_bypass(&engine, packet_observe(&ctx), &action, "self-proxy direct");
 
     check_int("loopback flag preserved in plan",
               (long)buf.m_dwDeviceFlags, (long)PACKET_FLAG_ON_SEND);
@@ -128,7 +236,7 @@ static void test_loopback_pass_is_routed_by_executor(void) {
     ctx.src_port = 12345;
 
     traffic_action_pass(&action, &ctx, &buf, "self-proxy direct");
-    path_plan_bypass(&engine, &ctx, &action, "self-proxy direct");
+    path_plan_bypass(&engine, packet_observe(&ctx), &action, "self-proxy direct");
     traffic_execute_action(&engine, &action);
 
     check_int("loopback sent to adapter", g_test_adapter_send_count, 0);
@@ -159,7 +267,7 @@ static void test_direct_plan_keeps_packet_facts_stable_until_execution(void) {
     ctx.src_port = 12345;
 
     traffic_action_pass(&action, &ctx, &buf, "pre-plan");
-    path_plan_bypass(&engine, &ctx, &action, "self-proxy direct");
+    path_plan_bypass(&engine, packet_observe(&ctx), &action, "self-proxy direct");
 
     check_int("planner leaves packet flag alone",
               (long)buf.m_dwDeviceFlags, (long)PACKET_FLAG_ON_SEND);
@@ -256,6 +364,439 @@ static void set_udp_dns_context(packet_ctx_t *ctx, INTERMEDIATE_BUFFER *buf,
     ctx->dns_txid_valid = 1;
 }
 
+static void test_batch_executor_groups_mstcp_driver_sends(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    INTERMEDIATE_BUFFER bufs[2];
+    traffic_action_t actions[2];
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    memset(bufs, 0, sizeof(bufs));
+    reset_counters();
+
+    bufs[0].m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;
+    bufs[1].m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;
+    traffic_action_pass_raw(&actions[0], bufs[0].m_IBuffer, 0,
+                            &bufs[0], "batch inbound 1");
+    traffic_action_pass_raw(&actions[1], bufs[1].m_IBuffer, 0,
+                            &bufs[1], "batch inbound 2");
+
+    traffic_execute_actions(&engine, actions, 2);
+
+    check_int("batch mstcp packet count", g_test_mstcp_send_count, 2);
+    check_int("batch mstcp driver calls", g_test_mstcp_send_call_count, 1);
+    check_int("batch mstcp adapter packets", g_test_adapter_send_count, 0);
+    check_int("batch mstcp adapter driver calls", g_test_adapter_send_call_count, 0);
+}
+
+static void test_batch_executor_groups_adapter_driver_sends_after_rewrite(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    packet_ctx_t ctxs[2];
+    INTERMEDIATE_BUFFER bufs[2];
+    traffic_action_t actions[2];
+    uint32_t client_ip = htonl(0x0A000002U);
+    uint32_t server_ip = htonl(0x08080808U);
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    reset_counters();
+
+    set_udp_context(&ctxs[0], &bufs[0], client_ip, 11111, server_ip, 53);
+    set_udp_context(&ctxs[1], &bufs[1], client_ip, 22222, server_ip, 443);
+
+    traffic_action_rewrite_send(&actions[0], &ctxs[0], &bufs[0],
+                                "batch rewrite adapter");
+    traffic_action_rewrite_udp_dport(&actions[0], 5353);
+    traffic_action_pass(&actions[1], &ctxs[1], &bufs[1], "batch pass adapter");
+
+    traffic_execute_actions(&engine, actions, 2);
+
+    check_int("batch adapter packet count", g_test_adapter_send_count, 2);
+    check_int("batch adapter driver calls", g_test_adapter_send_call_count, 1);
+    check_int("batch adapter mstcp packets", g_test_mstcp_send_count, 0);
+    check_int("batch adapter mstcp driver calls", g_test_mstcp_send_call_count, 0);
+    check_int("batch adapter rewrite applied",
+              (long)ntohs(ctxs[0].udp_hdr->uh_dport), 5353);
+}
+
+static void test_batch_executor_preserves_mixed_action_outcomes(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    packet_ctx_t ctxs[3];
+    INTERMEDIATE_BUFFER bufs[5];
+    traffic_action_t actions[5];
+    traffic_dns_forward_t fw;
+    uint32_t client_ip = htonl(0x0A000002U);
+    uint32_t server_ip = htonl(0x08080808U);
+    uint32_t dns_ip = htonl(0x01010101U);
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    memset(bufs, 0, sizeof(bufs));
+    memset(&fw, 0, sizeof(fw));
+    reset_counters();
+
+    engine.udp_fwd_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    engine.udp_relay_port = 9;
+
+    bufs[0].m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;
+    traffic_action_pass_raw(&actions[0], bufs[0].m_IBuffer, 0,
+                            &bufs[0], "mixed inbound pass");
+
+    set_udp_context(&ctxs[0], &bufs[1], client_ip, 11111, server_ip, 443);
+    traffic_action_rewrite_send(&actions[1], &ctxs[0], &bufs[1],
+                                "mixed adapter rewrite");
+    traffic_action_rewrite_udp_dport(&actions[1], 8443);
+
+    traffic_action_drop(&actions[2], NULL, &bufs[2], "mixed drop");
+
+    set_udp_dns_context(&ctxs[1], &bufs[3], client_ip, 22222,
+                        server_ip, 5300, 0xCAFE);
+    traffic_action_forward_udp(&actions[3], &ctxs[1], &bufs[3],
+                               "mixed udp forward");
+
+    set_udp_dns_context(&ctxs[2], &bufs[4], client_ip, 33333,
+                        dns_ip, 53, 0x1234);
+    fw.src_port = 33333;
+    fw.original_dns_ip = dns_ip;
+    fw.original_dns_port = 53;
+    fw.client_ip = client_ip;
+    fw.adapter_handle = (HANDLE)0x77;
+    traffic_action_forward_dns(&actions[4], &ctxs[2], &bufs[4],
+                               &fw, "mixed dns forward");
+
+    traffic_execute_actions(&engine, actions, 5);
+
+    check_int("mixed batch mstcp packets", g_test_mstcp_send_count, 1);
+    check_int("mixed batch mstcp driver calls", g_test_mstcp_send_call_count, 1);
+    check_int("mixed batch adapter packets", g_test_adapter_send_count, 1);
+    check_int("mixed batch adapter driver calls", g_test_adapter_send_call_count, 1);
+    check_int("mixed batch drop count", g_test_drop_count, 1);
+    check_int("mixed batch udp forwarded", g_test_udp_forwarded_count, 1);
+    check_int("mixed batch dns forwarded", g_test_dns_forwarded_count, 1);
+    check_int("mixed batch rewrite applied",
+              (long)ntohs(ctxs[0].udp_hdr->uh_dport), 8443);
+
+    if (engine.udp_fwd_sock != INVALID_SOCKET) {
+        closesocket(engine.udp_fwd_sock);
+    }
+}
+
+static void test_pass_planning_keeps_observation_snapshot(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    packet_ctx_t ctx;
+    traffic_action_t action;
+    INTERMEDIATE_BUFFER buf;
+    const packet_observation_t *obs;
+    observation_snapshot_t before;
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    reset_counters();
+
+    set_tcp_context(&ctx, &buf, htonl(0x0A000002U), 12345,
+                    htonl(0x08080808U), 443, TH_SYN);
+    obs = packet_observe(&ctx);
+    before = snapshot_observation(obs);
+
+    path_plan_bypass(&engine, obs, &action, "direct observation");
+
+    check_observation_snapshot("pass plan observation", obs, &before);
+    check_int("pass plan action", (long)action.type, (long)TRAFFIC_ACTION_PASS);
+}
+
+static void test_rewrite_execution_updates_frame_not_observation(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    packet_ctx_t ctx;
+    traffic_action_t action;
+    INTERMEDIATE_BUFFER buf;
+    const packet_observation_t *obs;
+    observation_snapshot_t before;
+    uint32_t client_ip = htonl(0x0A000002U);
+    uint32_t server_ip = htonl(0x08080808U);
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    reset_counters();
+
+    cfg.policy.default_decision = RULE_DECISION_PROXY;
+    engine.tcp_relay_port = 34010;
+
+    set_tcp_context(&ctx, &buf, client_ip, 12345, server_ip, 443, TH_SYN);
+    obs = packet_observe(&ctx);
+    before = snapshot_observation(obs);
+
+    path_plan_policy(&engine, obs, &action);
+    check_observation_snapshot("rewrite plan observation", obs, &before);
+
+    traffic_execute_action(&engine, &action);
+
+    check_int("rewrite frame src ip changed",
+              (long)ctx.ip_hdr->ip_src, (long)server_ip);
+    check_int("rewrite frame dst ip changed",
+              (long)ctx.ip_hdr->ip_dst, (long)client_ip);
+    check_int("rewrite observation src ip stable",
+              (long)obs->src_ip, (long)before.src_ip);
+    check_int("rewrite observation dst ip stable",
+              (long)obs->dst_ip, (long)before.dst_ip);
+    check_observation_snapshot("rewrite execute observation", obs, &before);
+}
+
+static void test_dns_planning_keeps_txid_payload_observation(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    packet_ctx_t ctx;
+    traffic_action_t action;
+    INTERMEDIATE_BUFFER buf;
+    const packet_observation_t *obs;
+    observation_snapshot_t before;
+    uint32_t client_ip = htonl(0x0A000002U);
+    uint32_t original_dns_ip = htonl(0x01010101U);
+    uint32_t redirect_ip = htonl(0x08080808U);
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    reset_counters();
+
+    dns_hijack.enabled = 1;
+    dns_hijack.redirect_ip = redirect_ip;
+    dns_hijack.redirect_port = 5353;
+    g_test_dns_rewrite_request_hit = 1;
+    g_test_dns_rewrite_request_ip = redirect_ip;
+    g_test_dns_rewrite_request_port = 5353;
+
+    set_udp_dns_context(&ctx, &buf, client_ip, 12345,
+                        original_dns_ip, 53, 0x1234);
+    obs = packet_observe(&ctx);
+    before = snapshot_observation(obs);
+
+    dns_plan_udp_query(&engine, obs, &action);
+
+    check_int("dns observation txid valid", obs->dns_txid_valid, 1);
+    check_int("dns observation txid", obs->dns_txid, 0x1234);
+    check_int("dns observation payload len", (long)obs->payload_len, 2);
+    check_observation_snapshot("dns plan observation", obs, &before);
+}
+
+static void test_return_planning_keeps_observation_snapshot(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    packet_ctx_t ctx;
+    traffic_action_t action;
+    INTERMEDIATE_BUFFER buf;
+    const packet_observation_t *obs;
+    observation_snapshot_t before;
+    uint32_t client_ip = htonl(0x0A000002U);
+    uint32_t server_ip = htonl(0x08080808U);
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    reset_counters();
+
+    engine.tcp_relay_port = 34010;
+    g_test_conntrack_tcp_proxy_return_hit = 1;
+    g_test_conntrack_entry.key_src_ip = server_ip;
+    g_test_conntrack_entry.src_port = 40000;
+    g_test_conntrack_entry.key_dst_ip = client_ip;
+    g_test_conntrack_entry.key_dst_port = 34010;
+    g_test_conntrack_entry.src_ip = client_ip;
+    g_test_conntrack_entry.client_port = 12345;
+    g_test_conntrack_entry.orig_dst_ip = server_ip;
+    g_test_conntrack_entry.orig_dst_port = 443;
+    g_test_conntrack_entry.relay_src_port = 40000;
+
+    set_tcp_context(&ctx, &buf, client_ip, 34010, server_ip, 40000, TH_ACK);
+    obs = packet_observe(&ctx);
+    before = snapshot_observation(obs);
+
+    path_plan_return(&engine, obs, 1, &action);
+    check_observation_snapshot("return plan observation", obs, &before);
+
+    traffic_execute_action(&engine, &action);
+    check_int("return frame src ip changed",
+              (long)ctx.ip_hdr->ip_src, (long)server_ip);
+    check_int("return frame dst ip changed",
+              (long)ctx.ip_hdr->ip_dst, (long)client_ip);
+    check_observation_snapshot("return execute observation", obs, &before);
+}
+
+static void test_direct_tcp_uses_role_contract_and_tracks_non_syn(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    packet_ctx_t ctx;
+    traffic_action_t action;
+    INTERMEDIATE_BUFFER buf;
+    uint32_t client_ip = htonl(0x0A000002U);
+    uint32_t server_ip = htonl(0x08080808U);
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    reset_counters();
+
+    cfg.policy.default_decision = RULE_DECISION_DIRECT;
+    engine.tcp_relay_port = 34010;
+    engine.udp_relay_port = 34011;
+
+    set_tcp_context(&ctx, &buf, client_ip, 12345, server_ip, 443, TH_SYN);
+    traffic_plan_packet(&engine, packet_observe(&ctx), &action);
+
+    check_int("direct tcp role track count",
+              g_test_conntrack_direct_tcp_track_count, 1);
+    check_int("direct tcp raw full-key add hidden",
+              g_test_conntrack_raw_full_key_add_count, 0);
+    check_int("direct tcp syn passes",
+              (long)action.type, (long)TRAFFIC_ACTION_PASS);
+
+    set_tcp_context(&ctx, &buf, client_ip, 12345, server_ip, 443, TH_ACK);
+    traffic_plan_packet(&engine, packet_observe(&ctx), &action);
+
+    check_int("direct tcp tracked non-syn passes",
+              (long)action.type, (long)TRAFFIC_ACTION_PASS);
+}
+
+static void test_tcp_proxy_uses_role_contract_creation(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    packet_ctx_t ctx;
+    traffic_action_t action;
+    INTERMEDIATE_BUFFER buf;
+    uint32_t client_ip = htonl(0x0A000002U);
+    uint32_t server_ip = htonl(0x08080808U);
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    reset_counters();
+
+    cfg.policy.default_decision = RULE_DECISION_PROXY;
+    engine.tcp_relay_port = 34010;
+
+    set_tcp_context(&ctx, &buf, client_ip, 12345, server_ip, 443, TH_SYN);
+    path_plan_policy(&engine, packet_observe(&ctx), &action);
+
+    check_int("tcp proxy role track count",
+              g_test_conntrack_tcp_proxy_track_count, 1);
+    check_int("tcp proxy raw full-key add hidden",
+              g_test_conntrack_raw_full_key_add_count, 0);
+    check_int("tcp proxy role action",
+              (long)action.type, (long)TRAFFIC_ACTION_REWRITE_SEND);
+}
+
+static void test_udp_proxy_uses_role_contract_creation(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    packet_ctx_t ctx;
+    traffic_action_t action;
+    INTERMEDIATE_BUFFER buf;
+    uint32_t client_ip = htonl(0x0A000002U);
+    uint32_t server_ip = htonl(0x08080808U);
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    reset_counters();
+
+    cfg.policy.default_decision = RULE_DECISION_PROXY;
+    engine.udp_relay_port = 34011;
+
+    set_udp_dns_context(&ctx, &buf, client_ip, 12345,
+                        server_ip, 5300, 0xCAFE);
+    path_plan_policy(&engine, packet_observe(&ctx), &action);
+
+    check_int("udp proxy role track count",
+              g_test_conntrack_udp_proxy_track_count, 1);
+    check_int("udp proxy raw full-key add hidden",
+              g_test_conntrack_raw_full_key_add_count, 0);
+    check_int("udp proxy role action",
+              (long)action.type, (long)TRAFFIC_ACTION_FORWARD_UDP_TO_RELAY);
+}
+
+static void test_tcp_dns_uses_role_contract_creation(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    packet_ctx_t ctx;
+    traffic_action_t action;
+    INTERMEDIATE_BUFFER buf;
+    uint32_t client_ip = htonl(0x0A000002U);
+    uint32_t original_dns_ip = htonl(0x01010101U);
+    uint32_t redirect_ip = htonl(0x08080808U);
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    reset_counters();
+
+    dns_hijack.enabled = 1;
+    dns_hijack.redirect_ip = redirect_ip;
+    dns_hijack.redirect_port = 5353;
+
+    set_tcp_context(&ctx, &buf, client_ip, 12345,
+                    original_dns_ip, 53, TH_SYN);
+    dns_plan_tcp_query(&engine, packet_observe(&ctx), &action);
+
+    check_int("tcp dns role track count",
+              g_test_conntrack_tcp_dns_track_count, 1);
+    check_int("tcp dns raw full-key add hidden",
+              g_test_conntrack_raw_full_key_add_count, 0);
+    check_int("tcp dns role action",
+              (long)action.type, (long)TRAFFIC_ACTION_REWRITE_SEND);
+}
+
+static void test_relay_consumes_tcp_and_udp_role_contracts(void) {
+    conntrack_entry_t entry;
+    uint32_t client_ip = htonl(0x0A000002U);
+    uint32_t server_ip = htonl(0x08080808U);
+
+    reset_counters();
+
+    g_test_conntrack_tcp_proxy_return_hit = 1;
+    g_test_conntrack_entry.key_src_ip = server_ip;
+    g_test_conntrack_entry.src_port = 40000;
+    g_test_conntrack_entry.key_dst_ip = client_ip;
+    g_test_conntrack_entry.key_dst_port = 34010;
+    g_test_conntrack_entry.src_ip = client_ip;
+    g_test_conntrack_entry.client_port = 12345;
+    g_test_conntrack_entry.orig_dst_ip = server_ip;
+    g_test_conntrack_entry.orig_dst_port = 443;
+    g_test_conntrack_entry.connect_dst_ip = server_ip;
+    g_test_conntrack_entry.connect_dst_port = 443;
+    g_test_conntrack_entry.relay_src_port = 40000;
+
+    check_int("tcp relay role lookup",
+              conntrack_get_tcp_proxy_return(NULL, server_ip, 40000,
+                                             client_ip, 34010, &entry),
+              ERR_OK);
+    check_int("tcp relay role original port", entry.orig_dst_port, 443);
+    conntrack_touch_tcp_proxy_outbound(NULL, &entry);
+    conntrack_touch_tcp_proxy_return(NULL, &entry);
+    check_int("tcp relay outbound touch",
+              g_test_conntrack_tcp_proxy_outbound_touch_count, 1);
+    check_int("tcp relay return touch",
+              g_test_conntrack_tcp_proxy_return_touch_count, 1);
+
+    reset_counters();
+
+    g_test_conntrack_udp_proxy_outbound_hit = 1;
+    g_test_conntrack_entry.key_src_ip = client_ip;
+    g_test_conntrack_entry.src_port = 12345;
+    g_test_conntrack_entry.src_ip = client_ip;
+    g_test_conntrack_entry.client_port = 12345;
+    g_test_conntrack_entry.orig_dst_ip = server_ip;
+    g_test_conntrack_entry.orig_dst_port = 53;
+
+    check_int("udp relay role lookup",
+              conntrack_get_udp_proxy_outbound(NULL, client_ip, 12345, &entry),
+              ERR_OK);
+    check_int("udp relay role original port", entry.orig_dst_port, 53);
+    conntrack_touch_udp_proxy_outbound(NULL, &entry);
+    conntrack_touch_udp_proxy_return(NULL, &entry);
+    check_int("udp relay outbound touch",
+              g_test_conntrack_udp_proxy_outbound_touch_count, 1);
+    check_int("udp relay return touch",
+              g_test_conntrack_udp_proxy_return_touch_count, 1);
+}
+
 static void test_tcp_proxy_plan_does_not_mutate_packet_until_execution(void) {
     app_config_t cfg;
     ndisapi_engine_t engine;
@@ -274,7 +815,7 @@ static void test_tcp_proxy_plan_does_not_mutate_packet_until_execution(void) {
 
     set_tcp_context(&ctx, &buf, client_ip, 12345, server_ip, 443, TH_SYN);
 
-    path_plan_policy(&engine, &ctx, &action);
+    path_plan_policy(&engine, packet_observe(&ctx), &action);
 
     check_int("tcp proxy plan action",
               (long)action.type, (long)TRAFFIC_ACTION_REWRITE_SEND);
@@ -310,7 +851,7 @@ static void test_tcp_proxy_rewrite_applies_during_execution(void) {
 
     set_tcp_context(&ctx, &buf, client_ip, 12345, server_ip, 443, TH_SYN);
 
-    path_plan_policy(&engine, &ctx, &action);
+    path_plan_policy(&engine, packet_observe(&ctx), &action);
     traffic_execute_action(&engine, &action);
 
     check_int("tcp proxy sent to adapter", g_test_adapter_send_count, 0);
@@ -355,7 +896,7 @@ static void test_tracked_tcp_proxy_non_syn_waits_for_executor_rewrite(void) {
 
     set_tcp_context(&ctx, &buf, client_ip, 12345, server_ip, 443, TH_ACK);
 
-    path_plan_policy(&engine, &ctx, &action);
+    path_plan_policy(&engine, packet_observe(&ctx), &action);
 
     check_int("tracked non-syn plan rewrite action",
               (long)action.type, (long)TRAFFIC_ACTION_REWRITE_SEND);
@@ -413,7 +954,7 @@ static void test_tcp_proxy_return_waits_for_executor_rewrite(void) {
 
     set_tcp_context(&ctx, &buf, client_ip, 34010, server_ip, 40000, TH_ACK);
 
-    path_plan_return(&engine, &ctx, 1, &action);
+    path_plan_return(&engine, packet_observe(&ctx), 1, &action);
 
     check_int("tcp return plan rewrite action",
               (long)action.type, (long)TRAFFIC_ACTION_REWRITE_SEND);
@@ -465,7 +1006,7 @@ static void test_tcp_proxy_return_missing_state_drops_closed(void) {
 
     set_tcp_context(&ctx, &buf, client_ip, 34010, server_ip, 40000, TH_ACK);
 
-    path_plan_return(&engine, &ctx, 1, &action);
+    path_plan_return(&engine, packet_observe(&ctx), 1, &action);
 
     check_int("tcp return missing state plan drop",
               (long)action.type, (long)TRAFFIC_ACTION_DROP);
@@ -508,7 +1049,7 @@ static void test_udp_proxy_return_waits_for_executor_rewrite(void) {
 
     set_udp_context(&ctx, &buf, client_ip, 34011, server_ip, 12345);
 
-    path_plan_return(&engine, &ctx, 0, &action);
+    path_plan_return(&engine, packet_observe(&ctx), 0, &action);
 
     check_int("udp return plan rewrite action",
               (long)action.type, (long)TRAFFIC_ACTION_REWRITE_SEND);
@@ -558,7 +1099,7 @@ static void test_udp_proxy_return_missing_state_drops_closed(void) {
 
     set_udp_context(&ctx, &buf, client_ip, 34011, server_ip, 12345);
 
-    path_plan_return(&engine, &ctx, 0, &action);
+    path_plan_return(&engine, packet_observe(&ctx), 0, &action);
 
     check_int("udp return missing state plan drop",
               (long)action.type, (long)TRAFFIC_ACTION_DROP);
@@ -601,7 +1142,7 @@ static void test_udp_dns_query_waits_for_executor_rewrite(void) {
     set_udp_dns_context(&ctx, &buf, client_ip, 12345,
                         original_dns_ip, 53, 0x1234);
 
-    dns_plan_udp_query(&engine, &ctx, &action);
+    dns_plan_udp_query(&engine, packet_observe(&ctx), &action);
 
     check_int("udp dns query plan rewrite action",
               (long)action.type, (long)TRAFFIC_ACTION_REWRITE_SEND);
@@ -645,7 +1186,7 @@ static void test_udp_dns_response_waits_for_executor_rewrite(void) {
                         client_ip, 12345, 0x1234);
     buf.m_dwDeviceFlags = PACKET_FLAG_ON_RECEIVE;
 
-    dns_plan_inbound_or_response(&engine, &ctx, 1, &action);
+    dns_plan_inbound_or_response(&engine, packet_observe(&ctx), 1, &action);
 
     check_int("udp dns response plan rewrite action",
               (long)action.type, (long)TRAFFIC_ACTION_REWRITE_SEND);
@@ -687,7 +1228,7 @@ static void test_loopback_udp_dns_query_forwards_without_packet_mutation(void) {
                         original_dns_ip, 53, 0x1234);
     buf.m_hAdapter = (HANDLE)0x55;
 
-    dns_plan_udp_query(&engine, &ctx, &action);
+    dns_plan_udp_query(&engine, packet_observe(&ctx), &action);
 
     check_int("loopback dns plan forward action",
               (long)action.type, (long)TRAFFIC_ACTION_FORWARD_DNS_TO_RESOLVER);
@@ -703,6 +1244,142 @@ static void test_loopback_udp_dns_query_forwards_without_packet_mutation(void) {
               (long)ctx.ip_hdr->ip_dst, (long)original_dns_ip);
     check_int("loopback dns dst port preserved before execute",
               (long)ntohs(ctx.udp_hdr->uh_dport), 53);
+}
+
+static void test_loopback_dns_forward_failure_drops_closed(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    packet_ctx_t ctx;
+    traffic_action_t action;
+    INTERMEDIATE_BUFFER buf;
+    uint32_t client_ip = htonl(0x0A000002U);
+    uint32_t original_dns_ip = htonl(0x01010101U);
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    reset_counters();
+
+    dns_hijack.enabled = 1;
+    dns_hijack.redirect_ip = LOOPBACK_ADDR;
+    dns_hijack.redirect_port = 5353;
+    dns_hijack.use_socket_fwd = 1;
+    g_test_dns_forward_error = ERR_NETWORK;
+
+    set_udp_dns_context(&ctx, &buf, client_ip, 12345,
+                        original_dns_ip, 53, 0x1234);
+
+    dns_plan_udp_query(&engine, packet_observe(&ctx), &action);
+    traffic_execute_action(&engine, &action);
+
+    check_int("loopback dns forward failure not adapter",
+              g_test_adapter_send_count, 0);
+    check_int("loopback dns forward failure not mstcp",
+              g_test_mstcp_send_count, 0);
+    check_int("loopback dns forward failure dropped",
+              g_test_drop_count, 1);
+}
+
+static void test_loopback_dns_response_injection_uses_executor_send_path(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    traffic_action_t action;
+    uint8_t dns_payload[4] = {0xAB, 0xCD, 0x81, 0x80};
+    uint32_t client_ip = htonl(0x0A000002U);
+    uint32_t original_dns_ip = htonl(0x01010101U);
+    iphdr_ptr ip;
+    udphdr_ptr udp;
+    uint8_t *restored_dns;
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    reset_counters();
+
+    engine.adapter_count = 1;
+    engine.adapter_handles[0] = (HANDLE)0x55;
+    engine.adapter_mac[0][0] = 0x02;
+    engine.adapter_mac[0][5] = 0x55;
+
+    traffic_action_inject_dns_response(&action, dns_payload, sizeof(dns_payload),
+                                       0x1234, original_dns_ip, 53,
+                                       client_ip, 12345,
+                                       (HANDLE)0x55,
+                                       "dns fwd response");
+    traffic_execute_action(&engine, &action);
+
+    check_int("dns response injection mstcp packets", g_test_mstcp_send_count, 1);
+    check_int("dns response injection mstcp driver calls",
+              g_test_mstcp_send_call_count, 1);
+    check_int("dns response injection adapter packets", g_test_adapter_send_count, 0);
+    check_int("dns response injection not dropped", g_test_drop_count, 0);
+    check_int("dns response injection captured packet",
+              g_test_last_mstcp_packet_valid, 1);
+    check_int("dns response injection adapter",
+              (long)(uintptr_t)g_test_last_mstcp_packet.m_hAdapter,
+              (long)(uintptr_t)(HANDLE)0x55);
+    check_int("dns response injection direction",
+              (long)g_test_last_mstcp_packet.m_dwDeviceFlags,
+              (long)PACKET_FLAG_ON_RECEIVE);
+
+    ip = (iphdr_ptr)(g_test_last_mstcp_packet.m_IBuffer + ETHER_HDR_LEN);
+    udp = (udphdr_ptr)(g_test_last_mstcp_packet.m_IBuffer + ETHER_HDR_LEN + 20);
+    restored_dns = g_test_last_mstcp_packet.m_IBuffer + ETHER_HDR_LEN + 20 + 8;
+
+    check_int("dns response injection src ip",
+              (long)ip->ip_src, (long)original_dns_ip);
+    check_int("dns response injection dst ip",
+              (long)ip->ip_dst, (long)client_ip);
+    check_int("dns response injection src port",
+              (long)ntohs(udp->uh_sport), 53);
+    check_int("dns response injection dst port",
+              (long)ntohs(udp->uh_dport), 12345);
+    check_int("dns response injection restored txid hi", restored_dns[0], 0x12);
+    check_int("dns response injection restored txid lo", restored_dns[1], 0x34);
+}
+
+static void test_loopback_dns_malformed_response_injection_drops_closed(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    traffic_action_t action;
+    uint8_t malformed_payload[1] = {0x12};
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    reset_counters();
+
+    traffic_action_inject_dns_response(&action, malformed_payload,
+                                       sizeof(malformed_payload),
+                                       0x1234, htonl(0x01010101U), 53,
+                                       htonl(0x0A000002U), 12345,
+                                       (HANDLE)0x55,
+                                       "dns malformed response");
+    traffic_execute_action(&engine, &action);
+
+    check_int("dns malformed response not mstcp", g_test_mstcp_send_count, 0);
+    check_int("dns malformed response not adapter", g_test_adapter_send_count, 0);
+    check_int("dns malformed response dropped", g_test_drop_count, 1);
+}
+
+static void test_loopback_dns_response_send_failure_fails_closed(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    traffic_action_t action;
+    uint8_t dns_payload[4] = {0xAB, 0xCD, 0x81, 0x80};
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    reset_counters();
+
+    g_test_mstcp_send_error = 1;
+    traffic_action_inject_dns_response(&action, dns_payload, sizeof(dns_payload),
+                                       0x1234, htonl(0x01010101U), 53,
+                                       htonl(0x0A000002U), 12345,
+                                       (HANDLE)0x55,
+                                       "dns send failure");
+    traffic_execute_action(&engine, &action);
+
+    check_int("dns send failure no mstcp packet count", g_test_mstcp_send_count, 0);
+    check_int("dns send failure no adapter", g_test_adapter_send_count, 0);
+    check_int("dns send failure counted", g_test_send_failure_count, 1);
 }
 
 static void test_tcp_dns_query_waits_for_executor_rewrite(void) {
@@ -726,7 +1403,7 @@ static void test_tcp_dns_query_waits_for_executor_rewrite(void) {
     set_tcp_context(&ctx, &buf, client_ip, 12345,
                     original_dns_ip, 53, TH_SYN);
 
-    dns_plan_tcp_query(&engine, &ctx, &action);
+    dns_plan_tcp_query(&engine, packet_observe(&ctx), &action);
 
     check_int("tcp dns query plan rewrite action",
               (long)action.type, (long)TRAFFIC_ACTION_REWRITE_SEND);
@@ -764,7 +1441,7 @@ static void test_loopback_tcp_dns_query_routes_to_mstcp_on_execute(void) {
     set_tcp_context(&ctx, &buf, client_ip, 12345,
                     original_dns_ip, 53, TH_SYN);
 
-    dns_plan_tcp_query(&engine, &ctx, &action);
+    dns_plan_tcp_query(&engine, packet_observe(&ctx), &action);
 
     check_int("loopback tcp dns plan rewrite action",
               (long)action.type, (long)TRAFFIC_ACTION_REWRITE_SEND);
@@ -805,7 +1482,7 @@ static void test_public_plan_non_proxyable_direct_uses_executor_owner(void) {
 
     set_tcp_context(&ctx, &buf, client_ip, 12345, broadcast_ip, 443, TH_SYN);
 
-    traffic_plan_packet(&engine, &ctx, &action);
+    traffic_plan_packet(&engine, packet_observe(&ctx), &action);
 
     check_int("non-proxyable plan pass",
               (long)action.type, (long)TRAFFIC_ACTION_PASS);
@@ -838,7 +1515,7 @@ static void test_public_plan_untracked_proxy_non_syn_drops_closed(void) {
 
     set_tcp_context(&ctx, &buf, client_ip, 12345, server_ip, 443, TH_ACK);
 
-    traffic_plan_packet(&engine, &ctx, &action);
+    traffic_plan_packet(&engine, packet_observe(&ctx), &action);
 
     check_int("untracked proxy non-syn plan drop",
               (long)action.type, (long)TRAFFIC_ACTION_DROP);
@@ -875,7 +1552,7 @@ static void test_startup_quarantine_discards_preexisting_external_direct_tcp(voi
 
     set_tcp_context(&ctx, &buf, client_ip, 12345, server_ip, 443, TH_ACK);
 
-    traffic_plan_packet(&engine, &ctx, &action);
+    traffic_plan_packet(&engine, packet_observe(&ctx), &action);
 
     check_int("startup quarantine preexisting direct tcp drops",
               (long)action.type, (long)TRAFFIC_ACTION_DROP);
@@ -911,7 +1588,7 @@ static void test_startup_quarantine_allows_new_direct_tcp_syn(void) {
 
     set_tcp_context(&ctx, &buf, client_ip, 12345, server_ip, 443, TH_SYN);
 
-    traffic_plan_packet(&engine, &ctx, &action);
+    traffic_plan_packet(&engine, packet_observe(&ctx), &action);
 
     check_int("startup quarantine new direct syn passes",
               (long)action.type, (long)TRAFFIC_ACTION_PASS);
@@ -942,11 +1619,11 @@ static void test_startup_quarantine_allows_tracked_new_direct_tcp_non_syn(void) 
     engine.udp_relay_port = 34011;
 
     set_tcp_context(&ctx, &buf, client_ip, 12345, server_ip, 443, TH_SYN);
-    traffic_plan_packet(&engine, &ctx, &action);
+    traffic_plan_packet(&engine, packet_observe(&ctx), &action);
     traffic_execute_action(&engine, &action);
 
     set_tcp_context(&ctx, &buf, client_ip, 12345, server_ip, 443, TH_ACK);
-    traffic_plan_packet(&engine, &ctx, &action);
+    traffic_plan_packet(&engine, packet_observe(&ctx), &action);
 
     check_int("startup quarantine tracked direct tcp non-syn passes",
               (long)action.type, (long)TRAFFIC_ACTION_PASS);
@@ -965,6 +1642,18 @@ int main(void) {
     test_loopback_plan_does_not_mutate_flag_before_execution();
     test_loopback_pass_is_routed_by_executor();
     test_direct_plan_keeps_packet_facts_stable_until_execution();
+    test_batch_executor_groups_mstcp_driver_sends();
+    test_batch_executor_groups_adapter_driver_sends_after_rewrite();
+    test_batch_executor_preserves_mixed_action_outcomes();
+    test_pass_planning_keeps_observation_snapshot();
+    test_rewrite_execution_updates_frame_not_observation();
+    test_dns_planning_keeps_txid_payload_observation();
+    test_return_planning_keeps_observation_snapshot();
+    test_direct_tcp_uses_role_contract_and_tracks_non_syn();
+    test_tcp_proxy_uses_role_contract_creation();
+    test_udp_proxy_uses_role_contract_creation();
+    test_tcp_dns_uses_role_contract_creation();
+    test_relay_consumes_tcp_and_udp_role_contracts();
     test_tcp_proxy_plan_does_not_mutate_packet_until_execution();
     test_tcp_proxy_rewrite_applies_during_execution();
     test_tracked_tcp_proxy_non_syn_waits_for_executor_rewrite();
@@ -975,6 +1664,10 @@ int main(void) {
     test_udp_dns_query_waits_for_executor_rewrite();
     test_udp_dns_response_waits_for_executor_rewrite();
     test_loopback_udp_dns_query_forwards_without_packet_mutation();
+    test_loopback_dns_forward_failure_drops_closed();
+    test_loopback_dns_response_injection_uses_executor_send_path();
+    test_loopback_dns_malformed_response_injection_drops_closed();
+    test_loopback_dns_response_send_failure_fails_closed();
     test_tcp_dns_query_waits_for_executor_rewrite();
     test_loopback_tcp_dns_query_routes_to_mstcp_on_execute();
     test_public_plan_non_proxyable_direct_uses_executor_owner();
