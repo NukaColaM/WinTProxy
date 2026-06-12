@@ -36,6 +36,10 @@ WinTProxy.exe --config config.example.json
 - [Architecture](docs/architecture.md)
 - [config.example.json](config.example.json)
 
+## Acknowledgments
+
+- [LINUX DO](https://linux.do)
+
 ## License
 
 Third-party components:
