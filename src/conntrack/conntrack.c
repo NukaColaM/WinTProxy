@@ -349,6 +349,11 @@ error_t conntrack_track_tcp_proxy(conntrack_t *ct,
     return ERR_OK;
 }
 
+/*
+ * UDP proxy pair: the outbound entry is keyed by the full tuple so each
+ * (client, server) flow carries its own policy decision; the return entry
+ * stays keyed (server_ip, client_port), one per server.
+ */
 error_t conntrack_track_udp_proxy(conntrack_t *ct,
                                   const conntrack_udp_proxy_flow_t *flow) {
     error_t err;
@@ -357,7 +362,7 @@ error_t conntrack_track_udp_proxy(conntrack_t *ct,
 
     err = conntrack_add_key_full(ct,
                                  flow->client_ip, flow->client_port,
-                                 0, 0,
+                                 flow->server_ip, flow->server_port,
                                  flow->client_ip, flow->client_port,
                                  flow->server_ip, flow->server_port,
                                  flow->server_ip, flow->server_port,
@@ -378,8 +383,9 @@ error_t conntrack_track_udp_proxy(conntrack_t *ct,
                                  flow->if_idx, flow->sub_if_idx,
                                  flow->client_port);
     if (err != ERR_OK) {
-        conntrack_remove(ct, flow->client_ip, flow->client_port,
-                         WTP_IPPROTO_UDP);
+        conntrack_remove_key(ct, flow->client_ip, flow->client_port,
+                             flow->server_ip, flow->server_port,
+                             WTP_IPPROTO_UDP);
         return err;
     }
     return ERR_OK;
@@ -466,9 +472,12 @@ error_t conntrack_get_tcp_proxy_return(conntrack_t *ct, uint32_t relay_src_ip,
 
 error_t conntrack_get_udp_proxy_outbound(conntrack_t *ct, uint32_t client_ip,
                                          uint16_t client_port,
+                                         uint32_t server_ip,
+                                         uint16_t server_port,
                                          conntrack_entry_t *out) {
-    return conntrack_get_full(ct, client_ip, client_port,
-                              WTP_IPPROTO_UDP, out);
+    return conntrack_get_full_key(ct, client_ip, client_port,
+                                  server_ip, server_port,
+                                  WTP_IPPROTO_UDP, out);
 }
 
 error_t conntrack_get_udp_proxy_return(conntrack_t *ct, uint32_t server_ip,
@@ -536,42 +545,196 @@ void conntrack_touch_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_port,
     ReleaseSRWLockExclusive(&ct->locks[idx]);
 }
 
-void conntrack_touch_direct_tcp(conntrack_t *ct,
-                                const conntrack_entry_t *entry) {
-    if (!ct || !entry) return;
-    conntrack_touch_key(ct, entry->src_ip, entry->client_port,
-                        entry->orig_dst_ip, entry->orig_dst_port,
-                        WTP_IPPROTO_TCP);
+/* ------------------------------------------------------------------ */
+/*  Fused role operations                                             */
+/* ------------------------------------------------------------------ */
+
+static void conntrack_entry_refresh(conntrack_entry_t *e, uint64_t now) {
+    InterlockedExchange64((volatile LONG64 *)&e->timestamp, (LONG64)now);
 }
 
-void conntrack_touch_tcp_proxy_outbound(conntrack_t *ct,
-                                        const conntrack_entry_t *entry) {
-    if (!ct || !entry) return;
-    conntrack_touch_key(ct, entry->src_ip, entry->client_port,
-                        entry->orig_dst_ip, entry->orig_dst_port,
-                        WTP_IPPROTO_TCP);
+/* Refresh one entry's timestamp by key under its shared bucket lock. */
+static void conntrack_refresh_key(conntrack_t *ct, uint32_t src_ip,
+                                  uint16_t src_port, uint32_t dst_ip,
+                                  uint16_t dst_port, uint8_t protocol,
+                                  uint64_t now) {
+    unsigned int idx = bucket_index_full(ct, src_ip, src_port, dst_ip,
+                                         dst_port, protocol);
+
+    AcquireSRWLockShared(&ct->locks[idx]);
+    for (conntrack_entry_t *e = ct->buckets[idx]; e; e = e->next) {
+        if (conntrack_key_matches(e, src_ip, src_port, dst_ip, dst_port,
+                                  protocol)) {
+            conntrack_entry_refresh(e, now);
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&ct->locks[idx]);
 }
 
-void conntrack_touch_tcp_proxy_return(conntrack_t *ct,
-                                      const conntrack_entry_t *entry) {
-    if (!ct || !entry) return;
-    conntrack_touch_key(ct, entry->key_src_ip, entry->src_port,
-                        entry->key_dst_ip, entry->key_dst_port,
-                        WTP_IPPROTO_TCP);
+static void conntrack_role_fill_snapshot(const conntrack_entry_t *e,
+                                         conntrack_role_snapshot_t *out) {
+    out->client_ip = e->src_ip;
+    out->client_port = e->client_port;
+    out->orig_dst_ip = e->orig_dst_ip;
+    out->orig_dst_port = e->orig_dst_port;
+    out->relay_src_port = e->relay_src_port;
 }
 
-void conntrack_touch_udp_proxy_outbound(conntrack_t *ct,
-                                        const conntrack_entry_t *entry) {
-    if (!ct || !entry) return;
-    conntrack_touch(ct, entry->src_ip, entry->client_port,
-                    WTP_IPPROTO_UDP);
+/*
+ * Look up an entry by key, fill the role snapshot, refresh the entry, and
+ * extract the paired entry's key for a follow-up refresh - all in one
+ * shared-lock pass over the entry's bucket.
+ */
+typedef struct {
+    uint32_t src_ip;
+    uint32_t dst_ip;
+    uint16_t src_port;
+    uint16_t dst_port;
+    int      valid;
+} conntrack_twin_key_t;
+
+typedef enum {
+    CONNTRACK_TWIN_NONE = 0,
+    CONNTRACK_TWIN_TCP_A_FROM_B,   /* found B; twin A = client->server key */
+    CONNTRACK_TWIN_UDP_B_FROM_A,   /* found A; twin B = (server, client_port) */
+    CONNTRACK_TWIN_UDP_A_FROM_B    /* found B; twin A = full client tuple */
+} conntrack_twin_kind_t;
+
+static error_t conntrack_role_lookup(conntrack_t *ct, uint32_t src_ip,
+                                     uint16_t src_port, uint32_t dst_ip,
+                                     uint16_t dst_port, uint8_t protocol,
+                                     conntrack_twin_kind_t twin_kind,
+                                     conntrack_role_snapshot_t *out) {
+    unsigned int idx = bucket_index_full(ct, src_ip, src_port, dst_ip,
+                                         dst_port, protocol);
+    uint64_t now = get_tick_ms();
+    conntrack_twin_key_t twin;
+    int found = 0;
+
+    twin.valid = 0;
+    twin.src_ip = 0;
+    twin.dst_ip = 0;
+    twin.src_port = 0;
+    twin.dst_port = 0;
+
+    AcquireSRWLockShared(&ct->locks[idx]);
+    for (conntrack_entry_t *e = ct->buckets[idx]; e; e = e->next) {
+        if (!conntrack_key_matches(e, src_ip, src_port, dst_ip, dst_port,
+                                   protocol)) {
+            continue;
+        }
+
+        if (out) conntrack_role_fill_snapshot(e, out);
+        conntrack_entry_refresh(e, now);
+
+        switch (twin_kind) {
+        case CONNTRACK_TWIN_TCP_A_FROM_B:
+            twin.src_ip = e->src_ip;
+            twin.src_port = e->client_port;
+            twin.dst_ip = e->orig_dst_ip;
+            twin.dst_port = e->orig_dst_port;
+            twin.valid = 1;
+            break;
+        case CONNTRACK_TWIN_UDP_B_FROM_A:
+            twin.src_ip = e->orig_dst_ip;
+            twin.src_port = e->client_port;
+            twin.valid = (e->orig_dst_ip != 0);
+            break;
+        case CONNTRACK_TWIN_UDP_A_FROM_B:
+            twin.src_ip = e->src_ip;
+            twin.src_port = e->client_port;
+            twin.dst_ip = e->orig_dst_ip;
+            twin.dst_port = e->orig_dst_port;
+            twin.valid = 1;
+            break;
+        case CONNTRACK_TWIN_NONE:
+        default:
+            break;
+        }
+
+        found = 1;
+        break;
+    }
+    ReleaseSRWLockShared(&ct->locks[idx]);
+
+    if (!found) {
+        counter_inc(&ct->counters.misses);
+        return ERR_NOT_FOUND;
+    }
+
+    if (twin.valid) {
+        conntrack_refresh_key(ct, twin.src_ip, twin.src_port,
+                              twin.dst_ip, twin.dst_port, protocol, now);
+    }
+    return ERR_OK;
 }
 
-void conntrack_touch_udp_proxy_return(conntrack_t *ct,
-                                      const conntrack_entry_t *entry) {
+error_t conntrack_role_tcp_outbound(conntrack_t *ct, uint32_t client_ip,
+                                    uint16_t client_port, uint32_t server_ip,
+                                    uint16_t server_port,
+                                    conntrack_role_snapshot_t *out) {
+    if (!ct || !out) return ERR_PARAM;
+    return conntrack_role_lookup(ct, client_ip, client_port,
+                                 server_ip, server_port, WTP_IPPROTO_TCP,
+                                 CONNTRACK_TWIN_NONE, out);
+}
+
+error_t conntrack_role_tcp_return(conntrack_t *ct, uint32_t relay_src_ip,
+                                  uint16_t relay_src_port,
+                                  uint32_t relay_dst_ip,
+                                  uint16_t relay_dst_port,
+                                  conntrack_role_snapshot_t *out) {
+    if (!ct || !out) return ERR_PARAM;
+    return conntrack_role_lookup(ct, relay_src_ip, relay_src_port,
+                                 relay_dst_ip, relay_dst_port, WTP_IPPROTO_TCP,
+                                 CONNTRACK_TWIN_TCP_A_FROM_B, out);
+}
+
+error_t conntrack_role_udp_outbound(conntrack_t *ct, uint32_t client_ip,
+                                    uint16_t client_port, uint32_t server_ip,
+                                    uint16_t server_port,
+                                    conntrack_role_snapshot_t *out) {
+    if (!ct || !out) return ERR_PARAM;
+    return conntrack_role_lookup(ct, client_ip, client_port,
+                                 server_ip, server_port,
+                                 WTP_IPPROTO_UDP,
+                                 CONNTRACK_TWIN_UDP_B_FROM_A, out);
+}
+
+error_t conntrack_role_udp_return(conntrack_t *ct, uint32_t server_ip,
+                                  uint16_t client_port,
+                                  conntrack_role_snapshot_t *out) {
+    if (!ct || !out) return ERR_PARAM;
+    return conntrack_role_lookup(ct, server_ip, client_port, 0, 0,
+                                 WTP_IPPROTO_UDP,
+                                 CONNTRACK_TWIN_UDP_A_FROM_B, out);
+}
+
+error_t conntrack_role_tcp_dns_return(conntrack_t *ct, uint32_t response_src_ip,
+                                      uint16_t response_src_port,
+                                      uint32_t response_dst_ip,
+                                      uint16_t response_dst_port,
+                                      conntrack_role_snapshot_t *out) {
+    if (!ct || !out) return ERR_PARAM;
+    return conntrack_role_lookup(ct, response_dst_ip, response_dst_port,
+                                 response_src_ip, response_src_port,
+                                 WTP_IPPROTO_TCP, CONNTRACK_TWIN_NONE, out);
+}
+
+void conntrack_role_refresh_tcp_pair(conntrack_t *ct,
+                                     const conntrack_entry_t *entry) {
+    uint64_t now;
+
     if (!ct || !entry) return;
-    conntrack_touch(ct, entry->key_src_ip, entry->src_port,
-                    WTP_IPPROTO_UDP);
+
+    now = get_tick_ms();
+    conntrack_refresh_key(ct, entry->src_ip, entry->client_port,
+                          entry->orig_dst_ip, entry->orig_dst_port,
+                          WTP_IPPROTO_TCP, now);
+    conntrack_refresh_key(ct, entry->key_src_ip, entry->src_port,
+                          entry->key_dst_ip, entry->key_dst_port,
+                          WTP_IPPROTO_TCP, now);
 }
 
 void conntrack_snapshot_counters(conntrack_t *ct, conntrack_counters_t *out) {

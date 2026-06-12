@@ -77,21 +77,21 @@ void dns_plan_inbound_or_response(ndisapi_engine_t *engine,
 void dns_plan_tcp_return(ndisapi_engine_t *engine,
                          const packet_observation_t *obs,
                          traffic_action_t *action) {
-    conntrack_entry_t entry;
+    conntrack_role_snapshot_t snap;
 
-    if (conntrack_get_tcp_dns_return(engine->conntrack,
-                                     obs->src_ip, obs->src_port,
-                                     obs->dst_ip, obs->dst_port,
-                                     &entry) != ERR_OK) {
+    if (conntrack_role_tcp_dns_return(engine->conntrack,
+                                      obs->src_ip, obs->src_port,
+                                      obs->dst_ip, obs->dst_port,
+                                      &snap) != ERR_OK) {
         LOG_TRACE("TCP DNS return: no conntrack for port %u", obs->dst_port);
         traffic_action_drop_observed(action, obs, "tcp dns return missing");
         return;
     }
     traffic_action_rewrite_send_observed(action, obs, "tcp dns return");
-    traffic_action_rewrite_ip_src(action, entry.orig_dst_ip);
-    traffic_action_rewrite_ip_dst(action, entry.src_ip);
-    traffic_action_rewrite_tcp_sport(action, entry.orig_dst_port);
-    traffic_action_rewrite_tcp_dport(action, entry.client_port);
+    traffic_action_rewrite_ip_src(action, snap.orig_dst_ip);
+    traffic_action_rewrite_ip_dst(action, snap.client_ip);
+    traffic_action_rewrite_tcp_sport(action, snap.orig_dst_port);
+    traffic_action_rewrite_tcp_dport(action, snap.client_port);
     traffic_action_rewrite_swap_eth(action);
     traffic_action_rewrite_clamp_tcp_mss(action, WTP_TCP_MSS_CLAMP);
     traffic_action_set_send_target(action, TRAFFIC_SEND_TO_MSTCP);

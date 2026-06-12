@@ -91,13 +91,6 @@ static void close_socket_if_valid(SOCKET *sock) {
     }
 }
 
-static void tcp_conn_touch_conntrack(tcp_conn_t *conn) {
-    conntrack_touch_tcp_proxy_return(conn->relay->conntrack,
-                                     &conn->conntrack_entry);
-    conntrack_touch_tcp_proxy_outbound(conn->relay->conntrack,
-                                       &conn->conntrack_entry);
-}
-
 static void tcp_conn_release(tcp_conn_t *conn);
 
 static void tcp_conn_add_ref(tcp_conn_t *conn) {
@@ -640,7 +633,6 @@ static void on_proxy_recv_complete(tcp_conn_t *conn, DWORD bytes) {
     }
 
     if (conn->state == TCP_STATE_RELAY) {
-        tcp_conn_touch_conntrack(conn);
         if (!post_send(conn, &conn->client_send, conn->client, TCP_IO_CLIENT_SEND, io->buf, bytes)) {
             tcp_conn_close(conn);
         }
@@ -656,7 +648,6 @@ static void on_client_recv_complete(tcp_conn_t *conn, DWORD bytes) {
         tcp_conn_maybe_close_after_eof(conn);
         return;
     }
-    tcp_conn_touch_conntrack(conn);
     if (!post_send(conn, &conn->proxy_send, conn->proxy, TCP_IO_PROXY_SEND, io->buf, bytes)) {
         tcp_conn_close(conn);
     }
@@ -731,6 +722,12 @@ static DWORD WINAPI tcp_accept_thread(LPVOID param) {
     return 0;
 }
 
+/*
+ * Liveness for relayed connections is owned by this periodic pass: the
+ * conntrack pair-refresh op keeps both entries of every open connection
+ * alive (20s cadence against the 60s TTL), so the recv-completion hot path
+ * issues no conntrack calls at all.
+ */
 static DWORD WINAPI tcp_refresh_thread(LPVOID param) {
     tcp_relay_t *relay = (tcp_relay_t *)param;
 
@@ -741,7 +738,8 @@ static DWORD WINAPI tcp_refresh_thread(LPVOID param) {
         AcquireSRWLockShared(&relay->conn_lock);
         for (tcp_conn_t *c = relay->active_list; c; c = c->next_active) {
             if (!c->closing && c->client_port) {
-                tcp_conn_touch_conntrack(c);
+                conntrack_role_refresh_tcp_pair(relay->conntrack,
+                                                &c->conntrack_entry);
             }
         }
         ReleaseSRWLockShared(&relay->conn_lock);

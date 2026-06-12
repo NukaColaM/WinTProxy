@@ -63,28 +63,28 @@ static error_t add_proxy_conntrack(ndisapi_engine_t *engine,
 
 /*
  * Non-SYN tracked TCP: redirect to relay using existing conntrack state.
+ * The role lookup fuses the liveness refresh; no separate touch calls.
  */
 static int plan_tcp_non_syn_tracked(ndisapi_engine_t *engine,
                                     const packet_observation_t *obs,
                                     traffic_action_t *action) {
-    conntrack_entry_t entry;
+    conntrack_role_snapshot_t snap;
 
-    if (conntrack_get_tcp_proxy_outbound(engine->conntrack, obs->src_ip,
-                                         obs->src_port, obs->dst_ip,
-                                         obs->dst_port, &entry) != ERR_OK) {
+    if (conntrack_role_tcp_outbound(engine->conntrack, obs->src_ip,
+                                    obs->src_port, obs->dst_ip,
+                                    obs->dst_port, &snap) != ERR_OK) {
         return 0;
     }
 
-    if (entry.relay_src_port == 0) {
-        conntrack_touch_direct_tcp(engine->conntrack, &entry);
+    if (snap.relay_src_port == 0) {
         traffic_action_pass_observed(action, obs, "TCP tracked direct");
         return 1;
     }
 
     traffic_action_rewrite_send_observed(action, obs, "TCP tracked non-SYN");
     traffic_action_rewrite_ip_src(action, obs->dst_ip);
-    traffic_action_rewrite_ip_dst(action, entry.src_ip);
-    traffic_action_rewrite_tcp_sport(action, entry.relay_src_port);
+    traffic_action_rewrite_ip_dst(action, snap.client_ip);
+    traffic_action_rewrite_tcp_sport(action, snap.relay_src_port);
     traffic_action_rewrite_tcp_dport(action, engine->tcp_relay_port);
     traffic_action_rewrite_swap_eth(action);
     traffic_action_rewrite_clamp_tcp_mss(action, WTP_TCP_MSS_CLAMP);
@@ -92,33 +92,26 @@ static int plan_tcp_non_syn_tracked(ndisapi_engine_t *engine,
     return 1;
 }
 
+/*
+ * Untracked non-SYN TCP drops fail-closed. Identity cannot change the
+ * disposition here, so only the cached flow index backs the self-pass
+ * guard - no synchronous owner-table refresh and no sleep may run on a
+ * flow worker for packets that will drop regardless.
+ */
 static void plan_tcp_non_syn_untracked(ndisapi_engine_t *engine,
                                        const packet_observation_t *obs,
                                        traffic_action_t *action) {
     char proc_name[256] = {0};
     uint32_t pid;
-    rule_decision_t decision;
 
-    pid = proc_lookup_tcp_retry(engine->proc_lookup, obs->src_ip, obs->src_port,
-                                proc_name, sizeof(proc_name));
+    pid = proc_lookup_tcp(engine->proc_lookup, obs->src_ip, obs->src_port,
+                          proc_name, sizeof(proc_name));
     if (pid > 0 && proc_is_self(engine->proc_lookup, pid)) {
         traffic_action_pass_observed(action, obs, "self pass");
         return;
     }
 
-    decision = policy_rules_match(engine->config->policy.rules,
-                                  engine->config->policy.rule_count,
-                                  engine->config->policy.default_decision,
-                                  proc_name, obs->dst_ip, obs->dst_port,
-                                  obs->protocol, NULL);
-
-    if (decision == RULE_DECISION_DIRECT) {
-        traffic_action_drop_observed(action, obs, "preexisting direct tcp");
-        return;
-    }
-
-    traffic_action_drop_observed(action, obs,
-                                 "TCP non-SYN proxy without conntrack");
+    traffic_action_drop_observed(action, obs, "TCP non-SYN untracked");
 }
 
 void path_plan_policy(ndisapi_engine_t *engine,
@@ -142,6 +135,20 @@ void path_plan_policy(ndisapi_engine_t *engine,
             return;
         }
     } else {
+        /* Tracked UDP fast path: a live full-tuple entry means policy
+         * already chose proxy for this (client, server) flow - forward
+         * without re-running identity lookup, policy, or tracking. The
+         * fused role op refreshes pair liveness in the same pass. */
+        conntrack_role_snapshot_t snap;
+
+        if (conntrack_role_udp_outbound(engine->conntrack, obs->src_ip,
+                                        obs->src_port, obs->dst_ip,
+                                        obs->dst_port, &snap) == ERR_OK) {
+            traffic_action_forward_udp_observed(action, obs,
+                                                "UDP PROXY tracked forward");
+            return;
+        }
+
         pid = proc_lookup_udp(engine->proc_lookup, obs->src_ip,
                               obs->src_port, proc_name, sizeof(proc_name));
     }

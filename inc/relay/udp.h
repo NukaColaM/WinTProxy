@@ -25,8 +25,6 @@ typedef struct {
     SOCKET           relay_sock;
     struct sockaddr_in relay_addr;
     uint64_t         last_activity;
-    int              active_prev;
-    int              active_next;
     int              next_index;
     int              bucket;
 } udp_session_t;
@@ -51,8 +49,6 @@ typedef struct {
     int             *session_buckets;
     size_t           session_capacity;
     size_t           bucket_count;
-    int              active_head;
-    int              active_tail;
     SRWLOCK          session_lock;
     udp_relay_counters_t counters;
 } udp_relay_t;
@@ -60,5 +56,21 @@ typedef struct {
 error_t udp_relay_start(udp_relay_t *relay, conntrack_t *conntrack, proxy_config_t *proxy);
 void    udp_relay_stop(udp_relay_t *relay);
 void    udp_relay_snapshot_counters(udp_relay_t *relay, udp_relay_counters_t *out);
+
+#ifdef WINTPROXY_TEST_HOOKS
+/* Test seams: drive the datagram handlers directly without the select loop. */
+void udp_relay_test_handle_client_datagram(udp_relay_t *relay, uint8_t *recv_buf,
+                                           int n, uint8_t *send_buf,
+                                           int send_buf_len);
+void udp_relay_test_handle_proxy_datagram(udp_relay_t *relay, SOCKET relay_sock,
+                                          struct sockaddr_in relay_addr,
+                                          uint32_t client_ip,
+                                          uint16_t client_port,
+                                          int session_index,
+                                          uint32_t generation,
+                                          uint8_t *recv_buf);
+int  udp_relay_test_alloc_oldest(udp_relay_t *relay);
+void udp_relay_test_cleanup_idle(udp_relay_t *relay);
+#endif
 
 #endif

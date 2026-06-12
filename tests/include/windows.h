@@ -156,8 +156,16 @@ static inline DWORD GetTickCount(void) {
     return 0;
 }
 
+#ifdef WINTPROXY_TEST_HOOKS
+extern uint64_t g_test_windows_tick_ms;
+#endif
+
 static inline uint64_t GetTickCount64(void) {
+#ifdef WINTPROXY_TEST_HOOKS
+    return g_test_windows_tick_ms;
+#else
     return 0;
+#endif
 }
 
 static inline void GetLocalTime(SYSTEMTIME *st) {
@@ -218,6 +226,9 @@ extern LPTHREAD_START_ROUTINE g_test_windows_thread_procs[64];
 extern LPVOID g_test_windows_thread_params[64];
 extern int g_test_windows_set_event_count;
 extern HANDLE g_test_windows_set_event_handles[128];
+extern int g_test_windows_wait_count;
+extern int g_test_windows_sleep_count;
+extern int g_test_windows_srw_exclusive_count;
 #endif
 
 static inline BOOL CloseHandle(HANDLE hObject) {
@@ -228,6 +239,9 @@ static inline BOOL CloseHandle(HANDLE hObject) {
 static inline DWORD WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds) {
     (void)hHandle;
     (void)dwMilliseconds;
+#ifdef WINTPROXY_TEST_HOOKS
+    g_test_windows_wait_count++;
+#endif
     return 0;
 }
 
@@ -281,6 +295,9 @@ static inline HANDLE CreateThread(LPSECURITY_ATTRIBUTES lpThreadAttributes, size
 
 static inline void Sleep(DWORD dwMilliseconds) {
     (void)dwMilliseconds;
+#ifdef WINTPROXY_TEST_HOOKS
+    g_test_windows_sleep_count++;
+#endif
 }
 
 static inline LONG InterlockedIncrement(LONG volatile *Addend) {
@@ -330,6 +347,9 @@ static inline void ReleaseSRWLockShared(SRWLOCK *lock) {
 
 static inline void AcquireSRWLockExclusive(SRWLOCK *lock) {
     (void)lock;
+#ifdef WINTPROXY_TEST_HOOKS
+    g_test_windows_srw_exclusive_count++;
+#endif
 }
 
 static inline void ReleaseSRWLockExclusive(SRWLOCK *lock) {

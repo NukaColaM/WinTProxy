@@ -18,6 +18,11 @@ LPTHREAD_START_ROUTINE g_test_windows_thread_procs[64];
 LPVOID g_test_windows_thread_params[64];
 int g_test_windows_set_event_count = 0;
 HANDLE g_test_windows_set_event_handles[128];
+int g_test_windows_wait_count = 0;
+int g_test_windows_sleep_count = 0;
+uint64_t g_test_windows_tick_ms = 0;
+int g_test_windows_srw_exclusive_count = 0;
+int g_test_winsock_ioctl_count = 0;
 
 static int failures = 0;
 static HANDLE adapter_a = (HANDLE)0xA001;
@@ -32,10 +37,12 @@ static int adapter_change_event_count = 0;
 static HANDLE adapter_change_event = NULL;
 static int flush_adapter_queue_count = 0;
 static HANDLE flush_adapter_queue_adapters[16];
+static unsigned long set_pool_size_value = 0;
 static int read_packets_count = 0;
 static int read_packets_unsorted_count = 0;
 static HANDLE read_packets_adapters[16];
 static unsigned read_packets_numbers[16];
+static int read_packets_full_batches_remaining = 0;
 static int mstcp_unsorted_send_count = 0;
 static int adapter_unsorted_send_count = 0;
 static int mstcp_send_call_count = 0;
@@ -44,6 +51,8 @@ static HANDLE mstcp_send_adapters[16];
 static HANDLE adapter_send_adapters[16];
 static unsigned mstcp_send_numbers[16];
 static unsigned adapter_send_numbers[16];
+static uint8_t mstcp_send_markers[16][8];
+static PETH_M_REQUEST mstcp_send_requests[16];
 static int mstcp_partial_next = 0;
 static int adapter_fail_next = 0;
 static int log_capture_enabled = 0;
@@ -188,6 +197,8 @@ static void reset_test_state(void) {
     memset(log_last_message, 0, sizeof(log_last_message));
     g_test_windows_create_thread_count = 0;
     g_test_windows_set_event_count = 0;
+    g_test_windows_wait_count = 0;
+    g_test_windows_sleep_count = 0;
     packet_event_count = 0;
     adapter_mode_count = 0;
     adapter_mode_reset_count = 0;
@@ -195,8 +206,10 @@ static void reset_test_state(void) {
     adapter_change_event_count = 0;
     adapter_change_event = NULL;
     flush_adapter_queue_count = 0;
+    set_pool_size_value = 0;
     read_packets_count = 0;
     read_packets_unsorted_count = 0;
+    read_packets_full_batches_remaining = 0;
     mstcp_unsorted_send_count = 0;
     adapter_unsorted_send_count = 0;
     mstcp_send_call_count = 0;
@@ -213,6 +226,8 @@ static void clear_send_capture(void) {
     memset(adapter_send_adapters, 0, sizeof(adapter_send_adapters));
     memset(mstcp_send_numbers, 0, sizeof(mstcp_send_numbers));
     memset(adapter_send_numbers, 0, sizeof(adapter_send_numbers));
+    memset(mstcp_send_markers, 0, sizeof(mstcp_send_markers));
+    memset(mstcp_send_requests, 0, sizeof(mstcp_send_requests));
     mstcp_send_call_count = 0;
     adapter_send_call_count = 0;
     mstcp_unsorted_send_count = 0;
@@ -306,7 +321,7 @@ BOOL __stdcall SetAdapterListChangeEvent(HANDLE hOpen, HANDLE hWin32Event) {
 }
 
 BOOL __stdcall SetPoolSize(DWORD dwPoolSize) {
-    (void)dwPoolSize;
+    set_pool_size_value = (unsigned long)dwPoolSize;
     return TRUE;
 }
 
@@ -336,6 +351,18 @@ BOOL __stdcall ReadPackets(HANDLE hOpen, PETH_M_REQUEST pPackets) {
     if (pPackets->dwPacketsNumber == 0 || !pPackets->EthPacket[0].Buffer) {
         if (engine_to_stop_after_read) engine_to_stop_after_read->running = 0;
         return FALSE;
+    }
+
+    if (read_packets_full_batches_remaining > 0) {
+        DWORD i;
+
+        read_packets_full_batches_remaining--;
+        for (i = 0; i < pPackets->dwPacketsNumber; i++) {
+            fill_inbound_ipv4_udp(pPackets->EthPacket[i].Buffer,
+                                  pPackets->hAdapterHandle);
+        }
+        pPackets->dwPacketsSuccess = pPackets->dwPacketsNumber;
+        return TRUE;
     }
 
     fill_inbound_ipv4_udp(pPackets->EthPacket[0].Buffer, pPackets->hAdapterHandle);
@@ -382,6 +409,12 @@ BOOL __stdcall SendPacketsToMstcp(HANDLE hOpen, PETH_M_REQUEST pPackets) {
     if (pPackets && mstcp_send_call_count < 16) {
         mstcp_send_adapters[mstcp_send_call_count] = pPackets->hAdapterHandle;
         mstcp_send_numbers[mstcp_send_call_count] = pPackets->dwPacketsNumber;
+        mstcp_send_requests[mstcp_send_call_count] = pPackets;
+        for (DWORD i = 0; i < pPackets->dwPacketsNumber && i < 8; i++) {
+            PINTERMEDIATE_BUFFER pkt = pPackets->EthPacket[i].Buffer;
+            mstcp_send_markers[mstcp_send_call_count][i] =
+                pkt ? pkt->m_IBuffer[0] : 0;
+        }
     }
     mstcp_send_call_count++;
     if (pPackets) {
@@ -496,42 +529,9 @@ int dns_hijack_rewrite_response(dns_hijack_t *dh, uint32_t *src_ip,
     return 0;
 }
 
-error_t conntrack_get_tcp_dns_return(conntrack_t *ct, uint32_t response_src_ip,
-                                     uint16_t response_src_port,
-                                     uint32_t response_dst_ip,
-                                     uint16_t response_dst_port,
-                                     conntrack_entry_t *out) {
-    (void)ct; (void)response_src_ip; (void)response_src_port;
-    (void)response_dst_ip; (void)response_dst_port; (void)out;
-    return ERR_NOT_FOUND;
-}
 
-error_t conntrack_get_tcp_proxy_return(conntrack_t *ct, uint32_t relay_src_ip,
-                                       uint16_t relay_src_port,
-                                       uint32_t relay_dst_ip,
-                                       uint16_t relay_dst_port,
-                                       conntrack_entry_t *out) {
-    (void)ct; (void)relay_src_ip; (void)relay_src_port;
-    (void)relay_dst_ip; (void)relay_dst_port; (void)out;
-    return ERR_NOT_FOUND;
-}
 
-error_t conntrack_get_udp_proxy_return(conntrack_t *ct, uint32_t server_ip,
-                                       uint16_t client_port,
-                                       conntrack_entry_t *out) {
-    (void)ct; (void)server_ip; (void)client_port; (void)out;
-    return ERR_NOT_FOUND;
-}
 
-error_t conntrack_get_tcp_proxy_outbound(conntrack_t *ct, uint32_t client_ip,
-                                         uint16_t client_port,
-                                         uint32_t server_ip,
-                                         uint16_t server_port,
-                                         conntrack_entry_t *out) {
-    (void)ct; (void)client_ip; (void)client_port; (void)server_ip;
-    (void)server_port; (void)out;
-    return ERR_NOT_FOUND;
-}
 
 error_t conntrack_track_direct_tcp(conntrack_t *ct,
                                    const conntrack_direct_tcp_flow_t *flow) {
@@ -559,28 +559,49 @@ error_t conntrack_track_tcp_dns(conntrack_t *ct,
     return ERR_OK;
 }
 
-void conntrack_touch_direct_tcp(conntrack_t *ct, const conntrack_entry_t *entry) {
-    (void)ct; (void)entry;
+error_t conntrack_role_tcp_outbound(conntrack_t *ct, uint32_t client_ip,
+                                    uint16_t client_port, uint32_t server_ip,
+                                    uint16_t server_port,
+                                    conntrack_role_snapshot_t *out) {
+    (void)ct; (void)client_ip; (void)client_port; (void)server_ip;
+    (void)server_port; (void)out;
+    return ERR_NOT_FOUND;
 }
 
-void conntrack_touch_tcp_proxy_outbound(conntrack_t *ct,
-                                        const conntrack_entry_t *entry) {
-    (void)ct; (void)entry;
+error_t conntrack_role_tcp_return(conntrack_t *ct, uint32_t relay_src_ip,
+                                  uint16_t relay_src_port,
+                                  uint32_t relay_dst_ip,
+                                  uint16_t relay_dst_port,
+                                  conntrack_role_snapshot_t *out) {
+    (void)ct; (void)relay_src_ip; (void)relay_src_port;
+    (void)relay_dst_ip; (void)relay_dst_port; (void)out;
+    return ERR_NOT_FOUND;
 }
 
-void conntrack_touch_tcp_proxy_return(conntrack_t *ct,
-                                      const conntrack_entry_t *entry) {
-    (void)ct; (void)entry;
+error_t conntrack_role_udp_outbound(conntrack_t *ct, uint32_t client_ip,
+                                    uint16_t client_port, uint32_t server_ip,
+                                    uint16_t server_port,
+                                    conntrack_role_snapshot_t *out) {
+    (void)ct; (void)client_ip; (void)client_port; (void)server_ip;
+    (void)server_port; (void)out;
+    return ERR_NOT_FOUND;
 }
 
-void conntrack_touch_udp_proxy_outbound(conntrack_t *ct,
-                                        const conntrack_entry_t *entry) {
-    (void)ct; (void)entry;
+error_t conntrack_role_udp_return(conntrack_t *ct, uint32_t server_ip,
+                                  uint16_t client_port,
+                                  conntrack_role_snapshot_t *out) {
+    (void)ct; (void)server_ip; (void)client_port; (void)out;
+    return ERR_NOT_FOUND;
 }
 
-void conntrack_touch_udp_proxy_return(conntrack_t *ct,
-                                      const conntrack_entry_t *entry) {
-    (void)ct; (void)entry;
+error_t conntrack_role_tcp_dns_return(conntrack_t *ct, uint32_t response_src_ip,
+                                      uint16_t response_src_port,
+                                      uint32_t response_dst_ip,
+                                      uint16_t response_dst_port,
+                                      conntrack_role_snapshot_t *out) {
+    (void)ct; (void)response_src_ip; (void)response_src_port;
+    (void)response_dst_ip; (void)response_dst_port; (void)out;
+    return ERR_NOT_FOUND;
 }
 
 static void test_start_registers_one_reader_per_adapter(void) {
@@ -910,6 +931,7 @@ static void test_flow_worker_enqueue_timeout_drops_and_releases(void) {
     worker->engine = &engine;
     worker->worker_index = 0;
     worker->work_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    worker->space_event = CreateEvent(NULL, TRUE, FALSE, NULL);
     InitializeSRWLock(&worker->lock);
 
     if (!ndisapi_packet_pool_init(&engine.packet_pool,
@@ -956,6 +978,231 @@ static void test_flow_worker_enqueue_timeout_drops_and_releases(void) {
     }
     CloseHandle(worker->work_event);
     ndisapi_packet_pool_destroy(&engine.packet_pool);
+}
+
+static void test_reader_drains_backlog_with_grouped_dispatch(void) {
+    ndisapi_engine_t engine;
+    app_config_t config;
+    conntrack_t conntrack;
+    proc_lookup_t proc_lookup;
+    dns_hijack_t dns_hijack;
+    DWORD queued_total = 0;
+    DWORD i;
+
+    memset(&engine, 0, sizeof(engine));
+    memset(&config, 0, sizeof(config));
+    memset(&conntrack, 0, sizeof(conntrack));
+    memset(&proc_lookup, 0, sizeof(proc_lookup));
+    memset(&dns_hijack, 0, sizeof(dns_hijack));
+    reset_test_state();
+
+    config.policy.default_decision = RULE_DECISION_DIRECT;
+    dns_hijack.enabled = 0;
+
+    if (ndisapi_start(&engine, &config, &conntrack, &proc_lookup, &dns_hijack,
+                      40000, 40001) != ERR_OK) {
+        fprintf(stderr, "FAIL ndisapi_start failed\n");
+        failures++;
+        return;
+    }
+
+    /* One full batch then a partial read; all packets share one flow. */
+    read_packets_full_batches_remaining = 1;
+    engine_to_stop_after_read = &engine;
+    read_packets_count = 0;
+    g_test_windows_wait_count = 0;
+    g_test_windows_set_event_count = 0;
+
+    if (!run_captured_thread(&engine.readers[0])) {
+        fprintf(stderr, "FAIL reader thread not captured\n");
+        failures++;
+    }
+
+    check_int("backlog drained reads per wake", read_packets_count, 2);
+    check_int("one event wait drains full backlog", g_test_windows_wait_count, 1);
+    check_int("one worker wake per read batch", g_test_windows_set_event_count, 2);
+
+    for (i = 0; i < engine.flow_worker_count; i++) {
+        queued_total += engine.flow_workers[i].count;
+    }
+    check_int("backlog packets queued for one flow worker",
+              (int)queued_total, NDISAPI_BATCH_SIZE + 1);
+    check_int("backlog recv counter",
+              (int)engine.counters.packets_recv, NDISAPI_BATCH_SIZE + 1);
+
+    ndisapi_stop(&engine);
+}
+
+static void test_flow_worker_dispatch_batch_groups_and_drops(void) {
+    ndisapi_engine_t engine;
+    ndisapi_flow_worker_t *worker;
+    ndisapi_packet_block_t *blocks[4];
+    DWORD i;
+
+    reset_test_state();
+    memset(&engine, 0, sizeof(engine));
+    engine.driver_handle = (HANDLE)0xD001;
+    engine.flow_worker_count = 1;
+    worker = &engine.flow_workers[0];
+    worker->engine = &engine;
+    worker->worker_index = 0;
+    worker->work_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    worker->space_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    InitializeSRWLock(&worker->lock);
+
+    if (!ndisapi_packet_pool_init(&engine.packet_pool,
+                                  NDISAPI_FLOW_QUEUE_DEPTH + 4)) {
+        fprintf(stderr, "FAIL packet pool init failed\n");
+        failures++;
+        return;
+    }
+
+    /* Leave two free slots in the worker queue. */
+    for (i = 0; i < NDISAPI_FLOW_QUEUE_DEPTH - 2; i++) {
+        ndisapi_packet_block_t *block =
+            ndisapi_packet_block_acquire(&engine.packet_pool, adapter_a, 0);
+        if (!ndisapi_flow_worker_enqueue(&engine, block, 0)) {
+            fprintf(stderr, "FAIL dispatch test prefill enqueue failed\n");
+            failures++;
+            return;
+        }
+    }
+
+    for (i = 0; i < 4; i++) {
+        blocks[i] = ndisapi_packet_block_acquire(&engine.packet_pool,
+                                                 adapter_a, 0);
+        if (!blocks[i]) {
+            fprintf(stderr, "FAIL dispatch test block acquire failed\n");
+            failures++;
+            return;
+        }
+        fill_inbound_ipv4_udp(&blocks[i]->buffer, adapter_a);
+    }
+
+    g_test_windows_set_event_count = 0;
+    {
+        DWORD free_before = engine.packet_pool.free_count;
+        DWORD enqueued;
+
+        g_test_windows_sleep_count = 0;
+        enqueued = ndisapi_flow_worker_dispatch_batch(&engine, blocks, 4,
+                                                      NDISAPI_FLOW_ENQUEUE_WAIT_MS);
+
+        check_int("dispatch batch enqueues into free space", (int)enqueued, 2);
+        check_int("dispatch overflow waits without sleeping",
+                  g_test_windows_sleep_count, 0);
+        check_int("dispatch batch single wake for the group",
+                  g_test_windows_set_event_count, 1);
+        check_int("dispatch batch queue is full",
+                  (int)worker->count, NDISAPI_FLOW_QUEUE_DEPTH);
+        check_int("dispatch batch overflow timeout counter",
+                  (int)engine.counters.enqueue_timeouts, 2);
+        check_int("dispatch batch overflow dropped counter",
+                  (int)engine.counters.packets_dropped, 2);
+        check_int("dispatch batch overflow blocks released",
+                  (int)engine.packet_pool.free_count, (int)(free_before + 2));
+    }
+
+    while (worker->count > 0) {
+        ndisapi_packet_block_t *block = worker->queue[worker->head];
+        worker->queue[worker->head] = NULL;
+        worker->head = (worker->head + 1U) % NDISAPI_FLOW_QUEUE_DEPTH;
+        worker->count--;
+        ndisapi_packet_block_release(block);
+    }
+    CloseHandle(worker->work_event);
+    ndisapi_packet_pool_destroy(&engine.packet_pool);
+}
+
+static void test_pool_capacity_derived_from_inflight_model(void) {
+    ndisapi_engine_t engine;
+    app_config_t config;
+    conntrack_t conntrack;
+    proc_lookup_t proc_lookup;
+    dns_hijack_t dns_hijack;
+    DWORD expected;
+
+    memset(&engine, 0, sizeof(engine));
+    memset(&config, 0, sizeof(config));
+    memset(&conntrack, 0, sizeof(conntrack));
+    memset(&proc_lookup, 0, sizeof(proc_lookup));
+    memset(&dns_hijack, 0, sizeof(dns_hijack));
+    reset_test_state();
+
+    config.policy.default_decision = RULE_DECISION_DIRECT;
+    dns_hijack.enabled = 0;
+
+    /* Formula: reader in-flight + total worker depth + total sender depth. */
+    check_int("capacity formula one adapter two workers",
+              (int)ndisapi_packet_pool_capacity_for(1, 2),
+              1 * NDISAPI_BATCH_SIZE * 2 +
+              2 * NDISAPI_FLOW_QUEUE_DEPTH +
+              NDISAPI_SENDER_COUNT * NDISAPI_SENDER_QUEUE_DEPTH);
+
+    if (ndisapi_start(&engine, &config, &conntrack, &proc_lookup, &dns_hijack,
+                      40000, 40001) != ERR_OK) {
+        fprintf(stderr, "FAIL ndisapi_start failed\n");
+        failures++;
+        return;
+    }
+
+    expected = ndisapi_packet_pool_capacity_for(engine.adapter_count,
+                                                engine.flow_worker_count);
+    check_int("pool capacity covers downstream occupancy",
+              (int)engine.packet_pool.capacity, (int)expected);
+    check_int("pool covers more than reader in-flight",
+              engine.packet_pool.capacity >
+              engine.adapter_count * NDISAPI_BATCH_SIZE * 2U, 1);
+    check_int("driver pool size aligned to reader in-flight",
+              (int)set_pool_size_value,
+              (int)(engine.adapter_count * NDISAPI_BATCH_SIZE * 2U));
+
+    ndisapi_stop(&engine);
+}
+
+static void test_pool_release_into_empty_pool_signals_free_event(void) {
+    ndisapi_packet_pool_t pool;
+    ndisapi_packet_block_t *a;
+    ndisapi_packet_block_t *b;
+
+    reset_test_state();
+    memset(&pool, 0, sizeof(pool));
+
+    if (!ndisapi_packet_pool_init(&pool, 2)) {
+        fprintf(stderr, "FAIL packet pool init failed\n");
+        failures++;
+        return;
+    }
+    if (!pool.free_event) {
+        fprintf(stderr, "FAIL packet pool has no free-space event\n");
+        failures++;
+        ndisapi_packet_pool_destroy(&pool);
+        return;
+    }
+
+    a = ndisapi_packet_block_acquire(&pool, adapter_a, 0);
+    b = ndisapi_packet_block_acquire(&pool, adapter_a, 0);
+    if (!a || !b) {
+        fprintf(stderr, "FAIL free-event test acquire failed\n");
+        failures++;
+        ndisapi_packet_pool_destroy(&pool);
+        return;
+    }
+
+    /* Release into an empty pool wakes blocked acquirers. */
+    g_test_windows_set_event_count = 0;
+    ndisapi_packet_block_release(a);
+    check_int("release into empty pool signals", g_test_windows_set_event_count, 1);
+    check_handle("release signal targets pool free event",
+                 g_test_windows_set_event_handles[0], pool.free_event);
+
+    /* Release into a non-empty pool stays silent. */
+    g_test_windows_set_event_count = 0;
+    ndisapi_packet_block_release(b);
+    check_int("release into non-empty pool is silent",
+              g_test_windows_set_event_count, 0);
+
+    ndisapi_packet_pool_destroy(&pool);
 }
 
 static void test_packet_pool_acquire_release_and_refcounts(void) {
@@ -1024,7 +1271,9 @@ static void test_packet_pool_exhaustion_flushes_adapter_queue(void) {
     }
 
     held = ndisapi_packet_block_acquire(&engine.packet_pool, adapter_a, 0);
-    blocked = ndisapi_packet_block_acquire_or_flush(&engine, adapter_b, 1, 0);
+    g_test_windows_sleep_count = 0;
+    blocked = ndisapi_packet_block_acquire_or_flush(&engine, adapter_b, 1,
+                                                    NDISAPI_PACKET_POOL_WAIT_MS);
 
     if (!held) {
         fprintf(stderr, "FAIL held packet block missing\n");
@@ -1035,6 +1284,8 @@ static void test_packet_pool_exhaustion_flushes_adapter_queue(void) {
         failures++;
     }
 
+    check_int("pool exhaustion waits without sleeping",
+              g_test_windows_sleep_count, 0);
     check_int("pool exhaustion flush count", flush_adapter_queue_count, 1);
     check_handle("pool exhaustion flush adapter",
                  flush_adapter_queue_adapters[0], adapter_b);
@@ -1046,6 +1297,124 @@ static void test_packet_pool_exhaustion_flushes_adapter_queue(void) {
 
     if (held) ndisapi_packet_block_release(held);
     ndisapi_packet_pool_destroy(&engine.packet_pool);
+}
+
+static void test_packet_block_pool_skips_buffer_clearing_between_cycles(void) {
+    ndisapi_packet_pool_t pool;
+    ndisapi_packet_block_t *block;
+    ndisapi_packet_block_t *again;
+
+    reset_test_state();
+    memset(&pool, 0, sizeof(pool));
+
+    if (!ndisapi_packet_pool_init(&pool, 1)) {
+        fprintf(stderr, "FAIL packet pool init failed\n");
+        failures++;
+        return;
+    }
+
+    block = ndisapi_packet_block_acquire(&pool, adapter_a, 0);
+    if (!block) {
+        fprintf(stderr, "FAIL hygiene test acquire failed\n");
+        failures++;
+        ndisapi_packet_pool_destroy(&pool);
+        return;
+    }
+    block->buffer.m_IBuffer[7] = 0xAB;
+    block->buffer.m_Length = 77;
+    ndisapi_packet_block_release(block);
+
+    again = ndisapi_packet_block_acquire(&pool, adapter_b, 1);
+    if (again != block) {
+        fprintf(stderr, "FAIL hygiene test expected same block back\n");
+        failures++;
+        ndisapi_packet_pool_destroy(&pool);
+        return;
+    }
+    check_int("pool cycle keeps frame bytes (no buffer memset)",
+              again->buffer.m_IBuffer[7], 0xAB);
+    check_int("reacquired block owned", (int)again->ref_count, 1);
+    check_handle("reacquired block adapter identity",
+                 again->adapter_handle, adapter_b);
+    check_handle("reacquired block buffer adapter",
+                 again->buffer.m_hAdapter, adapter_b);
+    check_int("reacquired block adapter index", (int)again->adapter_index, 1);
+
+    ndisapi_packet_block_release(again);
+    ndisapi_packet_pool_destroy(&pool);
+}
+
+static void test_sender_flush_reuses_preallocated_request(void) {
+    ndisapi_engine_t engine;
+    app_config_t config;
+    conntrack_t conntrack;
+    proc_lookup_t proc_lookup;
+    dns_hijack_t dns_hijack;
+    ndisapi_packet_block_t *block;
+    ndisapi_send_item_t item;
+    PETH_M_REQUEST prealloc;
+    int round;
+
+    memset(&engine, 0, sizeof(engine));
+    memset(&config, 0, sizeof(config));
+    memset(&conntrack, 0, sizeof(conntrack));
+    memset(&proc_lookup, 0, sizeof(proc_lookup));
+    memset(&dns_hijack, 0, sizeof(dns_hijack));
+    reset_test_state();
+
+    config.policy.default_decision = RULE_DECISION_DIRECT;
+    dns_hijack.enabled = 0;
+
+    if (ndisapi_start(&engine, &config, &conntrack, &proc_lookup, &dns_hijack,
+                      40000, 40001) != ERR_OK) {
+        fprintf(stderr, "FAIL ndisapi_start failed\n");
+        failures++;
+        return;
+    }
+    clear_send_capture();
+
+    prealloc = engine.senders[NDISAPI_SEND_TARGET_MSTCP].send_request;
+    if (!prealloc) {
+        fprintf(stderr, "FAIL sender has no preallocated send request\n");
+        failures++;
+        ndisapi_stop(&engine);
+        return;
+    }
+
+    engine.running = 0;
+    for (round = 0; round < 2; round++) {
+        block = ndisapi_packet_block_acquire(&engine.packet_pool, adapter_a, 0);
+        if (!block) {
+            fprintf(stderr, "FAIL prealloc test block acquire failed\n");
+            failures++;
+            ndisapi_stop(&engine);
+            return;
+        }
+        block->buffer.m_hAdapter = adapter_a;
+        memset(&item, 0, sizeof(item));
+        item.buf = &block->buffer;
+        item.block = block;
+        if (!ndisapi_enqueue_send_batch_to_mstcp(&engine, &item, 1)) {
+            fprintf(stderr, "FAIL prealloc test enqueue failed\n");
+            failures++;
+        }
+        ndisapi_packet_block_release(block);
+        if (!run_captured_thread(&engine.senders[NDISAPI_SEND_TARGET_MSTCP])) {
+            fprintf(stderr, "FAIL prealloc test sender thread not captured\n");
+            failures++;
+        }
+    }
+
+    check_int("two sender flushes", mstcp_send_call_count, 2);
+    check_handle("flush 0 uses preallocated request",
+                 (HANDLE)mstcp_send_requests[0], (HANDLE)prealloc);
+    check_handle("flush 1 reuses preallocated request",
+                 (HANDLE)mstcp_send_requests[1], (HANDLE)prealloc);
+    check_int("prealloc flush releases blocks",
+              (int)engine.packet_pool.free_count,
+              (int)engine.packet_pool.capacity);
+
+    ndisapi_stop(&engine);
 }
 
 static void test_driver_sends_are_grouped_by_adapter_and_target(void) {
@@ -1102,6 +1471,85 @@ static void test_driver_sends_are_grouped_by_adapter_and_target(void) {
     check_int("adapter grouped count 1", (int)adapter_send_numbers[1], 1);
     check_int("adapter grouped unsorted calls", adapter_unsorted_send_count, 0);
     check_int("adapter grouped sent counter", (int)engine.counters.packets_sent, 3);
+}
+
+static void test_flow_worker_drains_batch_into_single_sender_enqueue(void) {
+    ndisapi_engine_t engine;
+    app_config_t config;
+    conntrack_t conntrack;
+    proc_lookup_t proc_lookup;
+    dns_hijack_t dns_hijack;
+    DWORD worker_index = 0;
+    uint8_t markers[3] = { 0x11, 0x22, 0x33 };
+    int i;
+
+    memset(&engine, 0, sizeof(engine));
+    memset(&config, 0, sizeof(config));
+    memset(&conntrack, 0, sizeof(conntrack));
+    memset(&proc_lookup, 0, sizeof(proc_lookup));
+    memset(&dns_hijack, 0, sizeof(dns_hijack));
+    reset_test_state();
+
+    config.policy.default_decision = RULE_DECISION_DIRECT;
+    dns_hijack.enabled = 0;
+
+    if (ndisapi_start(&engine, &config, &conntrack, &proc_lookup, &dns_hijack,
+                      40000, 40001) != ERR_OK) {
+        fprintf(stderr, "FAIL ndisapi_start failed\n");
+        failures++;
+        return;
+    }
+    clear_send_capture();
+
+    /* Three same-flow inbound packets so they hash to one worker. */
+    for (i = 0; i < 3; i++) {
+        ndisapi_packet_block_t *block =
+            ndisapi_packet_block_acquire(&engine.packet_pool, adapter_a, 0);
+        if (!block) {
+            fprintf(stderr, "FAIL batch test block acquire failed\n");
+            failures++;
+            ndisapi_stop(&engine);
+            return;
+        }
+        fill_inbound_ipv4_udp(&block->buffer, adapter_a);
+        block->buffer.m_IBuffer[0] = markers[i];
+        worker_index = ndisapi_packet_worker_index(&engine, &block->buffer);
+        if (!ndisapi_flow_worker_enqueue(&engine, block, 0)) {
+            fprintf(stderr, "FAIL batch test enqueue failed\n");
+            failures++;
+            ndisapi_stop(&engine);
+            return;
+        }
+    }
+    check_int("batch queued on one worker",
+              (int)engine.flow_workers[worker_index].count, 3);
+
+    /* Worker drain must wake the MSTCP sender once for the whole batch. */
+    g_test_windows_set_event_count = 0;
+    engine.running = 0;
+    if (!run_captured_thread(&engine.flow_workers[worker_index])) {
+        fprintf(stderr, "FAIL batch test worker thread not captured\n");
+        failures++;
+    }
+    check_int("one sender wake per target per drain",
+              g_test_windows_set_event_count, 1);
+    check_int("drained batch queued to MSTCP sender",
+              (int)engine.senders[NDISAPI_SEND_TARGET_MSTCP].count, 3);
+
+    if (!run_captured_thread(&engine.senders[NDISAPI_SEND_TARGET_MSTCP])) {
+        fprintf(stderr, "FAIL batch test sender thread not captured\n");
+        failures++;
+    }
+    check_int("drained batch driver send calls", mstcp_send_call_count, 1);
+    check_int("drained batch driver send size", (int)mstcp_send_numbers[0], 3);
+    check_int("drained batch order 0", mstcp_send_markers[0][0], 0x11);
+    check_int("drained batch order 1", mstcp_send_markers[0][1], 0x22);
+    check_int("drained batch order 2", mstcp_send_markers[0][2], 0x33);
+    check_int("drained batch blocks released",
+              (int)engine.packet_pool.free_count,
+              (int)engine.packet_pool.capacity);
+
+    ndisapi_stop(&engine);
 }
 
 static void test_synthetic_dns_response_uses_adapter_specific_mstcp_send(void) {
@@ -1199,13 +1647,20 @@ static void test_partial_and_failed_sends_update_counters_and_logs(void) {
 
 int main(void) {
     test_packet_pool_acquire_release_and_refcounts();
+    test_packet_block_pool_skips_buffer_clearing_between_cycles();
+    test_pool_capacity_derived_from_inflight_model();
+    test_pool_release_into_empty_pool_signals_free_event();
     test_packet_pool_exhaustion_flushes_adapter_queue();
     test_flow_worker_sizing_and_affinity();
     test_flow_worker_enqueue_timeout_drops_and_releases();
+    test_flow_worker_dispatch_batch_groups_and_drops();
     test_start_registers_one_reader_per_adapter();
+    test_reader_drains_backlog_with_grouped_dispatch();
     test_adapter_change_marks_restart_required();
     test_stop_releases_lifecycle_resources_and_is_repeatable();
     test_sender_batches_and_releases_packet_blocks();
+    test_sender_flush_reuses_preallocated_request();
+    test_flow_worker_drains_batch_into_single_sender_enqueue();
     test_driver_sends_are_grouped_by_adapter_and_target();
     test_synthetic_dns_response_uses_adapter_specific_mstcp_send();
     test_partial_and_failed_sends_update_counters_and_logs();

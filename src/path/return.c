@@ -15,11 +15,12 @@
 void path_plan_return(ndisapi_engine_t *engine,
                       const packet_observation_t *obs,
                       int is_tcp, traffic_action_t *action) {
-    conntrack_entry_t entry;
+    conntrack_role_snapshot_t snap;
     error_t err;
 
     /*
-     * Lookup entry B.
+     * Fused role lookup: restores the original tuple and refreshes pair
+     * liveness in the same conntrack pass - no separate touch calls.
      *
      * For TCP, the relay's response packet has:
      *   src = client_ip:relay_port  (relay bound to INADDR_ANY)
@@ -28,14 +29,14 @@ void path_plan_return(ndisapi_engine_t *engine,
      * So we look up (obs->dst_ip, obs->dst_port, obs->src_ip, obs->src_port).
      */
     if (is_tcp) {
-        err = conntrack_get_tcp_proxy_return(engine->conntrack,
-                                             obs->dst_ip, obs->dst_port,
-                                             obs->src_ip, obs->src_port,
-                                             &entry);
+        err = conntrack_role_tcp_return(engine->conntrack,
+                                        obs->dst_ip, obs->dst_port,
+                                        obs->src_ip, obs->src_port,
+                                        &snap);
     } else {
-        err = conntrack_get_udp_proxy_return(engine->conntrack,
-                                             obs->dst_ip, obs->dst_port,
-                                             &entry);
+        err = conntrack_role_udp_return(engine->conntrack,
+                                        obs->dst_ip, obs->dst_port,
+                                        &snap);
     }
     if (err != ERR_OK) {
         LOG_WARN("%s return: no conntrack for dst %s:%u",
@@ -48,34 +49,26 @@ void path_plan_return(ndisapi_engine_t *engine,
         return;
     }
 
-    if (is_tcp) {
-        conntrack_touch_tcp_proxy_outbound(engine->conntrack, &entry);
-        conntrack_touch_tcp_proxy_return(engine->conntrack, &entry);
-    } else {
-        conntrack_touch_udp_proxy_outbound(engine->conntrack, &entry);
-        conntrack_touch_udp_proxy_return(engine->conntrack, &entry);
-    }
-
-    {
+    if (log_is_enabled(LOG_TRACE)) {
         char orig_dst_str[16], orig_src_str[16];
-        ip_to_str(entry.orig_dst_ip, orig_dst_str, sizeof(orig_dst_str));
-        ip_to_str(entry.src_ip, orig_src_str, sizeof(orig_src_str));
+        ip_to_str(snap.orig_dst_ip, orig_dst_str, sizeof(orig_dst_str));
+        ip_to_str(snap.client_ip, orig_src_str, sizeof(orig_src_str));
         LOG_TRACE("%s return: rewrite %s:%u -> %s:%u",
             is_tcp ? "TCP" : "UDP",
-            orig_dst_str, entry.orig_dst_port,
-            orig_src_str, entry.client_port);
+            orig_dst_str, snap.orig_dst_port,
+            orig_src_str, snap.client_port);
     }
 
     traffic_action_rewrite_send_observed(action, obs,
                                          is_tcp ? "TCP return" : "UDP return");
-    traffic_action_rewrite_ip_src(action, entry.orig_dst_ip);
-    traffic_action_rewrite_ip_dst(action, entry.src_ip);
+    traffic_action_rewrite_ip_src(action, snap.orig_dst_ip);
+    traffic_action_rewrite_ip_dst(action, snap.client_ip);
     if (is_tcp) {
-        traffic_action_rewrite_tcp_sport(action, entry.orig_dst_port);
-        traffic_action_rewrite_tcp_dport(action, entry.client_port);
+        traffic_action_rewrite_tcp_sport(action, snap.orig_dst_port);
+        traffic_action_rewrite_tcp_dport(action, snap.client_port);
         traffic_action_rewrite_clamp_tcp_mss(action, WTP_TCP_MSS_CLAMP);
     } else {
-        traffic_action_rewrite_udp_sport(action, entry.orig_dst_port);
+        traffic_action_rewrite_udp_sport(action, snap.orig_dst_port);
     }
     traffic_action_rewrite_swap_eth(action);
     traffic_action_set_send_target(action, TRAFFIC_SEND_TO_MSTCP);

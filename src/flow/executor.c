@@ -118,12 +118,18 @@ static void execute_udp_forward(ndisapi_engine_t *engine,
         return;
     }
 
-    uint8_t framed[6 + WTP_UDP_BUFFER_SIZE];
-    int framed_len = (int)(6U + udp_data_len);
+    /* Frame: src_ip(4) src_port(2) dst_ip(4) dst_port(2) payload. The
+     * explicit destination lets the relay wrap each datagram toward the
+     * destination it was actually sent to. */
+    uint8_t framed[12 + WTP_UDP_BUFFER_SIZE];
+    int framed_len = (int)(12U + udp_data_len);
     memcpy(framed, &ctx->src_ip, 4);
     framed[4] = (uint8_t)(ctx->src_port >> 8);
     framed[5] = (uint8_t)(ctx->src_port & 0xFF);
-    memcpy(framed + 6, udp_data, udp_data_len);
+    memcpy(framed + 6, &ctx->dst_ip, 4);
+    framed[10] = (uint8_t)(ctx->dst_port >> 8);
+    framed[11] = (uint8_t)(ctx->dst_port & 0xFF);
+    memcpy(framed + 12, udp_data, udp_data_len);
 
     struct sockaddr_in relay_dest;
     memset(&relay_dest, 0, sizeof(relay_dest));
@@ -261,6 +267,53 @@ static void execute_dns_response_injection(ndisapi_engine_t *engine,
     }
 }
 
+static void execute_one_action(ndisapi_engine_t *engine,
+                               traffic_action_t *action,
+                               ndisapi_send_item_t *to_adapter,
+                               size_t *adapter_count,
+                               ndisapi_send_item_t *to_mstcp,
+                               size_t *mstcp_count) {
+    if (!action) return;
+
+    switch (action->type) {
+    case TRAFFIC_ACTION_PASS:
+        queue_driver_send(engine, action, action->send_target,
+                          to_adapter, adapter_count, to_mstcp, mstcp_count);
+        break;
+
+    case TRAFFIC_ACTION_REWRITE_SEND:
+        if (action->ctx && action->ndis_buf) {
+            apply_packet_rewrite(action->ctx, &action->rewrite);
+            packet_recalculate_checksums(action->ctx);
+            queue_driver_send(engine, action, action->send_target,
+                              to_adapter, adapter_count,
+                              to_mstcp, mstcp_count);
+        }
+        break;
+
+    case TRAFFIC_ACTION_DROP:
+        ndisapi_count_drop(engine);
+        break;
+
+    case TRAFFIC_ACTION_FORWARD_UDP_TO_RELAY:
+        execute_udp_forward(engine, action);
+        break;
+
+    case TRAFFIC_ACTION_FORWARD_DNS_TO_RESOLVER: {
+        error_t err = execute_dns_forward(engine, action);
+        if (err != ERR_OK) {
+            LOG_WARN("DNS hijack: loopback forward failed (%d), dropping", err);
+            ndisapi_count_drop(engine);
+        }
+        break;
+    }
+
+    case TRAFFIC_ACTION_INJECT_DNS_RESPONSE:
+        execute_dns_response_injection(engine, action);
+        break;
+    }
+}
+
 void traffic_execute_actions(ndisapi_engine_t *engine, traffic_action_t *actions,
                              size_t action_count) {
     ndisapi_send_item_t to_adapter[NDISAPI_BATCH_SIZE];
@@ -272,45 +325,32 @@ void traffic_execute_actions(ndisapi_engine_t *engine, traffic_action_t *actions
     if (!engine || !actions || action_count == 0) return;
 
     for (i = 0; i < action_count; i++) {
-        traffic_action_t *action = &actions[i];
+        execute_one_action(engine, &actions[i],
+                           to_adapter, &adapter_count,
+                           to_mstcp, &mstcp_count);
+    }
 
-        switch (action->type) {
-        case TRAFFIC_ACTION_PASS:
-            queue_driver_send(engine, action, action->send_target,
-                              to_adapter, &adapter_count, to_mstcp, &mstcp_count);
-            break;
+    flush_driver_sends(engine, TRAFFIC_SEND_TO_ADAPTER,
+                       to_adapter, &adapter_count);
+    flush_driver_sends(engine, TRAFFIC_SEND_TO_MSTCP,
+                       to_mstcp, &mstcp_count);
+}
 
-        case TRAFFIC_ACTION_REWRITE_SEND:
-            if (action->ctx && action->ndis_buf) {
-                apply_packet_rewrite(action->ctx, &action->rewrite);
-                packet_recalculate_checksums(action->ctx);
-                queue_driver_send(engine, action, action->send_target,
-                                  to_adapter, &adapter_count,
-                                  to_mstcp, &mstcp_count);
-            }
-            break;
+void traffic_execute_action_batch(ndisapi_engine_t *engine,
+                                  traffic_action_t *const *actions,
+                                  size_t action_count) {
+    ndisapi_send_item_t to_adapter[NDISAPI_BATCH_SIZE];
+    ndisapi_send_item_t to_mstcp[NDISAPI_BATCH_SIZE];
+    size_t adapter_count = 0;
+    size_t mstcp_count = 0;
+    size_t i;
 
-        case TRAFFIC_ACTION_DROP:
-            ndisapi_count_drop(engine);
-            break;
+    if (!engine || !actions || action_count == 0) return;
 
-        case TRAFFIC_ACTION_FORWARD_UDP_TO_RELAY:
-            execute_udp_forward(engine, action);
-            break;
-
-        case TRAFFIC_ACTION_FORWARD_DNS_TO_RESOLVER: {
-            error_t err = execute_dns_forward(engine, action);
-            if (err != ERR_OK) {
-                LOG_WARN("DNS hijack: loopback forward failed (%d), dropping", err);
-                ndisapi_count_drop(engine);
-            }
-            break;
-        }
-
-        case TRAFFIC_ACTION_INJECT_DNS_RESPONSE:
-            execute_dns_response_injection(engine, action);
-            break;
-        }
+    for (i = 0; i < action_count; i++) {
+        execute_one_action(engine, actions[i],
+                           to_adapter, &adapter_count,
+                           to_mstcp, &mstcp_count);
     }
 
     flush_driver_sends(engine, TRAFFIC_SEND_TO_ADAPTER,

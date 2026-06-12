@@ -25,12 +25,20 @@ int g_test_dns_forward_error = 0;
 int g_test_conntrack_get_full_key_hit = 0;
 int g_test_conntrack_tcp_proxy_outbound_hit = 0;
 int g_test_conntrack_tcp_proxy_return_hit = 0;
-int g_test_conntrack_tcp_proxy_outbound_touch_count = 0;
-int g_test_conntrack_tcp_proxy_return_touch_count = 0;
+int g_test_conntrack_role_tcp_outbound_count = 0;
+int g_test_conntrack_role_tcp_return_count = 0;
+int g_test_conntrack_role_tcp_dns_return_count = 0;
+int g_test_conntrack_role_refresh_tcp_pair_count = 0;
 int g_test_conntrack_udp_proxy_outbound_hit = 0;
 int g_test_conntrack_udp_proxy_return_hit = 0;
-int g_test_conntrack_udp_proxy_outbound_touch_count = 0;
-int g_test_conntrack_udp_proxy_return_touch_count = 0;
+int g_test_conntrack_role_udp_outbound_count = 0;
+int g_test_conntrack_role_udp_return_count = 0;
+int g_test_proc_lookup_tcp_count = 0;
+int g_test_proc_lookup_tcp_retry_count = 0;
+int g_test_proc_lookup_udp_count = 0;
+int g_test_proc_lookup_udp_retry_count = 0;
+uint32_t g_test_proc_lookup_tcp_pid = 0;
+uint32_t g_test_proc_self_pid = 0;
 int g_test_conntrack_raw_full_key_add_count = 0;
 int g_test_conntrack_direct_tcp_track_count = 0;
 int g_test_conntrack_tcp_proxy_track_count = 0;
@@ -199,13 +207,15 @@ uint16_t ndisapi_next_tcp_relay_src_port(ndisapi_engine_t *engine) {
 uint32_t proc_lookup_tcp(proc_lookup_t *pl, uint32_t src_ip, uint16_t src_port,
                          char *name_out, int name_len) {
     (void)pl; (void)src_ip; (void)src_port;
+    g_test_proc_lookup_tcp_count++;
     if (name_out && name_len > 0) name_out[0] = '\0';
-    return 0;
+    return g_test_proc_lookup_tcp_pid;
 }
 
 uint32_t proc_lookup_udp(proc_lookup_t *pl, uint32_t src_ip, uint16_t src_port,
                          char *name_out, int name_len) {
     (void)pl; (void)src_ip; (void)src_port;
+    g_test_proc_lookup_udp_count++;
     if (name_out && name_len > 0) name_out[0] = '\0';
     return 0;
 }
@@ -213,6 +223,7 @@ uint32_t proc_lookup_udp(proc_lookup_t *pl, uint32_t src_ip, uint16_t src_port,
 uint32_t proc_lookup_tcp_retry(proc_lookup_t *pl, uint32_t src_ip, uint16_t src_port,
                                char *name_out, int name_len) {
     (void)pl; (void)src_ip; (void)src_port;
+    g_test_proc_lookup_tcp_retry_count++;
     if (name_out && name_len > 0) name_out[0] = '\0';
     return 0;
 }
@@ -220,13 +231,14 @@ uint32_t proc_lookup_tcp_retry(proc_lookup_t *pl, uint32_t src_ip, uint16_t src_
 uint32_t proc_lookup_udp_retry(proc_lookup_t *pl, uint32_t src_ip, uint16_t src_port,
                                char *name_out, int name_len) {
     (void)pl; (void)src_ip; (void)src_port;
+    g_test_proc_lookup_udp_retry_count++;
     if (name_out && name_len > 0) name_out[0] = '\0';
     return 0;
 }
 
 int proc_is_self(proc_lookup_t *pl, uint32_t pid) {
-    (void)pl; (void)pid;
-    return 0;
+    (void)pl;
+    return g_test_proc_self_pid != 0 && pid == g_test_proc_self_pid;
 }
 
 int dns_hijack_is_dns_request(uint16_t dst_port) {
@@ -389,7 +401,7 @@ error_t conntrack_track_udp_proxy(conntrack_t *ct,
     if (!flow) return ERR_PARAM;
     g_test_conntrack_udp_proxy_track_count++;
     test_store_conntrack_entry(flow->client_ip, flow->client_port,
-                               0, 0,
+                               flow->server_ip, flow->server_port,
                                flow->client_ip, flow->client_port,
                                flow->server_ip, flow->server_port,
                                flow->server_ip, flow->server_port,
@@ -496,10 +508,19 @@ error_t conntrack_get_tcp_proxy_return(conntrack_t *ct, uint32_t relay_src_ip,
 
 error_t conntrack_get_udp_proxy_outbound(conntrack_t *ct, uint32_t client_ip,
                                          uint16_t client_port,
+                                         uint32_t server_ip,
+                                         uint16_t server_port,
                                          conntrack_entry_t *out) {
     (void)ct;
-    (void)client_ip;
-    (void)client_port;
+    if (g_test_added_conntrack_valid &&
+        g_test_added_conntrack_entry.key_src_ip == client_ip &&
+        g_test_added_conntrack_entry.src_port == client_port &&
+        g_test_added_conntrack_entry.key_dst_ip == server_ip &&
+        g_test_added_conntrack_entry.key_dst_port == server_port &&
+        g_test_added_conntrack_entry.protocol == WTP_IPPROTO_UDP) {
+        if (out) *out = g_test_added_conntrack_entry;
+        return ERR_OK;
+    }
     if (!g_test_conntrack_udp_proxy_outbound_hit) return ERR_NOT_FOUND;
     if (out) *out = g_test_conntrack_entry;
     return ERR_OK;
@@ -555,38 +576,106 @@ void conntrack_touch_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_port,
     (void)ct; (void)src_ip; (void)src_port; (void)dst_ip; (void)dst_port; (void)protocol;
 }
 
-void conntrack_touch_direct_tcp(conntrack_t *ct,
-                                const conntrack_entry_t *entry) {
-    (void)ct;
-    (void)entry;
+static void test_fill_role_snapshot(const conntrack_entry_t *e,
+                                    conntrack_role_snapshot_t *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    out->client_ip = e->src_ip;
+    out->client_port = e->client_port;
+    out->orig_dst_ip = e->orig_dst_ip;
+    out->orig_dst_port = e->orig_dst_port;
+    out->relay_src_port = e->relay_src_port;
 }
 
-void conntrack_touch_tcp_proxy_outbound(conntrack_t *ct,
-                                        const conntrack_entry_t *entry) {
+error_t conntrack_role_tcp_outbound(conntrack_t *ct, uint32_t client_ip,
+                                    uint16_t client_port, uint32_t server_ip,
+                                    uint16_t server_port,
+                                    conntrack_role_snapshot_t *out) {
     (void)ct;
-    (void)entry;
-    g_test_conntrack_tcp_proxy_outbound_touch_count++;
+    g_test_conntrack_role_tcp_outbound_count++;
+    if (g_test_added_conntrack_valid &&
+        g_test_added_conntrack_entry.key_src_ip == client_ip &&
+        g_test_added_conntrack_entry.src_port == client_port &&
+        g_test_added_conntrack_entry.key_dst_ip == server_ip &&
+        g_test_added_conntrack_entry.key_dst_port == server_port &&
+        g_test_added_conntrack_entry.protocol == WTP_IPPROTO_TCP) {
+        test_fill_role_snapshot(&g_test_added_conntrack_entry, out);
+        return ERR_OK;
+    }
+    if (!g_test_conntrack_tcp_proxy_outbound_hit) return ERR_NOT_FOUND;
+    test_fill_role_snapshot(&g_test_conntrack_entry, out);
+    return ERR_OK;
 }
 
-void conntrack_touch_tcp_proxy_return(conntrack_t *ct,
-                                      const conntrack_entry_t *entry) {
-    (void)ct;
-    (void)entry;
-    g_test_conntrack_tcp_proxy_return_touch_count++;
+error_t conntrack_role_tcp_return(conntrack_t *ct, uint32_t relay_src_ip,
+                                  uint16_t relay_src_port,
+                                  uint32_t relay_dst_ip,
+                                  uint16_t relay_dst_port,
+                                  conntrack_role_snapshot_t *out) {
+    (void)ct; (void)relay_src_ip; (void)relay_src_port;
+    (void)relay_dst_ip; (void)relay_dst_port;
+    g_test_conntrack_role_tcp_return_count++;
+    if (!g_test_conntrack_tcp_proxy_return_hit) return ERR_NOT_FOUND;
+    test_fill_role_snapshot(&g_test_conntrack_entry, out);
+    return ERR_OK;
 }
 
-void conntrack_touch_udp_proxy_outbound(conntrack_t *ct,
-                                        const conntrack_entry_t *entry) {
+error_t conntrack_role_udp_outbound(conntrack_t *ct, uint32_t client_ip,
+                                    uint16_t client_port, uint32_t server_ip,
+                                    uint16_t server_port,
+                                    conntrack_role_snapshot_t *out) {
     (void)ct;
-    (void)entry;
-    g_test_conntrack_udp_proxy_outbound_touch_count++;
+    g_test_conntrack_role_udp_outbound_count++;
+    if (g_test_added_conntrack_valid &&
+        g_test_added_conntrack_entry.key_src_ip == client_ip &&
+        g_test_added_conntrack_entry.src_port == client_port &&
+        g_test_added_conntrack_entry.key_dst_ip == server_ip &&
+        g_test_added_conntrack_entry.key_dst_port == server_port &&
+        g_test_added_conntrack_entry.protocol == WTP_IPPROTO_UDP) {
+        test_fill_role_snapshot(&g_test_added_conntrack_entry, out);
+        return ERR_OK;
+    }
+    if (!g_test_conntrack_udp_proxy_outbound_hit) return ERR_NOT_FOUND;
+    test_fill_role_snapshot(&g_test_conntrack_entry, out);
+    return ERR_OK;
 }
 
-void conntrack_touch_udp_proxy_return(conntrack_t *ct,
-                                      const conntrack_entry_t *entry) {
+error_t conntrack_role_udp_return(conntrack_t *ct, uint32_t server_ip,
+                                  uint16_t client_port,
+                                  conntrack_role_snapshot_t *out) {
+    (void)ct; (void)server_ip; (void)client_port;
+    g_test_conntrack_role_udp_return_count++;
+    if (!g_test_conntrack_udp_proxy_return_hit) return ERR_NOT_FOUND;
+    test_fill_role_snapshot(&g_test_conntrack_entry, out);
+    return ERR_OK;
+}
+
+error_t conntrack_role_tcp_dns_return(conntrack_t *ct, uint32_t response_src_ip,
+                                      uint16_t response_src_port,
+                                      uint32_t response_dst_ip,
+                                      uint16_t response_dst_port,
+                                      conntrack_role_snapshot_t *out) {
+    (void)ct;
+    g_test_conntrack_role_tcp_dns_return_count++;
+    if (g_test_added_conntrack_valid &&
+        g_test_added_conntrack_entry.key_src_ip == response_dst_ip &&
+        g_test_added_conntrack_entry.src_port == response_dst_port &&
+        g_test_added_conntrack_entry.key_dst_ip == response_src_ip &&
+        g_test_added_conntrack_entry.key_dst_port == response_src_port &&
+        g_test_added_conntrack_entry.protocol == WTP_IPPROTO_TCP) {
+        test_fill_role_snapshot(&g_test_added_conntrack_entry, out);
+        return ERR_OK;
+    }
+    if (!g_test_conntrack_get_full_key_hit) return ERR_NOT_FOUND;
+    test_fill_role_snapshot(&g_test_conntrack_entry, out);
+    return ERR_OK;
+}
+
+void conntrack_role_refresh_tcp_pair(conntrack_t *ct,
+                                     const conntrack_entry_t *entry) {
     (void)ct;
     (void)entry;
-    g_test_conntrack_udp_proxy_return_touch_count++;
+    g_test_conntrack_role_refresh_tcp_pair_count++;
 }
 
 void conntrack_touch(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol) {

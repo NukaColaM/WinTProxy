@@ -78,6 +78,8 @@ struct ndisapi_packet_pool_s {
     ndisapi_packet_block_t *free_list;
     DWORD capacity;
     DWORD free_count;
+    /* Signaled when blocks return to an empty pool; acquirers wait on it. */
+    HANDLE free_event;
 };
 
 struct ndisapi_flow_worker_s {
@@ -85,6 +87,8 @@ struct ndisapi_flow_worker_s {
     DWORD worker_index;
     HANDLE thread;
     HANDLE work_event;
+    /* Signaled when a full queue frees space; dispatchers wait on it. */
+    HANDLE space_event;
     SRWLOCK lock;
     ndisapi_packet_block_t *queue[NDISAPI_FLOW_QUEUE_DEPTH];
     DWORD head;
@@ -102,6 +106,9 @@ struct ndisapi_sender_s {
     DWORD head;
     DWORD tail;
     DWORD count;
+    /* Flush storage reused across sends; no allocation per flush. */
+    PETH_M_REQUEST send_request;
+    unsigned char *group_scratch;
 };
 
 typedef struct {
@@ -170,6 +177,8 @@ void     ndisapi_count_drop(ndisapi_engine_t *engine);
 void     ndisapi_count_udp_forwarded(ndisapi_engine_t *engine);
 
 /* === Packet block pool === */
+DWORD    ndisapi_packet_pool_capacity_for(DWORD adapter_count,
+                                          DWORD flow_worker_count);
 int      ndisapi_packet_pool_init(ndisapi_packet_pool_t *pool, DWORD capacity);
 void     ndisapi_packet_pool_destroy(ndisapi_packet_pool_t *pool);
 ndisapi_packet_block_t *ndisapi_packet_block_acquire(ndisapi_packet_pool_t *pool,
@@ -190,6 +199,10 @@ DWORD    ndisapi_packet_worker_index(ndisapi_engine_t *engine,
 int      ndisapi_flow_worker_enqueue(ndisapi_engine_t *engine,
                                      ndisapi_packet_block_t *block,
                                      DWORD wait_ms);
+DWORD    ndisapi_flow_worker_dispatch_batch(ndisapi_engine_t *engine,
+                                            ndisapi_packet_block_t **blocks,
+                                            DWORD count,
+                                            DWORD wait_ms);
 
 /* === Dedicated sender dispatch === */
 int      ndisapi_enqueue_send_batch_to_mstcp(ndisapi_engine_t *engine,

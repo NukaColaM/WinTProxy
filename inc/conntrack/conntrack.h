@@ -162,6 +162,8 @@ error_t conntrack_get_tcp_proxy_return(conntrack_t *ct, uint32_t relay_src_ip,
                                        conntrack_entry_t *out);
 error_t conntrack_get_udp_proxy_outbound(conntrack_t *ct, uint32_t client_ip,
                                          uint16_t client_port,
+                                         uint32_t server_ip,
+                                         uint16_t server_port,
                                          conntrack_entry_t *out);
 error_t conntrack_get_udp_proxy_return(conntrack_t *ct, uint32_t server_ip,
                                        uint16_t client_port,
@@ -177,16 +179,49 @@ void    conntrack_remove_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_port
 void    conntrack_touch(conntrack_t *ct, uint32_t src_ip, uint16_t src_port, uint8_t protocol);
 void    conntrack_touch_key(conntrack_t *ct, uint32_t src_ip, uint16_t src_port,
                             uint32_t dst_ip, uint16_t dst_port, uint8_t protocol);
-void    conntrack_touch_direct_tcp(conntrack_t *ct,
-                                   const conntrack_entry_t *entry);
-void    conntrack_touch_tcp_proxy_outbound(conntrack_t *ct,
-                                           const conntrack_entry_t *entry);
-void    conntrack_touch_tcp_proxy_return(conntrack_t *ct,
-                                         const conntrack_entry_t *entry);
-void    conntrack_touch_udp_proxy_outbound(conntrack_t *ct,
-                                           const conntrack_entry_t *entry);
-void    conntrack_touch_udp_proxy_return(conntrack_t *ct,
-                                         const conntrack_entry_t *entry);
+/*
+ * Narrow role snapshot for per-packet paths. Deliberately excludes
+ * process_name and raw key fields: planners consume restored-tuple facts,
+ * not entry encoding.
+ */
+typedef struct {
+    uint32_t client_ip;
+    uint32_t orig_dst_ip;
+    uint16_t client_port;
+    uint16_t orig_dst_port;
+    uint16_t relay_src_port;   /* 0 = tracked direct (no relay leg) */
+} conntrack_role_snapshot_t;
+
+/*
+ * Fused role operations: one lookup pass returns the role snapshot and
+ * refreshes entry liveness. Pair liveness is owned here - a role op on one
+ * side of a tracked pair keeps the entries the role depends on alive.
+ * Refreshes are atomic timestamp writes under shared bucket locks.
+ */
+error_t conntrack_role_tcp_outbound(conntrack_t *ct, uint32_t client_ip,
+                                    uint16_t client_port, uint32_t server_ip,
+                                    uint16_t server_port,
+                                    conntrack_role_snapshot_t *out);
+error_t conntrack_role_tcp_return(conntrack_t *ct, uint32_t relay_src_ip,
+                                  uint16_t relay_src_port,
+                                  uint32_t relay_dst_ip,
+                                  uint16_t relay_dst_port,
+                                  conntrack_role_snapshot_t *out);
+error_t conntrack_role_udp_outbound(conntrack_t *ct, uint32_t client_ip,
+                                    uint16_t client_port, uint32_t server_ip,
+                                    uint16_t server_port,
+                                    conntrack_role_snapshot_t *out);
+error_t conntrack_role_udp_return(conntrack_t *ct, uint32_t server_ip,
+                                  uint16_t client_port,
+                                  conntrack_role_snapshot_t *out);
+error_t conntrack_role_tcp_dns_return(conntrack_t *ct, uint32_t response_src_ip,
+                                      uint16_t response_src_port,
+                                      uint32_t response_dst_ip,
+                                      uint16_t response_dst_port,
+                                      conntrack_role_snapshot_t *out);
+void    conntrack_role_refresh_tcp_pair(conntrack_t *ct,
+                                        const conntrack_entry_t *entry);
+
 void    conntrack_snapshot_counters(conntrack_t *ct, conntrack_counters_t *out);
 
 #ifdef __cplusplus

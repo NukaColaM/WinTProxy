@@ -64,6 +64,20 @@ static void ndisapi_counter_add(volatile LONG64 *counter, LONG64 value) {
 /*  Packet block pool                                                 */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Pool capacity covers the maximum simultaneous downstream occupancy: blocks
+ * in flight inside readers plus every flow-worker and sender queue slot, so
+ * pool exhaustion means systemic overload rather than a single stalled stage.
+ */
+DWORD ndisapi_packet_pool_capacity_for(DWORD adapter_count,
+                                       DWORD flow_worker_count) {
+    DWORD reader_in_flight = adapter_count * (DWORD)NDISAPI_BATCH_SIZE * 2U;
+
+    return reader_in_flight +
+           flow_worker_count * (DWORD)NDISAPI_FLOW_QUEUE_DEPTH +
+           (DWORD)NDISAPI_SENDER_COUNT * (DWORD)NDISAPI_SENDER_QUEUE_DEPTH;
+}
+
 int ndisapi_packet_pool_init(ndisapi_packet_pool_t *pool, DWORD capacity) {
     DWORD i;
 
@@ -71,9 +85,15 @@ int ndisapi_packet_pool_init(ndisapi_packet_pool_t *pool, DWORD capacity) {
 
     memset(pool, 0, sizeof(*pool));
     InitializeSRWLock(&pool->lock);
+    pool->free_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!pool->free_event) return 0;
     pool->blocks = (ndisapi_packet_block_t *)
         calloc((size_t)capacity, sizeof(pool->blocks[0]));
-    if (!pool->blocks) return 0;
+    if (!pool->blocks) {
+        CloseHandle(pool->free_event);
+        pool->free_event = NULL;
+        return 0;
+    }
 
     pool->capacity = capacity;
     pool->free_count = capacity;
@@ -89,10 +109,17 @@ int ndisapi_packet_pool_init(ndisapi_packet_pool_t *pool, DWORD capacity) {
 
 void ndisapi_packet_pool_destroy(ndisapi_packet_pool_t *pool) {
     if (!pool) return;
+    if (pool->free_event) CloseHandle(pool->free_event);
     free(pool->blocks);
     memset(pool, 0, sizeof(*pool));
 }
 
+/*
+ * Acquire sets ownership and identity only. Frame, context, and action
+ * storage is intentionally left as-is: ReadPackets fills the buffer,
+ * packet_parse clears the context, and action constructors clear the action,
+ * so each is written exactly once per pool cycle at the point of use.
+ */
 ndisapi_packet_block_t *ndisapi_packet_block_acquire(ndisapi_packet_pool_t *pool,
                                                      HANDLE adapter_handle,
                                                      DWORD adapter_index) {
@@ -112,9 +139,6 @@ ndisapi_packet_block_t *ndisapi_packet_block_acquire(ndisapi_packet_pool_t *pool
 
     if (!block) return NULL;
 
-    memset(&block->buffer, 0, sizeof(block->buffer));
-    memset(&block->context, 0, sizeof(block->context));
-    memset(&block->action, 0, sizeof(block->action));
     block->adapter_handle = adapter_handle;
     block->adapter_index = adapter_index;
     block->direction = 0;
@@ -127,19 +151,24 @@ ndisapi_packet_block_t *ndisapi_packet_block_acquire_or_flush(ndisapi_engine_t *
                                                              HANDLE adapter_handle,
                                                              DWORD adapter_index,
                                                              DWORD wait_ms) {
-    DWORD waited = 0;
     ndisapi_packet_block_t *block;
 
     if (!engine) return NULL;
 
-    for (;;) {
+    block = ndisapi_packet_block_acquire(&engine->packet_pool,
+                                         adapter_handle, adapter_index);
+    if (!block && wait_ms > 0 && engine->packet_pool.free_event) {
+        /* Arm the free event, re-check to avoid a lost wake, then wait. */
+        ResetEvent(engine->packet_pool.free_event);
         block = ndisapi_packet_block_acquire(&engine->packet_pool,
                                              adapter_handle, adapter_index);
-        if (block) return block;
-        if (waited >= wait_ms) break;
-        Sleep(1);
-        waited++;
+        if (!block) {
+            WaitForSingleObject(engine->packet_pool.free_event, wait_ms);
+            block = ndisapi_packet_block_acquire(&engine->packet_pool,
+                                                 adapter_handle, adapter_index);
+        }
     }
+    if (block) return block;
 
     ndisapi_counter_inc(&engine->counters.pool_exhausted);
     ndisapi_counter_inc(&engine->counters.adapter_queue_flushes);
@@ -180,18 +209,19 @@ void ndisapi_packet_block_release(ndisapi_packet_block_t *block) {
     pool = block->pool;
     if (!pool) return;
 
-    memset(&block->buffer, 0, sizeof(block->buffer));
-    memset(&block->context, 0, sizeof(block->context));
-    memset(&block->action, 0, sizeof(block->action));
-    block->adapter_handle = NULL;
-    block->adapter_index = 0;
-    block->direction = 0;
-
     AcquireSRWLockExclusive(&pool->lock);
-    block->next = pool->free_list;
-    pool->free_list = block;
-    pool->free_count++;
-    ReleaseSRWLockExclusive(&pool->lock);
+    {
+        int was_empty = (pool->free_count == 0);
+
+        block->next = pool->free_list;
+        pool->free_list = block;
+        pool->free_count++;
+        ReleaseSRWLockExclusive(&pool->lock);
+
+        if (was_empty && pool->free_event) {
+            SetEvent(pool->free_event);
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -298,88 +328,177 @@ DWORD ndisapi_packet_worker_index(ndisapi_engine_t *engine,
     return (DWORD)(ndisapi_packet_flow_hash(buf) % count);
 }
 
-static int ndisapi_flow_worker_try_enqueue(ndisapi_flow_worker_t *worker,
-                                           ndisapi_packet_block_t *block) {
-    int queued = 0;
+/*
+ * Enqueue up to `count` blocks into one worker under a single lock pass and
+ * wake the worker once when anything landed. Returns the number enqueued.
+ */
+static DWORD ndisapi_flow_worker_enqueue_group(ndisapi_flow_worker_t *worker,
+                                               ndisapi_packet_block_t **blocks,
+                                               DWORD count) {
+    DWORD enqueued = 0;
 
-    if (!worker || !block) return 0;
+    if (!worker || !blocks || count == 0) return 0;
 
     AcquireSRWLockExclusive(&worker->lock);
-    if (worker->count < NDISAPI_FLOW_QUEUE_DEPTH) {
-        worker->queue[worker->tail] = block;
+    while (enqueued < count && worker->count < NDISAPI_FLOW_QUEUE_DEPTH) {
+        worker->queue[worker->tail] = blocks[enqueued];
         worker->tail = (worker->tail + 1U) % NDISAPI_FLOW_QUEUE_DEPTH;
         worker->count++;
-        queued = 1;
+        enqueued++;
     }
     ReleaseSRWLockExclusive(&worker->lock);
 
-    if (queued && worker->work_event) {
+    if (enqueued > 0 && worker->work_event) {
         SetEvent(worker->work_event);
     }
-    return queued;
+    return enqueued;
 }
 
-static ndisapi_packet_block_t *ndisapi_flow_worker_dequeue(ndisapi_flow_worker_t *worker) {
-    ndisapi_packet_block_t *block = NULL;
+/*
+ * Route a read batch to its flow workers: blocks are grouped by worker so
+ * each worker pays one queue lock and one wake per read batch. Overflow on a
+ * full queue keeps the bounded-wait-then-drop overload semantics per block.
+ */
+DWORD ndisapi_flow_worker_dispatch_batch(ndisapi_engine_t *engine,
+                                         ndisapi_packet_block_t **blocks,
+                                         DWORD count,
+                                         DWORD wait_ms) {
+    ndisapi_packet_block_t *group[NDISAPI_BATCH_SIZE];
+    DWORD indexes[NDISAPI_BATCH_SIZE];
+    DWORD dispatched = 0;
+    DWORD offset = 0;
 
-    if (!worker) return NULL;
+    if (!blocks || count == 0) return 0;
+
+    if (!engine || engine->flow_worker_count == 0) {
+        for (DWORD i = 0; i < count; i++) {
+            ndisapi_packet_block_release(blocks[i]);
+        }
+        return 0;
+    }
+
+    while (offset < count) {
+        ndisapi_packet_block_t **chunk_blocks = blocks + offset;
+        DWORD chunk = count - offset;
+        DWORD i, w;
+
+        if (chunk > NDISAPI_BATCH_SIZE) chunk = NDISAPI_BATCH_SIZE;
+
+        for (i = 0; i < chunk; i++) {
+            ndisapi_packet_block_t *block = chunk_blocks[i];
+            block->direction = block->buffer.m_dwDeviceFlags;
+            indexes[i] = ndisapi_packet_worker_index(engine, &block->buffer);
+        }
+
+        for (w = 0; w < engine->flow_worker_count; w++) {
+            ndisapi_flow_worker_t *worker = &engine->flow_workers[w];
+            DWORD group_count = 0;
+            DWORD enqueued;
+
+            for (i = 0; i < chunk; i++) {
+                if (indexes[i] == w) {
+                    group[group_count++] = chunk_blocks[i];
+                }
+            }
+            if (group_count == 0) continue;
+
+            enqueued = ndisapi_flow_worker_enqueue_group(worker, group,
+                                                         group_count);
+            if (enqueued < group_count && wait_ms > 0 && worker->space_event) {
+                /* Arm the space event, re-check, then wait once bounded. */
+                ResetEvent(worker->space_event);
+                enqueued += ndisapi_flow_worker_enqueue_group(
+                    worker, group + enqueued, group_count - enqueued);
+                if (enqueued < group_count) {
+                    WaitForSingleObject(worker->space_event, wait_ms);
+                    enqueued += ndisapi_flow_worker_enqueue_group(
+                        worker, group + enqueued, group_count - enqueued);
+                }
+            }
+            dispatched += enqueued;
+
+            if (enqueued < group_count) {
+                DWORD dropped = group_count - enqueued;
+
+                LOG_WARN("NDISAPI flow worker queue full worker=%lu adapter=%p "
+                         "dropped=%lu",
+                         (unsigned long)w,
+                         group[enqueued]->adapter_handle,
+                         (unsigned long)dropped);
+                for (i = enqueued; i < group_count; i++) {
+                    ndisapi_counter_inc(&engine->counters.enqueue_timeouts);
+                    ndisapi_count_overload_drop(engine);
+                    ndisapi_packet_block_release(group[i]);
+                }
+            }
+        }
+
+        offset += chunk;
+    }
+
+    return dispatched;
+}
+
+int ndisapi_flow_worker_enqueue(ndisapi_engine_t *engine,
+                                ndisapi_packet_block_t *block,
+                                DWORD wait_ms) {
+    if (!block) return 0;
+    return ndisapi_flow_worker_dispatch_batch(engine, &block, 1, wait_ms) == 1;
+}
+
+static DWORD ndisapi_flow_worker_dequeue_many(ndisapi_flow_worker_t *worker,
+                                              ndisapi_packet_block_t **blocks,
+                                              DWORD max_count) {
+    DWORD count = 0;
+    int was_full;
+
+    if (!worker || !blocks || max_count == 0) return 0;
 
     AcquireSRWLockExclusive(&worker->lock);
-    if (worker->count > 0) {
-        block = worker->queue[worker->head];
+    was_full = (worker->count == NDISAPI_FLOW_QUEUE_DEPTH);
+    while (worker->count > 0 && count < max_count) {
+        blocks[count++] = worker->queue[worker->head];
         worker->queue[worker->head] = NULL;
         worker->head = (worker->head + 1U) % NDISAPI_FLOW_QUEUE_DEPTH;
         worker->count--;
     }
     ReleaseSRWLockExclusive(&worker->lock);
 
-    return block;
-}
-
-int ndisapi_flow_worker_enqueue(ndisapi_engine_t *engine,
-                                ndisapi_packet_block_t *block,
-                                DWORD wait_ms) {
-    DWORD waited = 0;
-    DWORD index;
-    ndisapi_flow_worker_t *worker;
-
-    if (!engine || !block || engine->flow_worker_count == 0) {
-        ndisapi_packet_block_release(block);
-        return 0;
+    if (was_full && count > 0 && worker->space_event) {
+        SetEvent(worker->space_event);
     }
 
-    block->direction = block->buffer.m_dwDeviceFlags;
-    index = ndisapi_packet_worker_index(engine, &block->buffer);
-    worker = &engine->flow_workers[index];
-
-    for (;;) {
-        if (ndisapi_flow_worker_try_enqueue(worker, block)) {
-            return 1;
-        }
-        if (waited >= wait_ms) break;
-        Sleep(1);
-        waited++;
-    }
-
-    ndisapi_counter_inc(&engine->counters.enqueue_timeouts);
-    ndisapi_count_overload_drop(engine);
-    LOG_WARN("NDISAPI flow worker queue full worker=%lu adapter=%p",
-             (unsigned long)index, block->adapter_handle);
-    ndisapi_packet_block_release(block);
-    return 0;
+    return count;
 }
 
-static void ndisapi_process_packet_block(ndisapi_flow_worker_t *worker,
-                                         ndisapi_packet_block_t *block) {
+/*
+ * Drained-batch processing: plan every block, execute the whole set through
+ * one executor call so driver-send handoff amortizes per drain, then release.
+ */
+static void ndisapi_process_packet_blocks(ndisapi_flow_worker_t *worker,
+                                          ndisapi_packet_block_t **blocks,
+                                          DWORD count) {
     ndisapi_engine_t *engine = worker ? worker->engine : NULL;
-    PINTERMEDIATE_BUFFER buf = block ? &block->buffer : NULL;
+    traffic_action_t *actions[NDISAPI_BATCH_SIZE];
+    DWORD action_count = 0;
+    DWORD i;
 
-    if (!engine || !block || !buf) {
-        ndisapi_packet_block_release(block);
+    if (!blocks || count == 0) return;
+    if (count > NDISAPI_BATCH_SIZE) count = NDISAPI_BATCH_SIZE;
+
+    if (!engine) {
+        for (i = 0; i < count; i++) {
+            ndisapi_packet_block_release(blocks[i]);
+        }
         return;
     }
 
-    if (buf->m_Length >= ETHER_HDR_LEN) {
+    for (i = 0; i < count; i++) {
+        ndisapi_packet_block_t *block = blocks[i];
+        PINTERMEDIATE_BUFFER buf = block ? &block->buffer : NULL;
+
+        if (!buf || buf->m_Length < ETHER_HDR_LEN) continue;
+
         if (!buf->m_hAdapter) {
             buf->m_hAdapter = block->adapter_handle;
         }
@@ -396,23 +515,31 @@ static void ndisapi_process_packet_block(ndisapi_flow_worker_t *worker,
                                     buf, "unparseable");
         }
         block->action.owner_block = block;
-
-        traffic_execute_action(engine, &block->action);
+        actions[action_count++] = &block->action;
     }
 
-    ndisapi_packet_block_release(block);
+    if (action_count > 0) {
+        traffic_execute_action_batch(engine, actions, action_count);
+    }
+
+    for (i = 0; i < count; i++) {
+        ndisapi_packet_block_release(blocks[i]);
+    }
 }
 
 static DWORD WINAPI ndisapi_flow_worker_proc(LPVOID param) {
     ndisapi_flow_worker_t *worker = (ndisapi_flow_worker_t *)param;
     ndisapi_engine_t *engine = worker ? worker->engine : NULL;
+    ndisapi_packet_block_t *blocks[NDISAPI_BATCH_SIZE];
+    DWORD count;
 
     if (!worker || !engine) return 0;
 
     for (;;) {
-        ndisapi_packet_block_t *block = ndisapi_flow_worker_dequeue(worker);
-        if (block) {
-            ndisapi_process_packet_block(worker, block);
+        count = ndisapi_flow_worker_dequeue_many(worker, blocks,
+                                                 NDISAPI_BATCH_SIZE);
+        if (count > 0) {
+            ndisapi_process_packet_blocks(worker, blocks, count);
             continue;
         }
 
@@ -423,9 +550,10 @@ static DWORD WINAPI ndisapi_flow_worker_proc(LPVOID param) {
     }
 
     for (;;) {
-        ndisapi_packet_block_t *block = ndisapi_flow_worker_dequeue(worker);
-        if (!block) break;
-        ndisapi_process_packet_block(worker, block);
+        count = ndisapi_flow_worker_dequeue_many(worker, blocks,
+                                                 NDISAPI_BATCH_SIZE);
+        if (count == 0) break;
+        ndisapi_process_packet_blocks(worker, blocks, count);
     }
 
     return 0;
@@ -434,8 +562,10 @@ static DWORD WINAPI ndisapi_flow_worker_proc(LPVOID param) {
 static error_t ndisapi_start_flow_workers(ndisapi_engine_t *engine) {
     DWORD i;
 
-    engine->flow_worker_count =
-        ndisapi_flow_worker_count_for_cpu(ndisapi_detect_cpu_count());
+    if (engine->flow_worker_count == 0) {
+        engine->flow_worker_count =
+            ndisapi_flow_worker_count_for_cpu(ndisapi_detect_cpu_count());
+    }
 
     for (i = 0; i < engine->flow_worker_count; i++) {
         ndisapi_flow_worker_t *worker = &engine->flow_workers[i];
@@ -444,7 +574,8 @@ static error_t ndisapi_start_flow_workers(ndisapi_engine_t *engine) {
         worker->worker_index = i;
         InitializeSRWLock(&worker->lock);
         worker->work_event = CreateEvent(NULL, TRUE, FALSE, NULL);
-        if (!worker->work_event) {
+        worker->space_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+        if (!worker->work_event || !worker->space_event) {
             LOG_ERROR("CreateEvent for flow worker %lu failed: %lu",
                       (unsigned long)i, GetLastError());
             return ERR_GENERIC;
@@ -474,10 +605,17 @@ static void ndisapi_wake_flow_workers(ndisapi_engine_t *engine) {
 }
 
 static void ndisapi_drain_flow_worker(ndisapi_flow_worker_t *worker) {
+    ndisapi_packet_block_t *blocks[NDISAPI_BATCH_SIZE];
+    DWORD count;
+    DWORD i;
+
     for (;;) {
-        ndisapi_packet_block_t *block = ndisapi_flow_worker_dequeue(worker);
-        if (!block) break;
-        ndisapi_packet_block_release(block);
+        count = ndisapi_flow_worker_dequeue_many(worker, blocks,
+                                                 NDISAPI_BATCH_SIZE);
+        if (count == 0) break;
+        for (i = 0; i < count; i++) {
+            ndisapi_packet_block_release(blocks[i]);
+        }
     }
 }
 
@@ -499,10 +637,21 @@ static void ndisapi_stop_flow_workers(ndisapi_engine_t *engine) {
             CloseHandle(worker->work_event);
             worker->work_event = NULL;
         }
+        if (worker->space_event) {
+            CloseHandle(worker->space_event);
+            worker->space_event = NULL;
+        }
     }
 }
 
 static const char *ndisapi_send_target_name(int to_adapter);
+static int ndisapi_send_batch_grouped_with(ndisapi_engine_t *engine,
+                                           PINTERMEDIATE_BUFFER *bufs,
+                                           DWORD count,
+                                           int to_adapter,
+                                           PETH_M_REQUEST request,
+                                           unsigned char *used);
+static size_t ndisapi_m_request_size(DWORD packet_count);
 
 /* ------------------------------------------------------------------ */
 /*  Dedicated sender threads                                          */
@@ -530,57 +679,69 @@ static void ndisapi_release_queued_send_item(ndisapi_send_item_t *item) {
     memset(item, 0, sizeof(*item));
 }
 
-static int ndisapi_sender_try_enqueue(ndisapi_sender_t *sender,
-                                      const ndisapi_send_item_t *item) {
-    int queued = 0;
-
-    if (!sender || !item || !item->buf) return 0;
-
-    AcquireSRWLockExclusive(&sender->lock);
-    if (sender->count < NDISAPI_SENDER_QUEUE_DEPTH) {
-        sender->queue[sender->tail] = *item;
-        sender->tail = (sender->tail + 1U) % NDISAPI_SENDER_QUEUE_DEPTH;
-        sender->count++;
-        queued = 1;
-    }
-    ReleaseSRWLockExclusive(&sender->lock);
-
-    if (queued && sender->work_event) {
-        SetEvent(sender->work_event);
-    }
-    return queued;
-}
-
+/*
+ * Batch handoff to a sender: one lock pass enqueues the whole chunk and one
+ * wake signals the sender, so executor flushes do not pay per-packet
+ * synchronization. Overflowing items are dropped with counters after the
+ * lock is released.
+ */
 static int ndisapi_enqueue_send_batch(ndisapi_engine_t *engine,
                                       ndisapi_send_item_t *items,
                                       DWORD count,
                                       ndisapi_send_target_t target) {
     ndisapi_sender_t *sender = ndisapi_sender_for_target(engine, target);
+    ndisapi_send_item_t overflow[NDISAPI_BATCH_SIZE];
+    DWORD queued_total = 0;
+    DWORD offset = 0;
     int all_ok = 1;
-    DWORD i;
 
     if (!engine || !items || count == 0) return 1;
 
-    for (i = 0; i < count; i++) {
-        ndisapi_send_item_t queued = items[i];
+    while (offset < count) {
+        DWORD chunk = count - offset;
+        DWORD overflow_count = 0;
+        DWORD i;
 
-        if (!queued.buf && queued.block) {
-            queued.buf = &queued.block->buffer;
+        if (chunk > NDISAPI_BATCH_SIZE) chunk = NDISAPI_BATCH_SIZE;
+
+        if (sender) AcquireSRWLockExclusive(&sender->lock);
+        for (i = 0; i < chunk; i++) {
+            ndisapi_send_item_t queued = items[offset + i];
+
+            if (!queued.buf && queued.block) {
+                queued.buf = &queued.block->buffer;
+            }
+            if (!queued.buf) continue;
+
+            if (queued.block) {
+                ndisapi_packet_block_retain(queued.block);
+            }
+
+            if (sender && sender->count < NDISAPI_SENDER_QUEUE_DEPTH) {
+                sender->queue[sender->tail] = queued;
+                sender->tail = (sender->tail + 1U) % NDISAPI_SENDER_QUEUE_DEPTH;
+                sender->count++;
+                queued_total++;
+            } else {
+                overflow[overflow_count++] = queued;
+            }
         }
-        if (!queued.buf) continue;
+        if (sender) ReleaseSRWLockExclusive(&sender->lock);
 
-        if (queued.block) {
-            ndisapi_packet_block_retain(queued.block);
-        }
-
-        if (!sender || !ndisapi_sender_try_enqueue(sender, &queued)) {
+        for (i = 0; i < overflow_count; i++) {
             ndisapi_counter_inc(&engine->counters.send_failures);
             LOG_WARN("NDISAPI sender queue full target=%s adapter=%p",
                      ndisapi_send_target_name(ndisapi_sender_target_is_adapter(target)),
-                     queued.buf->m_hAdapter);
-            ndisapi_release_queued_send_item(&queued);
+                     overflow[i].buf ? overflow[i].buf->m_hAdapter : NULL);
+            ndisapi_release_queued_send_item(&overflow[i]);
             all_ok = 0;
         }
+
+        offset += chunk;
+    }
+
+    if (queued_total > 0 && sender && sender->work_event) {
+        SetEvent(sender->work_event);
     }
 
     return all_ok;
@@ -625,6 +786,7 @@ static void ndisapi_sender_send_items(ndisapi_sender_t *sender,
                                       ndisapi_send_item_t *items,
                                       DWORD count) {
     PINTERMEDIATE_BUFFER bufs[NDISAPI_BATCH_SIZE];
+    int to_adapter;
     DWORD i;
 
     if (!sender || !items || count == 0) return;
@@ -633,7 +795,13 @@ static void ndisapi_sender_send_items(ndisapi_sender_t *sender,
         bufs[i] = items[i].buf;
     }
 
-    if (ndisapi_sender_target_is_adapter(sender->target)) {
+    to_adapter = ndisapi_sender_target_is_adapter(sender->target);
+    if (sender->send_request && sender->group_scratch) {
+        ndisapi_send_batch_grouped_with(sender->engine, bufs, count,
+                                        to_adapter,
+                                        sender->send_request,
+                                        sender->group_scratch);
+    } else if (to_adapter) {
         ndisapi_send_batch_to_adapter(sender->engine, bufs, count);
     } else {
         ndisapi_send_batch_to_mstcp(sender->engine, bufs, count);
@@ -683,6 +851,16 @@ static error_t ndisapi_start_senders(ndisapi_engine_t *engine) {
         sender->engine = engine;
         sender->target = (ndisapi_send_target_t)i;
         InitializeSRWLock(&sender->lock);
+        sender->send_request =
+            (PETH_M_REQUEST)calloc(1, ndisapi_m_request_size(NDISAPI_BATCH_SIZE));
+        sender->group_scratch =
+            (unsigned char *)calloc(NDISAPI_BATCH_SIZE,
+                                    sizeof(*sender->group_scratch));
+        if (!sender->send_request || !sender->group_scratch) {
+            LOG_ERROR("Failed to allocate sender %lu flush storage",
+                      (unsigned long)i);
+            return ERR_MEMORY;
+        }
         sender->work_event = CreateEvent(NULL, TRUE, FALSE, NULL);
         if (!sender->work_event) {
             LOG_ERROR("CreateEvent for sender %lu failed: %lu",
@@ -744,6 +922,10 @@ static void ndisapi_stop_senders(ndisapi_engine_t *engine) {
             CloseHandle(sender->work_event);
             sender->work_event = NULL;
         }
+        free(sender->send_request);
+        sender->send_request = NULL;
+        free(sender->group_scratch);
+        sender->group_scratch = NULL;
     }
 }
 
@@ -797,27 +979,19 @@ static int ndisapi_send_request(ndisapi_engine_t *engine,
     return 0;
 }
 
-static int ndisapi_send_batch_grouped(ndisapi_engine_t *engine,
-                                      PINTERMEDIATE_BUFFER *bufs,
-                                      DWORD count,
-                                      int to_adapter) {
-    PETH_M_REQUEST request;
-    unsigned char *used;
+static int ndisapi_send_batch_grouped_with(ndisapi_engine_t *engine,
+                                           PINTERMEDIATE_BUFFER *bufs,
+                                           DWORD count,
+                                           int to_adapter,
+                                           PETH_M_REQUEST request,
+                                           unsigned char *used) {
     int all_ok = 1;
     DWORD i;
 
     if (!engine || !bufs || count == 0) return 1;
+    if (!request || !used) return 0;
 
-    request = (PETH_M_REQUEST)calloc(1, ndisapi_m_request_size(count));
-    used = (unsigned char *)calloc((size_t)count, sizeof(*used));
-    if (!request || !used) {
-        free(request);
-        free(used);
-        ndisapi_counter_add(&engine->counters.send_failures, (LONG64)count);
-        LOG_WARN("NDISAPI send allocation failed target=%s packets=%lu",
-                 ndisapi_send_target_name(to_adapter), (unsigned long)count);
-        return 0;
-    }
+    memset(used, 0, (size_t)count);
 
     for (i = 0; i < count; i++) {
         HANDLE adapter;
@@ -860,6 +1034,33 @@ static int ndisapi_send_batch_grouped(ndisapi_engine_t *engine,
             all_ok = 0;
         }
     }
+
+    return all_ok;
+}
+
+static int ndisapi_send_batch_grouped(ndisapi_engine_t *engine,
+                                      PINTERMEDIATE_BUFFER *bufs,
+                                      DWORD count,
+                                      int to_adapter) {
+    PETH_M_REQUEST request;
+    unsigned char *used;
+    int all_ok;
+
+    if (!engine || !bufs || count == 0) return 1;
+
+    request = (PETH_M_REQUEST)calloc(1, ndisapi_m_request_size(count));
+    used = (unsigned char *)calloc((size_t)count, sizeof(*used));
+    if (!request || !used) {
+        free(request);
+        free(used);
+        ndisapi_counter_add(&engine->counters.send_failures, (LONG64)count);
+        LOG_WARN("NDISAPI send allocation failed target=%s packets=%lu",
+                 ndisapi_send_target_name(to_adapter), (unsigned long)count);
+        return 0;
+    }
+
+    all_ok = ndisapi_send_batch_grouped_with(engine, bufs, count, to_adapter,
+                                             request, used);
 
     free(used);
     free(request);
@@ -1051,19 +1252,27 @@ static void ndisapi_stop_adapter_monitor(ndisapi_engine_t *engine) {
 static int ndisapi_alloc_packet_pool(ndisapi_engine_t *engine) {
     DWORD pool_capacity;
 
-    if (!engine || engine->adapter_count == 0) return 0;
+    if (!engine || engine->adapter_count == 0 ||
+        engine->flow_worker_count == 0) {
+        return 0;
+    }
 
-    pool_capacity = engine->adapter_count * (DWORD)NDISAPI_BATCH_SIZE * 2U;
+    pool_capacity = ndisapi_packet_pool_capacity_for(engine->adapter_count,
+                                                     engine->flow_worker_count);
     if (!ndisapi_packet_pool_init(&engine->packet_pool, pool_capacity)) {
         LOG_ERROR("Failed to allocate packet block pool (%lu blocks)",
                   (unsigned long)pool_capacity);
         return 0;
     }
 
-    LOG_INFO("Allocated packet block pool: %lu blocks (%lu KB)",
+    LOG_INFO("Allocated packet block pool: %lu blocks (%lu KB) = "
+             "readers %lux%dx2 + workers %lux%d + senders %dx%d",
              (unsigned long)pool_capacity,
              (unsigned long)((size_t)pool_capacity *
-                             sizeof(ndisapi_packet_block_t) / 1024U));
+                             sizeof(ndisapi_packet_block_t) / 1024U),
+             (unsigned long)engine->adapter_count, NDISAPI_BATCH_SIZE,
+             (unsigned long)engine->flow_worker_count, NDISAPI_FLOW_QUEUE_DEPTH,
+             NDISAPI_SENDER_COUNT, NDISAPI_SENDER_QUEUE_DEPTH);
     return 1;
 }
 
@@ -1115,8 +1324,9 @@ static void ndisapi_free_readers(ndisapi_engine_t *engine) {
 /* ------------------------------------------------------------------ */
 
 /*
- * Reads a batch from one adapter-associated queue, parses each packet,
- * plans the action, and executes the resulting batch.
+ * Reads from one adapter-associated queue until it is drained (a partial
+ * batch), dispatching each read batch to the flow workers in per-worker
+ * groups, then re-waits on the adapter packet event.
  */
 static DWORD WINAPI ndisapi_reader_proc(LPVOID param) {
     ndisapi_adapter_reader_t *reader = (ndisapi_adapter_reader_t *)param;
@@ -1134,59 +1344,54 @@ static DWORD WINAPI ndisapi_reader_proc(LPVOID param) {
 
         if (!engine->running) break;
 
-        memset(blocks, 0, sizeof(blocks));
-        acquired = 0;
-        for (j = 0; j < batch; j++) {
-            ndisapi_packet_block_t *block =
-                ndisapi_packet_block_acquire_or_flush(engine,
-                                                      reader->adapter_handle,
-                                                      reader->adapter_index,
-                                                      NDISAPI_PACKET_POOL_WAIT_MS);
-            if (!block) break;
-            blocks[acquired] = block;
-            reader->read_request->EthPacket[acquired].Buffer = &block->buffer;
-            acquired++;
-        }
-        if (acquired == 0) continue;
+        /* Drain the adapter queue: keep reading while full batches return. */
+        for (;;) {
+            acquired = 0;
+            for (j = 0; j < batch; j++) {
+                ndisapi_packet_block_t *block =
+                    ndisapi_packet_block_acquire_or_flush(engine,
+                                                          reader->adapter_handle,
+                                                          reader->adapter_index,
+                                                          NDISAPI_PACKET_POOL_WAIT_MS);
+                if (!block) break;
+                blocks[acquired] = block;
+                reader->read_request->EthPacket[acquired].Buffer = &block->buffer;
+                acquired++;
+            }
+            if (acquired == 0) break;
 
-        /* Read into pool-owned blocks. */
-        reader->read_request->dwPacketsSuccess = 0;
-        reader->read_request->dwPacketsNumber = acquired;
-        if (!ReadPackets(engine->driver_handle, reader->read_request)) {
-            for (j = 0; j < acquired; j++) {
+            /* Read into pool-owned blocks. */
+            reader->read_request->dwPacketsSuccess = 0;
+            reader->read_request->dwPacketsNumber = acquired;
+            if (!ReadPackets(engine->driver_handle, reader->read_request)) {
+                for (j = 0; j < acquired; j++) {
+                    ndisapi_packet_block_release(blocks[j]);
+                }
+                break;
+            }
+
+            packets_read = reader->read_request->dwPacketsSuccess;
+            if (packets_read > acquired) packets_read = acquired;
+            for (j = packets_read; j < acquired; j++) {
                 ndisapi_packet_block_release(blocks[j]);
             }
-            if (!engine->running) break;
-            continue;
-        }
+            if (packets_read == 0) break;
 
-        packets_read = reader->read_request->dwPacketsSuccess;
-        if (packets_read > acquired) packets_read = acquired;
-        for (j = packets_read; j < acquired; j++) {
-            ndisapi_packet_block_release(blocks[j]);
-        }
-        if (packets_read == 0) continue;
+            InterlockedAdd64(&engine->counters.packets_recv,
+                             (LONG64)packets_read);
 
-        {
-            LONG64 inc = (LONG64)packets_read;
-            InterlockedAdd64(&engine->counters.packets_recv, inc);
-        }
+            for (j = 0; j < packets_read; j++) {
+                ndisapi_packet_block_t *block = blocks[j];
 
-        for (j = 0; j < packets_read; j++) {
-            ndisapi_packet_block_t *block = blocks[j];
-            PINTERMEDIATE_BUFFER buf = block ? &block->buffer : NULL;
-            if (!buf) {
-                ndisapi_packet_block_release(block);
-                continue;
-            }
-            buf->m_hAdapter = reader->adapter_handle;
-            if (block) {
+                block->buffer.m_hAdapter = reader->adapter_handle;
                 block->adapter_handle = reader->adapter_handle;
                 block->adapter_index = reader->adapter_index;
-                block->direction = buf->m_dwDeviceFlags;
             }
-            ndisapi_flow_worker_enqueue(engine, block,
-                                        NDISAPI_FLOW_ENQUEUE_WAIT_MS);
+            ndisapi_flow_worker_dispatch_batch(engine, blocks, packets_read,
+                                               NDISAPI_FLOW_ENQUEUE_WAIT_MS);
+
+            if (packets_read < acquired) break;
+            if (!engine->running) break;
         }
     }
 
@@ -1319,11 +1524,15 @@ error_t ndisapi_start(ndisapi_engine_t *engine, app_config_t *config,
         return ndisapi_start_fail(engine, dns_hijack, dns_forwarder_started, err);
     }
 
-    /* 3. Set pool size (in number of packets) */
+    /* 3. Size the pipeline: worker count feeds the pool capacity model, and
+     * the driver-side pool covers the reader in-flight component. */
+    engine->flow_worker_count =
+        ndisapi_flow_worker_count_for_cpu(ndisapi_detect_cpu_count());
     {
-        DWORD pool_size = engine->adapter_count * (DWORD)NDISAPI_BATCH_SIZE * 2;
-        SetPoolSize(pool_size);
-        LOG_INFO("ndisapi buffer pool size set to %lu", (unsigned long)pool_size);
+        DWORD driver_pool = engine->adapter_count * (DWORD)NDISAPI_BATCH_SIZE * 2;
+        SetPoolSize(driver_pool);
+        LOG_INFO("ndisapi buffer pool size set to %lu (reader in-flight)",
+                 (unsigned long)driver_pool);
     }
 
     /* 4. Allocate caller-owned packet blocks */

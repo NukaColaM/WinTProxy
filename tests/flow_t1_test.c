@@ -29,12 +29,20 @@ extern int g_test_dns_forward_error;
 extern int g_test_conntrack_get_full_key_hit;
 extern int g_test_conntrack_tcp_proxy_outbound_hit;
 extern int g_test_conntrack_tcp_proxy_return_hit;
-extern int g_test_conntrack_tcp_proxy_outbound_touch_count;
-extern int g_test_conntrack_tcp_proxy_return_touch_count;
+extern int g_test_conntrack_role_tcp_outbound_count;
+extern int g_test_conntrack_role_tcp_return_count;
+extern int g_test_conntrack_role_tcp_dns_return_count;
+extern int g_test_conntrack_role_refresh_tcp_pair_count;
 extern int g_test_conntrack_udp_proxy_outbound_hit;
 extern int g_test_conntrack_udp_proxy_return_hit;
-extern int g_test_conntrack_udp_proxy_outbound_touch_count;
-extern int g_test_conntrack_udp_proxy_return_touch_count;
+extern int g_test_conntrack_role_udp_outbound_count;
+extern int g_test_conntrack_role_udp_return_count;
+extern int g_test_proc_lookup_tcp_count;
+extern int g_test_proc_lookup_tcp_retry_count;
+extern int g_test_proc_lookup_udp_count;
+extern int g_test_proc_lookup_udp_retry_count;
+extern uint32_t g_test_proc_lookup_tcp_pid;
+extern uint32_t g_test_proc_self_pid;
 extern int g_test_conntrack_raw_full_key_add_count;
 extern int g_test_conntrack_direct_tcp_track_count;
 extern int g_test_conntrack_tcp_proxy_track_count;
@@ -67,12 +75,20 @@ static void reset_counters(void) {
     g_test_conntrack_get_full_key_hit = 0;
     g_test_conntrack_tcp_proxy_outbound_hit = 0;
     g_test_conntrack_tcp_proxy_return_hit = 0;
-    g_test_conntrack_tcp_proxy_outbound_touch_count = 0;
-    g_test_conntrack_tcp_proxy_return_touch_count = 0;
+    g_test_conntrack_role_tcp_outbound_count = 0;
+    g_test_conntrack_role_tcp_return_count = 0;
+    g_test_conntrack_role_tcp_dns_return_count = 0;
+    g_test_conntrack_role_refresh_tcp_pair_count = 0;
     g_test_conntrack_udp_proxy_outbound_hit = 0;
     g_test_conntrack_udp_proxy_return_hit = 0;
-    g_test_conntrack_udp_proxy_outbound_touch_count = 0;
-    g_test_conntrack_udp_proxy_return_touch_count = 0;
+    g_test_conntrack_role_udp_outbound_count = 0;
+    g_test_conntrack_role_udp_return_count = 0;
+    g_test_proc_lookup_tcp_count = 0;
+    g_test_proc_lookup_tcp_retry_count = 0;
+    g_test_proc_lookup_udp_count = 0;
+    g_test_proc_lookup_udp_retry_count = 0;
+    g_test_proc_lookup_tcp_pid = 0;
+    g_test_proc_self_pid = 0;
     g_test_conntrack_raw_full_key_add_count = 0;
     g_test_conntrack_direct_tcp_track_count = 0;
     g_test_conntrack_tcp_proxy_track_count = 0;
@@ -656,6 +672,8 @@ static void test_direct_tcp_uses_role_contract_and_tracks_non_syn(void) {
 
     check_int("direct tcp tracked non-syn passes",
               (long)action.type, (long)TRAFFIC_ACTION_PASS);
+    check_int("direct tcp tracked non-syn uses fused role op",
+              g_test_conntrack_role_tcp_outbound_count, 1);
 }
 
 static void test_tcp_proxy_uses_role_contract_creation(void) {
@@ -763,38 +781,33 @@ static void test_relay_consumes_tcp_and_udp_role_contracts(void) {
     g_test_conntrack_entry.connect_dst_port = 443;
     g_test_conntrack_entry.relay_src_port = 40000;
 
-    check_int("tcp relay role lookup",
+    check_int("tcp relay setup full-entry lookup",
               conntrack_get_tcp_proxy_return(NULL, server_ip, 40000,
                                              client_ip, 34010, &entry),
               ERR_OK);
     check_int("tcp relay role original port", entry.orig_dst_port, 443);
-    conntrack_touch_tcp_proxy_outbound(NULL, &entry);
-    conntrack_touch_tcp_proxy_return(NULL, &entry);
-    check_int("tcp relay outbound touch",
-              g_test_conntrack_tcp_proxy_outbound_touch_count, 1);
-    check_int("tcp relay return touch",
-              g_test_conntrack_tcp_proxy_return_touch_count, 1);
+    conntrack_role_refresh_tcp_pair(NULL, &entry);
+    check_int("tcp relay periodic pair refresh is conntrack-owned",
+              g_test_conntrack_role_refresh_tcp_pair_count, 1);
 
     reset_counters();
 
     g_test_conntrack_udp_proxy_outbound_hit = 1;
     g_test_conntrack_entry.key_src_ip = client_ip;
     g_test_conntrack_entry.src_port = 12345;
+    g_test_conntrack_entry.key_dst_ip = server_ip;
+    g_test_conntrack_entry.key_dst_port = 53;
     g_test_conntrack_entry.src_ip = client_ip;
     g_test_conntrack_entry.client_port = 12345;
     g_test_conntrack_entry.orig_dst_ip = server_ip;
     g_test_conntrack_entry.orig_dst_port = 53;
 
     check_int("udp relay role lookup",
-              conntrack_get_udp_proxy_outbound(NULL, client_ip, 12345, &entry),
+              conntrack_get_udp_proxy_outbound(NULL, client_ip, 12345,
+                                               server_ip, 53, &entry),
               ERR_OK);
     check_int("udp relay role original port", entry.orig_dst_port, 53);
-    conntrack_touch_udp_proxy_outbound(NULL, &entry);
-    conntrack_touch_udp_proxy_return(NULL, &entry);
-    check_int("udp relay outbound touch",
-              g_test_conntrack_udp_proxy_outbound_touch_count, 1);
-    check_int("udp relay return touch",
-              g_test_conntrack_udp_proxy_return_touch_count, 1);
+    /* Liveness is owned by packet-path role ops; relays issue no touches. */
 }
 
 static void test_tcp_proxy_plan_does_not_mutate_packet_until_execution(void) {
@@ -983,10 +996,8 @@ static void test_tcp_proxy_return_waits_for_executor_rewrite(void) {
               (long)ntohs(ctx.tcp_hdr->th_sport), 443);
     check_int("tcp return dst port rewritten on execute",
               (long)ntohs(ctx.tcp_hdr->th_dport), 12345);
-    check_int("tcp return outbound conntrack touched",
-              g_test_conntrack_tcp_proxy_outbound_touch_count, 1);
-    check_int("tcp return relay conntrack touched",
-              g_test_conntrack_tcp_proxy_return_touch_count, 1);
+    check_int("tcp return role op fused lookup and refresh",
+              g_test_conntrack_role_tcp_return_count, 1);
 }
 
 static void test_tcp_proxy_return_missing_state_drops_closed(void) {
@@ -1076,10 +1087,8 @@ static void test_udp_proxy_return_waits_for_executor_rewrite(void) {
               (long)ntohs(ctx.udp_hdr->uh_sport), 53);
     check_int("udp return dst port preserved on execute",
               (long)ntohs(ctx.udp_hdr->uh_dport), 12345);
-    check_int("udp return outbound conntrack touched",
-              g_test_conntrack_udp_proxy_outbound_touch_count, 1);
-    check_int("udp return relay conntrack touched",
-              g_test_conntrack_udp_proxy_return_touch_count, 1);
+    check_int("udp return role op fused lookup and refresh",
+              g_test_conntrack_role_udp_return_count, 1);
 }
 
 static void test_udp_proxy_return_missing_state_drops_closed(void) {
@@ -1638,6 +1647,210 @@ static void test_startup_quarantine_allows_tracked_new_direct_tcp_non_syn(void) 
               g_test_drop_count, 0);
 }
 
+
+static void test_udp_forward_frame_carries_destination(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    packet_ctx_t ctx;
+    traffic_action_t action;
+    INTERMEDIATE_BUFFER buf;
+    uint32_t client_ip = htonl(0x0A000002U);
+    uint32_t server_ip = htonl(0x08080808U);
+    SOCKET receiver;
+    SOCKET fwd_sock;
+    struct sockaddr_in addr;
+    int addr_len = sizeof(addr);
+    struct timeval tv;
+    uint8_t frame[128];
+    int n;
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    reset_counters();
+
+    receiver = socket(AF_INET, SOCK_DGRAM, 0);
+    fwd_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (receiver < 0 || fwd_sock < 0) {
+        fprintf(stderr, "FAIL frame test socket setup\n");
+        failures++;
+        return;
+    }
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(0x7F000001U);
+    addr.sin_port = 0;
+    if (bind(receiver, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        getsockname(receiver, (struct sockaddr *)&addr, &addr_len) != 0) {
+        fprintf(stderr, "FAIL frame test bind\n");
+        failures++;
+        closesocket(receiver);
+        closesocket(fwd_sock);
+        return;
+    }
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(receiver, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+
+    engine.udp_fwd_sock = fwd_sock;
+    engine.udp_relay_port = ntohs(addr.sin_port);
+
+    set_udp_dns_context(&ctx, &buf, client_ip, 50000, server_ip, 443, 0xAABB);
+    traffic_action_forward_udp_observed(&action, packet_observe(&ctx), "fwd");
+    traffic_execute_action(&engine, &action);
+
+    n = (int)recv(receiver, (char *)frame, sizeof(frame), 0);
+    check_int("udp forward frame length", n, 12 + 2);
+    if (n >= 12) {
+        check_int("frame src ip", memcmp(frame, &client_ip, 4), 0);
+        check_int("frame src port", (frame[4] << 8) | frame[5], 50000);
+        check_int("frame dst ip", memcmp(frame + 6, &server_ip, 4), 0);
+        check_int("frame dst port", (frame[10] << 8) | frame[11], 443);
+    }
+    if (n >= 14) {
+        check_int("frame payload first byte", frame[12], 0xAA);
+        check_int("frame payload second byte", frame[13], 0xBB);
+    }
+    check_int("udp forwarded counter", g_test_udp_forwarded_count, 1);
+
+    closesocket(receiver);
+    closesocket(fwd_sock);
+}
+
+
+static void test_udp_tracked_fast_path_skips_identity_and_policy(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    packet_ctx_t ctx;
+    traffic_action_t action;
+    INTERMEDIATE_BUFFER buf;
+    uint32_t client_ip = htonl(0x0A000002U);
+    uint32_t server_ip = htonl(0x08080808U);
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    reset_counters();
+
+    cfg.policy.default_decision = RULE_DECISION_PROXY;
+    engine.udp_relay_port = 34011;
+
+    /* First datagram: full path - identity, policy, tracking. */
+    set_udp_dns_context(&ctx, &buf, client_ip, 50000, server_ip, 5300, 0x1111);
+    path_plan_policy(&engine, packet_observe(&ctx), &action);
+    check_int("udp first datagram forwards",
+              (long)action.type, (long)TRAFFIC_ACTION_FORWARD_UDP_TO_RELAY);
+    check_int("udp first datagram identity lookup",
+              g_test_proc_lookup_udp_count, 1);
+    check_int("udp first datagram tracks", g_test_conntrack_udp_proxy_track_count, 1);
+
+    /* Second datagram on the tracked tuple: fused fast path only. */
+    set_udp_dns_context(&ctx, &buf, client_ip, 50000, server_ip, 5300, 0x2222);
+    path_plan_policy(&engine, packet_observe(&ctx), &action);
+    check_int("udp tracked datagram forwards",
+              (long)action.type, (long)TRAFFIC_ACTION_FORWARD_UDP_TO_RELAY);
+    check_int("udp tracked datagram skips identity lookup",
+              g_test_proc_lookup_udp_count, 1);
+    check_int("udp tracked datagram skips re-tracking",
+              g_test_conntrack_udp_proxy_track_count, 1);
+    check_int("udp tracked datagram uses fused role op",
+              g_test_conntrack_role_udp_outbound_count >= 1, 1);
+}
+
+static void test_udp_policy_stays_per_destination(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    packet_ctx_t ctx;
+    traffic_action_t action;
+    INTERMEDIATE_BUFFER buf;
+    policy_rule_t rule;
+    uint32_t client_ip = htonl(0x0A000002U);
+    uint32_t server1 = htonl(0x08080808U);
+    uint32_t server2 = htonl(0x09090909U);
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    reset_counters();
+
+    /* Rule: proxy server1 only; everything else direct. */
+    memset(&rule, 0, sizeof(rule));
+    rule.id = 1;
+    rule.enabled = 1;
+    rule.decision = RULE_DECISION_PROXY;
+    rule.protocol = RULE_PROTO_UDP;
+    rule.process_any = 1;
+    rule.port_any = 1;
+    rule.ip_any = 0;
+    rule.ip_ranges[0].start = 0x08080808U;
+    rule.ip_ranges[0].end = 0x08080808U;
+    rule.ip_range_count = 1;
+    cfg.policy.rules = &rule;
+    cfg.policy.rule_count = 1;
+    cfg.policy.default_decision = RULE_DECISION_DIRECT;
+    engine.udp_relay_port = 34011;
+
+    /* server1 from port 50000: proxied and tracked. */
+    set_udp_dns_context(&ctx, &buf, client_ip, 50000, server1, 5300, 0x1111);
+    path_plan_policy(&engine, packet_observe(&ctx), &action);
+    check_int("per-dst policy proxies server1",
+              (long)action.type, (long)TRAFFIC_ACTION_FORWARD_UDP_TO_RELAY);
+
+    /* server2 from the SAME port: its own tuple, its own decision. */
+    set_udp_dns_context(&ctx, &buf, client_ip, 50000, server2, 5300, 0x2222);
+    path_plan_policy(&engine, packet_observe(&ctx), &action);
+    check_int("per-dst policy directs server2",
+              (long)action.type, (long)TRAFFIC_ACTION_PASS);
+}
+
+
+static void test_untracked_non_syn_drops_without_sync_refresh(void) {
+    app_config_t cfg;
+    ndisapi_engine_t engine;
+    dns_hijack_t dns_hijack;
+    packet_ctx_t ctx;
+    traffic_action_t action;
+    INTERMEDIATE_BUFFER buf;
+    uint32_t client_ip = htonl(0x0A000002U);
+    uint32_t server_ip = htonl(0x08080808U);
+    int i;
+
+    init_engine(&engine, &cfg, &dns_hijack);
+    reset_counters();
+
+    cfg.policy.default_decision = RULE_DECISION_PROXY;
+    engine.tcp_relay_port = 34010;
+
+    /* A burst of untracked non-SYN packets: every one drops fail-closed and
+     * none may trigger the synchronous owner-table retry on a flow worker. */
+    for (i = 0; i < 5; i++) {
+        set_tcp_context(&ctx, &buf, client_ip, (uint16_t)(20000 + i),
+                        server_ip, 443, TH_ACK);
+        path_plan_policy(&engine, packet_observe(&ctx), &action);
+        check_int("untracked non-syn drops",
+                  (long)action.type, (long)TRAFFIC_ACTION_DROP);
+    }
+    check_int("untracked non-syn burst triggers no sync refresh",
+              g_test_proc_lookup_tcp_retry_count, 0);
+    check_int("untracked non-syn consults cached index",
+              g_test_proc_lookup_tcp_count, 5);
+
+    /* Self traffic with a cache hit still passes. */
+    g_test_proc_lookup_tcp_pid = 42;
+    g_test_proc_self_pid = 42;
+    set_tcp_context(&ctx, &buf, client_ip, 20099, server_ip, 443, TH_ACK);
+    path_plan_policy(&engine, packet_observe(&ctx), &action);
+    check_int("untracked non-syn self cache hit passes",
+              (long)action.type, (long)TRAFFIC_ACTION_PASS);
+    check_int("self guard stays cache-only",
+              g_test_proc_lookup_tcp_retry_count, 0);
+
+    /* The SYN path keeps retry-with-refresh identity resolution. */
+    g_test_proc_lookup_tcp_pid = 0;
+    g_test_proc_self_pid = 0;
+    set_tcp_context(&ctx, &buf, client_ip, 20100, server_ip, 443, TH_SYN);
+    path_plan_policy(&engine, packet_observe(&ctx), &action);
+    check_int("syn path still retries identity",
+              g_test_proc_lookup_tcp_retry_count, 1);
+}
+
 int main(void) {
     test_loopback_plan_does_not_mutate_flag_before_execution();
     test_loopback_pass_is_routed_by_executor();
@@ -1652,6 +1865,10 @@ int main(void) {
     test_direct_tcp_uses_role_contract_and_tracks_non_syn();
     test_tcp_proxy_uses_role_contract_creation();
     test_udp_proxy_uses_role_contract_creation();
+    test_udp_forward_frame_carries_destination();
+    test_udp_tracked_fast_path_skips_identity_and_policy();
+    test_udp_policy_stays_per_destination();
+    test_untracked_non_syn_drops_without_sync_refresh();
     test_tcp_dns_uses_role_contract_creation();
     test_relay_consumes_tcp_and_udp_role_contracts();
     test_tcp_proxy_plan_does_not_mutate_packet_until_execution();

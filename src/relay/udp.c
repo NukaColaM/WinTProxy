@@ -87,38 +87,11 @@ static int session_index(udp_relay_t *relay, udp_session_t *s) {
     return (int)(s - relay->sessions);
 }
 
-static void active_unlink(udp_relay_t *relay, udp_session_t *s) {
-    int idx = session_index(relay, s);
-    if (s->active_prev >= 0) relay->sessions[s->active_prev].active_next = s->active_next;
-    else if (relay->active_head == idx) relay->active_head = s->active_next;
-    if (s->active_next >= 0) relay->sessions[s->active_next].active_prev = s->active_prev;
-    else if (relay->active_tail == idx) relay->active_tail = s->active_prev;
-    s->active_prev = -1;
-    s->active_next = -1;
-}
-
-static void active_append(udp_relay_t *relay, udp_session_t *s) {
-    int idx = session_index(relay, s);
-    s->active_prev = relay->active_tail;
-    s->active_next = -1;
-    if (relay->active_tail >= 0) relay->sessions[relay->active_tail].active_next = idx;
-    else relay->active_head = idx;
-    relay->active_tail = idx;
-}
-
-static void active_touch(udp_relay_t *relay, udp_session_t *s) {
-    if (relay->active_tail == session_index(relay, s)) return;
-    active_unlink(relay, s);
-    active_append(relay, s);
-}
-
 static void session_clear(udp_session_t *s, int keep_generation) {
     uint32_t generation = s->generation;
     memset(s, 0, sizeof(*s));
     s->ctrl_sock = INVALID_SOCKET;
     s->relay_sock = INVALID_SOCKET;
-    s->active_prev = -1;
-    s->active_next = -1;
     s->next_index = -1;
     s->bucket = -1;
     if (keep_generation) s->generation = generation;
@@ -149,13 +122,11 @@ static void link_session(udp_relay_t *relay, udp_session_t *s) {
     s->bucket = bucket;
     s->next_index = relay->session_buckets[bucket];
     relay->session_buckets[bucket] = idx;
-    active_append(relay, s);
 }
 
 static void session_close(udp_relay_t *relay, udp_session_t *s, int count_eviction) {
     if (!s->active) return;
     unlink_session(relay, s);
-    active_unlink(relay, s);
     close_socket_if_valid(&s->ctrl_sock);
     close_socket_if_valid(&s->relay_sock);
     s->generation++;
@@ -174,13 +145,21 @@ static udp_session_t *find_session(udp_relay_t *relay, uint32_t client_ip, uint1
     return NULL;
 }
 
+/* Table full: evict the session with the oldest activity timestamp. The
+ * scan is bounded by the small session table, which lets the datagram path
+ * update activity without maintaining LRU ordering under an exclusive lock. */
 static udp_session_t *alloc_session(udp_relay_t *relay) {
+    udp_session_t *oldest = NULL;
+
     for (size_t i = 0; i < relay->session_capacity; i++) {
-        if (!relay->sessions[i].active) return &relay->sessions[i];
+        udp_session_t *s = &relay->sessions[i];
+        if (!s->active) return s;
+        if (!oldest || s->last_activity < oldest->last_activity) {
+            oldest = s;
+        }
     }
 
-    if (relay->active_head >= 0) {
-        udp_session_t *oldest = &relay->sessions[relay->active_head];
+    if (oldest) {
         session_close(relay, oldest, 1);
         return oldest;
     }
@@ -237,57 +216,47 @@ static int check_ctrl_alive(SOCKET ctrl_sock) {
     return 1;
 }
 
+/* Periodic pass owns idle expiry and control-socket liveness, so the
+ * per-datagram path never probes sockets. Ctrl-dead sessions survive on
+ * their relay socket exactly as before; only the dead handle is released. */
 static void cleanup_idle_sessions(udp_relay_t *relay) {
     uint64_t now = GetTickCount64();
-    while (relay->active_head >= 0) {
-        udp_session_t *s = &relay->sessions[relay->active_head];
-        if ((now - s->last_activity) <= (UDP_SESSION_TTL_SEC * 1000ULL)) break;
-        LOG_TRACE("UDP relay: session expired for port %u", s->client_port);
-        session_close(relay, s, 1);
+
+    for (size_t i = 0; i < relay->session_capacity; i++) {
+        udp_session_t *s = &relay->sessions[i];
+
+        if (!s->active) continue;
+        if ((now - s->last_activity) > (UDP_SESSION_TTL_SEC * 1000ULL)) {
+            LOG_TRACE("UDP relay: session expired for port %u", s->client_port);
+            session_close(relay, s, 1);
+            continue;
+        }
+        if (s->ctrl_sock != INVALID_SOCKET && !check_ctrl_alive(s->ctrl_sock)) {
+            close_socket_if_valid(&s->ctrl_sock);
+            LOG_TRACE("UDP relay: control closed for port %u (session kept)",
+                      s->client_port);
+        }
     }
 }
 
 static int ensure_session(udp_relay_t *relay, uint32_t client_ip, uint16_t client_port) {
-    SOCKET ctrl_sock = INVALID_SOCKET;
-    uint32_t generation = 0;
     int had_session = 0;
 
     /*
-     * Locking: shared lock for fast path (existing session), exclusive only
-     * on the slow path (new session or ctrl_sock cleanup).  Contention is
-     * low in practice since session creation is infrequent after warm-up.
-     * TODO: session_lock could be split into a read/write lock per bucket
-     * if hot-path contention ever becomes measurable.
+     * Locking: shared lock for the fast path (existing session); exclusive
+     * only when creating a session. Control-socket liveness is owned by the
+     * periodic cleanup pass, so the datagram path never probes sockets.
      */
     AcquireSRWLockShared(&relay->session_lock);
     {
         udp_session_t *s = find_session(relay, client_ip, client_port);
         if (s) {
-            ctrl_sock = s->ctrl_sock;
-            generation = s->generation;
             had_session = 1;
         }
     }
     ReleaseSRWLockShared(&relay->session_lock);
 
-    if (had_session && check_ctrl_alive(ctrl_sock)) {
-        return 1;
-    }
-
     if (had_session) {
-        /* Control socket closed — don't kill the session.  The UDP
-         * relay_sock is still valid.  Only time out on idle expiry. */
-        close_socket_if_valid(&ctrl_sock);
-        AcquireSRWLockExclusive(&relay->session_lock);
-        {
-            udp_session_t *s = find_session(relay, client_ip, client_port);
-            if (s && s->generation == generation) {
-                s->ctrl_sock = INVALID_SOCKET;
-                LOG_TRACE("UDP relay: control closed for port %u (session kept)",
-                          client_port);
-            }
-        }
-        ReleaseSRWLockExclusive(&relay->session_lock);
         return 1;
     }
 
@@ -361,15 +330,15 @@ static int snapshot_session(udp_relay_t *relay, uint32_t client_ip, uint16_t cli
 }
 
 static void update_session_activity(udp_relay_t *relay, const udp_session_snapshot_t *snapshot) {
-    AcquireSRWLockExclusive(&relay->session_lock);
+    AcquireSRWLockShared(&relay->session_lock);
     if (snapshot->session_index >= 0 && (size_t)snapshot->session_index < relay->session_capacity) {
         udp_session_t *s = &relay->sessions[snapshot->session_index];
         if (s->active && s->generation == snapshot->generation && s->relay_sock == snapshot->relay_sock) {
-            s->last_activity = GetTickCount64();
-            active_touch(relay, s);
+            InterlockedExchange64((volatile LONG64 *)&s->last_activity,
+                                  (LONG64)GetTickCount64());
         }
     }
-    ReleaseSRWLockExclusive(&relay->session_lock);
+    ReleaseSRWLockShared(&relay->session_lock);
 }
 
 static void close_failed_snapshot(udp_relay_t *relay, const udp_session_snapshot_t *snapshot) {
@@ -388,14 +357,14 @@ static int snapshot_relay_sockets(udp_relay_t *relay, udp_session_snapshot_t *sn
     int count = 0;
 
     AcquireSRWLockShared(&relay->session_lock);
-    for (int idx = relay->active_head; idx >= 0 && count < max_snapshots; idx = relay->sessions[idx].active_next) {
+    for (size_t idx = 0; idx < relay->session_capacity && count < max_snapshots; idx++) {
         udp_session_t *s = &relay->sessions[idx];
         if (s->active && s->relay_sock != INVALID_SOCKET) {
             snapshots[count].relay_sock = s->relay_sock;
             snapshots[count].relay_addr = s->relay_addr;
             snapshots[count].client_ip = s->client_ip;
             snapshots[count].client_port = s->client_port;
-            snapshots[count].session_index = idx;
+            snapshots[count].session_index = (int)idx;
             snapshots[count].generation = s->generation;
             FD_SET(s->relay_sock, fds);
             if ((int)s->relay_sock > *max_fd) *max_fd = (int)s->relay_sock;
@@ -410,7 +379,9 @@ static int snapshot_relay_sockets(udp_relay_t *relay, udp_session_snapshot_t *sn
 static void handle_client_datagram(udp_relay_t *relay, uint8_t *recv_buf, int n,
                                    uint8_t *send_buf, int send_buf_len) {
     uint32_t client_ip = LOOPBACK_ADDR;
+    uint32_t framed_dst_ip = 0;
     uint16_t client_port;
+    uint16_t framed_dst_port;
     uint8_t *udp_payload;
     int udp_payload_len;
     conntrack_entry_t entry;
@@ -419,18 +390,26 @@ static void handle_client_datagram(udp_relay_t *relay, uint8_t *recv_buf, int n,
     memset(&snapshot, 0, sizeof(snapshot));
     snapshot.session_index = -1;
 
-    if (n < 6) {
+    /* Frame: src_ip(4) src_port(2) dst_ip(4) dst_port(2) payload. */
+    if (n < 12) {
         counter_inc(&relay->counters.dropped_datagrams);
         return;
     }
 
     memcpy(&client_ip, recv_buf, 4);
     client_port = (uint16_t)(((uint16_t)recv_buf[4] << 8) | (uint16_t)recv_buf[5]);
-    udp_payload = recv_buf + 6;
-    udp_payload_len = n - 6;
+    memcpy(&framed_dst_ip, recv_buf + 6, 4);
+    framed_dst_port = (uint16_t)(((uint16_t)recv_buf[10] << 8) |
+                                 (uint16_t)recv_buf[11]);
+    udp_payload = recv_buf + 12;
+    udp_payload_len = n - 12;
 
+    /* Conntrack stays the validity gate, now per tuple; the wrap destination
+     * comes from the frame so multi-destination client ports route
+     * correctly. */
     if (conntrack_get_udp_proxy_outbound(relay->conntrack, client_ip,
-                                         client_port, &entry) != ERR_OK) {
+                                         client_port, framed_dst_ip,
+                                         framed_dst_port, &entry) != ERR_OK) {
         LOG_TRACE("UDP relay: no conntrack for port %u, dropping", client_port);
         counter_inc(&relay->counters.dropped_datagrams);
         return;
@@ -445,7 +424,7 @@ static void handle_client_datagram(udp_relay_t *relay, uint8_t *recv_buf, int n,
 
     {
         int wrapped = socks5_udp_wrap(send_buf, send_buf_len,
-            entry.orig_dst_ip, entry.orig_dst_port, udp_payload, udp_payload_len);
+            framed_dst_ip, framed_dst_port, udp_payload, udp_payload_len);
         if (wrapped > 0) {
             int sent;
 
@@ -454,12 +433,10 @@ static void handle_client_datagram(udp_relay_t *relay, uint8_t *recv_buf, int n,
             if (sent != SOCKET_ERROR) {
                 char dst_str[16];
                 update_session_activity(relay, &snapshot);
-                conntrack_touch_udp_proxy_outbound(relay->conntrack, &entry);
-                conntrack_touch_udp_proxy_return(relay->conntrack, &entry);
                 counter_add(&relay->counters.bytes_up, udp_payload_len);
-                ip_to_str(entry.orig_dst_ip, dst_str, sizeof(dst_str));
+                ip_to_str(framed_dst_ip, dst_str, sizeof(dst_str));
                 LOG_TRACE("UDP relay: forwarded %d bytes from :%u to %s:%u",
-                    udp_payload_len, client_port, dst_str, entry.orig_dst_port);
+                    udp_payload_len, client_port, dst_str, framed_dst_port);
             } else {
                 close_failed_snapshot(relay, &snapshot);
                 counter_inc(&relay->counters.dropped_datagrams);
@@ -488,22 +465,12 @@ static void handle_proxy_datagram(udp_relay_t *relay, udp_session_snapshot_t *sn
             struct sockaddr_in dst;
             uint32_t dst_ip = LOOPBACK_ADDR;
 
-            /* Send response to orig_dst_ip so it routes through the adapter
-             * where NDIS catches it for return-path rewrite.  Keep the relay
-             * bound to INADDR_LOOPBACK for receiving client data. */
-            {
-                conntrack_entry_t entry;
-                if (conntrack_get_udp_proxy_outbound(relay->conntrack,
-                                                     snapshot->client_ip,
-                                                     snapshot->client_port,
-                                                     &entry) == ERR_OK &&
-                    entry.orig_dst_ip != 0) {
-                    dst_ip = entry.orig_dst_ip;
-                    conntrack_touch_udp_proxy_outbound(relay->conntrack,
-                                                       &entry);
-                    conntrack_touch_udp_proxy_return(relay->conntrack,
-                                                     &entry);
-                }
+            /* Route the response toward the server that actually responded
+             * (the unwrapped SOCKS source) so NDIS catches it for the
+             * per-server return-path rewrite.  Multi-destination client
+             * ports get each response attributed to its own server. */
+            if (src_ip != 0) {
+                dst_ip = src_ip;
             }
 
             memset(&dst, 0, sizeof(dst));
@@ -521,6 +488,50 @@ static void handle_proxy_datagram(udp_relay_t *relay, udp_session_snapshot_t *sn
         }
     }
 }
+
+#ifdef WINTPROXY_TEST_HOOKS
+void udp_relay_test_handle_client_datagram(udp_relay_t *relay, uint8_t *recv_buf,
+                                           int n, uint8_t *send_buf,
+                                           int send_buf_len) {
+    handle_client_datagram(relay, recv_buf, n, send_buf, send_buf_len);
+}
+
+void udp_relay_test_handle_proxy_datagram(udp_relay_t *relay, SOCKET relay_sock,
+                                          struct sockaddr_in relay_addr,
+                                          uint32_t client_ip,
+                                          uint16_t client_port,
+                                          int session_index,
+                                          uint32_t generation,
+                                          uint8_t *recv_buf) {
+    udp_session_snapshot_t snapshot;
+
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.relay_sock = relay_sock;
+    snapshot.relay_addr = relay_addr;
+    snapshot.client_ip = client_ip;
+    snapshot.client_port = client_port;
+    snapshot.session_index = session_index;
+    snapshot.generation = generation;
+    handle_proxy_datagram(relay, &snapshot, recv_buf);
+}
+
+int udp_relay_test_alloc_oldest(udp_relay_t *relay) {
+    udp_session_t *s;
+    int idx = -1;
+
+    AcquireSRWLockExclusive(&relay->session_lock);
+    s = alloc_session(relay);
+    if (s) idx = session_index(relay, s);
+    ReleaseSRWLockExclusive(&relay->session_lock);
+    return idx;
+}
+
+void udp_relay_test_cleanup_idle(udp_relay_t *relay) {
+    AcquireSRWLockExclusive(&relay->session_lock);
+    cleanup_idle_sessions(relay);
+    ReleaseSRWLockExclusive(&relay->session_lock);
+}
+#endif
 
 static DWORD WINAPI udp_relay_thread(LPVOID param) {
     udp_relay_t *relay = (udp_relay_t *)param;
@@ -602,8 +613,6 @@ error_t udp_relay_start(udp_relay_t *relay, conntrack_t *conntrack, proxy_config
     relay->running = 1;
     relay->session_capacity = UDP_SESSION_MAX;
     relay->bucket_count = UDP_SESSION_BUCKETS;
-    relay->active_head = -1;
-    relay->active_tail = -1;
     InitializeSRWLock(&relay->session_lock);
 
     relay->sessions = (udp_session_t *)calloc(relay->session_capacity, sizeof(relay->sessions[0]));
@@ -671,8 +680,6 @@ void udp_relay_stop(udp_relay_t *relay) {
     free(relay->session_buckets);
     relay->sessions = NULL;
     relay->session_buckets = NULL;
-    relay->active_head = -1;
-    relay->active_tail = -1;
 
     LOG_INFO("UDP relay stopped");
 }
